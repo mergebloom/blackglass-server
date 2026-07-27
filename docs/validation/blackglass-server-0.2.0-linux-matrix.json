@@ -1,0 +1,51 @@
+{
+  "schemaVersion": 1,
+  "validatedAt": "2026-07-27",
+  "passed": true,
+  "name": "blackglass-server",
+  "version": "0.2.0",
+  "builderImage": "rust:1.92.0-alpine3.22@sha256:0fe89ba9d67dc20a4ff50206d25c88606919cb611b41dd0285dfe3cbb02d69de",
+  "targets": [
+    {
+      "target": "linux-amd64",
+      "linkage": "static-pie-musl",
+      "binarySha256": "1b55cc4027a4c637a66e8f58e0718d6b953e6a138d010a5abf57b2f7461dd969",
+      "binaryBytes": 4719344,
+      "archiveSha256": "a40822c9b51293baa11beb435fa7fd417c668eb50e1c63d5c2461af5d0e557a2",
+      "archiveBytes": 2252601
+    },
+    {
+      "target": "linux-arm64",
+      "linkage": "static-musl",
+      "binarySha256": "8a13afe9a26a3c3f79510145fa3f0ac75045bd07519cbc11cbadd1fea168c59b",
+      "binaryBytes": 4150032,
+      "archiveSha256": "9ea61013e8c9e98b507e761b45c52276e29cf9f679d3c0c5c5b7fe897efd75cd",
+      "archiveBytes": 2113092
+    }
+  ],
+  "multiarchOci": {
+    "platforms": [
+      "linux/amd64",
+      "linux/arm64"
+    ],
+    "indexDigest": "sha256:f205c277ab773b7dccda06461b99ef1794a9680d58d78711f911ff53a8ccba90"
+  },
+  "automatedGates": {
+    "targetCargoUnitTestsPerArchitecture": 4,
+    "targetSqliteInitialization": true,
+    "targetHealth": true,
+    "targetReadiness": true,
+    "archiveChecksum": true,
+    "archiveAllowList": true,
+    "manifestBinding": true,
+    "scratchImageCli": true,
+    "nonRootReadOnlyImageStartup": true,
+    "multiarchRuntimeConfig": true,
+    "zeroCapabilities": true,
+    "noExternalNetwork": true,
+    "sourceIntegrationTests": 16,
+    "sourceAssertions": 171,
+    "shellcheck": "0.11.0",
+    "actionlint": "1.7.12"
+  }
+}

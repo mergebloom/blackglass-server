@@ -1,0 +1,11 @@
+**
+!apps/
+!apps/server-rust/
+!apps/server-rust/Cargo.toml
+!apps/server-rust/Cargo.lock
+!apps/server-rust/src/
+!apps/server-rust/src/**
+!ops/
+!ops/release/
+!ops/release/INSTALL.md
+!LICENSE

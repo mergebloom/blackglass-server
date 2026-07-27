@@ -1,0 +1,33 @@
+{
+  "name": "blackglass-server",
+  "version": "0.2.0",
+  "private": true,
+  "license": "MIT",
+  "engines": {
+    "bun": ">=1.3.0"
+  },
+  "type": "module",
+  "workspaces": [
+    "apps/*",
+    "packages/*"
+  ],
+  "scripts": {
+    "build:linux": "./ops/build-all-linux-releases.sh",
+    "build:linux:amd64": "./ops/build-linux-release.sh linux-amd64",
+    "build:linux:arm64": "./ops/build-linux-release.sh linux-arm64",
+    "build:release": "./ops/build-release.sh",
+    "server": "cargo run --release --manifest-path apps/server-rust/Cargo.toml -- serve",
+    "server:bun-oracle": "bun run apps/server/src/index.ts",
+    "server:check": "cargo check --manifest-path apps/server-rust/Cargo.toml",
+    "server:test": "cargo test --manifest-path apps/server-rust/Cargo.toml",
+    "server:measure": "bun run tools/measure-rust-server.ts",
+    "test:integration": "bun test tests/server.integration.test.ts",
+    "check": "bun run typecheck && cargo fmt --manifest-path apps/server-rust/Cargo.toml -- --check && cargo clippy --locked --manifest-path apps/server-rust/Cargo.toml --all-targets -- -D warnings && bun test",
+    "test": "bun test",
+    "typecheck": "tsc --noEmit"
+  },
+  "devDependencies": {
+    "@types/bun": "^1.2.22",
+    "typescript": "^5.9.2"
+  }
+}

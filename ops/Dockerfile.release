@@ -1,0 +1,135 @@
+# syntax=docker/dockerfile:1.7
+
+ARG RUST_BUILDER="rust:1.92.0-alpine3.22@sha256:0fe89ba9d67dc20a4ff50206d25c88606919cb611b41dd0285dfe3cbb02d69de"
+
+FROM --platform=$TARGETPLATFORM ${RUST_BUILDER} AS build
+
+ARG RUST_BUILDER
+ARG SOURCE_REVISION=unknown
+ARG TARGETARCH
+ARG TARGETOS
+ARG VERSION
+
+RUN test "$TARGETOS" = linux \
+    && case "$TARGETARCH" in amd64|arm64) ;; *) exit 1 ;; esac \
+    && test -n "$VERSION"
+
+RUN apk add --no-cache gzip musl-dev tar
+
+WORKDIR /source
+COPY apps/server-rust/Cargo.toml apps/server-rust/Cargo.lock ./apps/server-rust/
+
+# Cargo validates that the package has a target before fetching its locked
+# graph. This disposable stub keeps dependency downloads cached independently
+# from application source changes; the real source replaces it below.
+RUN mkdir -p apps/server-rust/src \
+    && printf '%s\n' 'fn main() {}' > apps/server-rust/src/main.rs
+
+RUN --mount=type=cache,id=blackglass-cargo-registry-$TARGETARCH,target=/usr/local/cargo/registry,sharing=locked \
+    --mount=type=cache,id=blackglass-cargo-git-$TARGETARCH,target=/usr/local/cargo/git,sharing=locked \
+    cargo fetch --locked --manifest-path apps/server-rust/Cargo.toml
+
+COPY apps/server-rust/src ./apps/server-rust/src
+COPY LICENSE /metadata/LICENSE
+COPY ops/release/INSTALL.md /metadata/INSTALL.md
+
+ENV CARGO_TARGET_DIR=/target
+
+RUN --mount=type=cache,id=blackglass-cargo-registry-$TARGETARCH,target=/usr/local/cargo/registry,sharing=locked \
+    --mount=type=cache,id=blackglass-cargo-git-$TARGETARCH,target=/usr/local/cargo/git,sharing=locked \
+    cargo test --locked --release --manifest-path apps/server-rust/Cargo.toml \
+    && cargo build --locked --release --manifest-path apps/server-rust/Cargo.toml
+
+RUN test "$(/target/release/blackglass-server --version)" = "blackglass-server $VERSION"
+
+# Exercise the exact release binary, including Argon2, SQLite initialization,
+# both listeners, and readiness. The password is fixed test data in a disposable
+# build layer, not a production credential.
+RUN set -eu; \
+    password_hash=$(printf '%s\n' release-smoke-password | /target/release/blackglass-server hash-password); \
+    SELFHOST_BIND_HOST=127.0.0.1 \
+    SELFHOST_CONTROL_PORT=3100 \
+    SELFHOST_DATA_PORT=3103 \
+    SELFHOST_DATA_HOST=127.0.0.1:3103 \
+    SELFHOST_DATABASE=/tmp/blackglass-smoke.sqlite \
+    SELFHOST_STAGING_DIR=/tmp/blackglass-smoke-uploads \
+    SELFHOST_EMAIL=release-smoke@example.test \
+    SELFHOST_PASSWORD_HASH="$password_hash" \
+    SELFHOST_LOG_FORMAT=pretty \
+    /target/release/blackglass-server serve >/tmp/blackglass-smoke.log 2>&1 & \
+    server_pid=$!; \
+    trap 'kill "$server_pid" 2>/dev/null || true' EXIT; \
+    ready=0; \
+    for attempt in 1 2 3 4 5 6 7 8 9 10; do \
+        if wget -q -O /tmp/health.json http://127.0.0.1:3100/health; then ready=1; break; fi; \
+        sleep 1; \
+    done; \
+    test "$ready" -eq 1; \
+    grep -q '"service":"blackglass-server"' /tmp/health.json; \
+    grep -q '"version":"'$VERSION'"' /tmp/health.json; \
+    wget -q -O /tmp/ready.json http://127.0.0.1:3100/ready; \
+    grep -q '"ok":true' /tmp/ready.json; \
+    kill "$server_pid"; \
+    wait "$server_pid"; \
+    trap - EXIT
+
+RUN set -eu; \
+    dist_target="linux-${TARGETARCH}"; \
+    bundle="blackglass-server-v${VERSION}-${dist_target}"; \
+    archive="${bundle}.tar.gz"; \
+    mkdir -p "/package/$bundle" /out /runtime-state; \
+    cp /target/release/blackglass-server "/package/$bundle/blackglass-server"; \
+    chmod 0755 "/package/$bundle/blackglass-server"; \
+    cp /metadata/INSTALL.md "/package/$bundle/INSTALL.md"; \
+    cp /metadata/LICENSE "/package/$bundle/LICENSE"; \
+    binary_sha=$(sha256sum "/package/$bundle/blackglass-server" | cut -d ' ' -f 1); \
+    binary_size=$(wc -c < "/package/$bundle/blackglass-server" | tr -d ' '); \
+    printf '%s\n' \
+      '{' \
+      '  "schemaVersion": 1,' \
+      '  "name": "blackglass-server",' \
+      "  \"version\": \"$VERSION\"," \
+      "  \"target\": \"$dist_target\"," \
+      '  "os": "linux",' \
+      "  \"architecture\": \"$TARGETARCH\"," \
+      '  "libc": "musl",' \
+      '  "binary": "blackglass-server",' \
+      "  \"binarySha256\": \"$binary_sha\"," \
+      "  \"binarySize\": $binary_size," \
+      '  "rustVersion": "1.92.0",' \
+      "  \"builderImage\": \"$RUST_BUILDER\"," \
+      "  \"sourceRevision\": \"$SOURCE_REVISION\"" \
+      '}' > "/package/$bundle/manifest.json"; \
+    touch /runtime-state/.blackglass-state; \
+    tar --sort=name --format=ustar --mtime='@0' --owner=0 --group=0 --numeric-owner \
+      -C /package -cf "/out/${bundle}.tar" "$bundle"; \
+    gzip -n "/out/${bundle}.tar"; \
+    cd /out; \
+    sha256sum "$archive" > "$archive.sha256"
+
+FROM scratch AS release
+COPY --from=build /out/ /
+
+FROM scratch AS runtime
+
+ARG SOURCE_REVISION=unknown
+ARG VERSION
+
+LABEL org.opencontainers.image.title="Blackglass Server" \
+      org.opencontainers.image.description="Lean self-hosted encrypted-vault synchronization service" \
+      org.opencontainers.image.licenses="MIT" \
+      org.opencontainers.image.revision="$SOURCE_REVISION" \
+      org.opencontainers.image.version="$VERSION"
+
+COPY --from=build --chmod=0555 /target/release/blackglass-server /usr/local/bin/blackglass-server
+COPY --from=build --chown=65532:65532 /runtime-state/ /var/lib/blackglass-server/
+
+ENV SELFHOST_BIND_HOST=127.0.0.1 \
+    SELFHOST_DATABASE=/var/lib/blackglass-server/server.sqlite \
+    SELFHOST_STAGING_DIR=/var/lib/blackglass-server/uploads
+
+VOLUME ["/var/lib/blackglass-server"]
+USER 65532:65532
+WORKDIR /var/lib/blackglass-server
+ENTRYPOINT ["/usr/local/bin/blackglass-server"]
+CMD ["serve"]

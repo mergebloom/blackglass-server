@@ -1,0 +1,10 @@
+sync-control.example.com {
+    encode zstd gzip
+    @operations path /health /ready /metrics
+    respond @operations 404
+    reverse_proxy 127.0.0.1:3000
+}
+
+sync-data.example.com {
+    reverse_proxy 127.0.0.1:3003
+}

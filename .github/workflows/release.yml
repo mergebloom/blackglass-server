@@ -1,0 +1,135 @@
+name: Release
+
+on:
+  workflow_dispatch:
+  push:
+    tags:
+      - "v*"
+
+permissions:
+  contents: read
+
+jobs:
+  package:
+    name: Package ${{ matrix.target }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - target: linux-amd64
+            runner: ubuntu-24.04
+          - target: linux-arm64
+            runner: ubuntu-24.04-arm
+    runs-on: ${{ matrix.runner }}
+    timeout-minutes: 45
+    permissions:
+      artifact-metadata: write
+      attestations: write
+      contents: read
+      id-token: write
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - uses: docker/setup-buildx-action@bb05f3f5519dd87d3ba754cc423b652a5edd6d2c # v4.2.0
+      - run: ./ops/build-linux-release.sh "${{ matrix.target }}"
+      - uses: actions/attest@f7c74d28b9d84cb8768d0b8ca14a4bac6ef463e6 # v4.2.0
+        with:
+          subject-path: artifacts/releases/*.tar.gz
+      - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: blackglass-server-${{ matrix.target }}
+          path: |
+            artifacts/releases/*.tar.gz
+            artifacts/releases/*.tar.gz.sha256
+          if-no-files-found: error
+          compression-level: 0
+
+  publish:
+    name: Publish tagged release
+    if: startsWith(github.ref, 'refs/tags/v')
+    needs: package
+    runs-on: ubuntu-24.04
+    timeout-minutes: 60
+    permissions:
+      artifact-metadata: write
+      attestations: write
+      contents: write
+      id-token: write
+      packages: write
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
+        with:
+          pattern: blackglass-server-linux-*
+          path: incoming
+      - name: Assemble release assets
+        shell: bash
+        run: |
+          set -euo pipefail
+          version=$(awk '
+            $0 == "[package]" { in_package = 1; next }
+            in_package && /^\[/ { exit }
+            in_package && /^version = "/ {
+              sub(/^version = "/, "")
+              sub(/"$/, "")
+              print
+              exit
+            }
+          ' apps/server-rust/Cargo.toml)
+          test -n "$version"
+          test "$GITHUB_REF_NAME" = "v$version"
+          mkdir release-assets
+          find incoming -type f -name '*.tar.gz' -exec cp '{}' release-assets/ \;
+          test "$(find release-assets -type f -name '*.tar.gz' | wc -l)" -eq 2
+          cd release-assets
+          sha256sum ./*.tar.gz > SHA256SUMS
+          printf 'VERSION=%s\n' "$version" >> "$GITHUB_ENV"
+          printf 'IMAGE=ghcr.io/%s\n' "${GITHUB_REPOSITORY,,}" >> "$GITHUB_ENV"
+      - uses: actions/attest@f7c74d28b9d84cb8768d0b8ca14a4bac6ef463e6 # v4.2.0
+        with:
+          subject-path: release-assets/*
+      - uses: docker/setup-buildx-action@bb05f3f5519dd87d3ba754cc423b652a5edd6d2c # v4.2.0
+      - name: Sign in to GitHub Container Registry
+        shell: bash
+        env:
+          GHCR_TOKEN: ${{ github.token }}
+        run: echo "$GHCR_TOKEN" | docker login ghcr.io --username "$GITHUB_ACTOR" --password-stdin
+      - name: Publish multi-architecture image
+        shell: bash
+        run: |
+          set -euo pipefail
+          image_tags=(--tag "$IMAGE:$VERSION")
+          if [[ "$VERSION" != *-* ]]; then
+            image_tags+=(--tag "$IMAGE:latest")
+          fi
+          docker buildx build \
+            --platform linux/amd64,linux/arm64 \
+            --file ops/Dockerfile.release \
+            --target runtime \
+            --build-arg "VERSION=$VERSION" \
+            --build-arg "SOURCE_REVISION=$GITHUB_SHA" \
+            "${image_tags[@]}" \
+            --metadata-file image-metadata.json \
+            --push \
+            .
+          digest=$(jq -r '."containerimage.digest"' image-metadata.json)
+          test "$digest" != null
+          printf 'IMAGE_DIGEST=%s\n' "$digest" >> "$GITHUB_ENV"
+      - uses: actions/attest@f7c74d28b9d84cb8768d0b8ca14a4bac6ef463e6 # v4.2.0
+        with:
+          subject-name: ${{ env.IMAGE }}
+          subject-digest: ${{ env.IMAGE_DIGEST }}
+          push-to-registry: true
+      - name: Create or update GitHub release
+        shell: bash
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          if gh release view "$GITHUB_REF_NAME" >/dev/null 2>&1; then
+            gh release upload "$GITHUB_REF_NAME" release-assets/* --clobber
+          else
+            gh release create "$GITHUB_REF_NAME" release-assets/* \
+              --verify-tag \
+              --generate-notes \
+              --title "Blackglass Server $VERSION"
+          fi

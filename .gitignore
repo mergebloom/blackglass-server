@@ -1,0 +1,8 @@
+node_modules/
+.data/
+artifacts/
+fixtures/private/
+coverage/
+*.log
+.DS_Store
+apps/server-rust/target/

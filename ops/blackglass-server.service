@@ -1,0 +1,43 @@
+[Unit]
+Description=Blackglass Server
+After=network.target
+
+[Service]
+Type=simple
+DynamicUser=yes
+StateDirectory=blackglass-server
+StateDirectoryMode=0700
+EnvironmentFile=/etc/blackglass-server/server.env
+ExecStart=/opt/blackglass-server/blackglass-server serve
+Restart=on-failure
+RestartSec=5s
+TimeoutStopSec=30s
+UMask=0077
+NoNewPrivileges=yes
+PrivateTmp=yes
+PrivateDevices=yes
+ProtectSystem=strict
+ProtectHome=yes
+ProtectKernelTunables=yes
+ProtectKernelModules=yes
+ProtectKernelLogs=yes
+ProtectControlGroups=yes
+ProtectClock=yes
+ProtectHostname=yes
+ProtectProc=invisible
+ProcSubset=pid
+RestrictSUIDSGID=yes
+RestrictRealtime=yes
+LockPersonality=yes
+MemoryDenyWriteExecute=yes
+SystemCallArchitectures=native
+SystemCallFilter=@system-service
+SystemCallErrorNumber=EPERM
+RestrictAddressFamilies=AF_UNIX AF_INET AF_INET6
+CapabilityBoundingSet=
+AmbientCapabilities=
+LimitNOFILE=4096
+TasksMax=64
+
+[Install]
+WantedBy=multi-user.target
