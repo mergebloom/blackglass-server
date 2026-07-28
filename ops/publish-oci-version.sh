@@ -144,7 +144,9 @@ for architecture in amd64 arm64; do
   target="linux-${architecture}"
   archive="${release_assets}/blackglass-server-v${version}-${target}.tar.gz"
   raw_binary="${release_assets}/blackglass-server-v${version}-${target}"
-  ./ops/verify-linux-release.sh "$target" "$archive" "$raw_binary"
+  ./ops/verify-linux-release.sh \
+    "$target" "$archive" "$raw_binary" "$source_revision" \
+    --execute-trusted-binary
 
   context="$work/context-${architecture}"
   mkdir -p "$context/state"

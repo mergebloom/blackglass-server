@@ -53,3 +53,12 @@ blackglass_is_supported_release_tag() (
         *) return 1 ;;
     esac
 )
+
+blackglass_is_full_source_revision() (
+    test "$#" -eq 1 || return 1
+    test "${#1}" -eq 40 || return 1
+    case "$1" in
+        *[!0-9a-f]*) return 1 ;;
+        *) return 0 ;;
+    esac
+)

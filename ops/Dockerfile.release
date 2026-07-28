@@ -10,11 +10,25 @@ ARG TARGETARCH
 ARG TARGETOS
 ARG VERSION
 
-RUN test "$TARGETOS" = linux \
-    && case "$TARGETARCH" in amd64|arm64) ;; *) exit 1 ;; esac \
-    && test -n "$VERSION"
+RUN set -eu; \
+    test "$TARGETOS" = linux; \
+    case "$TARGETARCH" in amd64|arm64) ;; *) exit 1 ;; esac; \
+    test -n "$VERSION"; \
+    test "${#SOURCE_REVISION}" -eq 40; \
+    case "$SOURCE_REVISION" in *[!0-9a-f]*) exit 1 ;; esac
 
-RUN apk add --no-cache gzip musl-dev tar
+# Pin the complete package closure added on top of the digest-pinned builder.
+# Alpine security updates therefore fail this build closed until these versions
+# and the builder digest are deliberately advanced together.
+RUN apk add --no-cache \
+      acl-libs=2.3.2-r1 \
+      gzip=1.14-r1 \
+      less=679-r0 \
+      libncursesw=6.5_p20250503-r0 \
+      musl=1.2.5-r12 \
+      musl-dev=1.2.5-r12 \
+      ncurses-terminfo-base=6.5_p20250503-r0 \
+      tar=1.35-r3
 
 WORKDIR /source
 COPY apps/server-rust/Cargo.toml apps/server-rust/Cargo.lock ./apps/server-rust/

@@ -24,9 +24,9 @@ hardening profile target Linux.
 
 ## Build locally
 
-Requirements are Docker with Buildx, standard Unix archive/file tools, and
-enough disk for the pinned official Rust builder image. The host does not need
-a Rust compiler. Build one architecture or both:
+Requirements are Docker with Buildx, `jq`, standard Unix archive/file tools,
+and enough disk for the pinned official Rust builder image. The host does not
+need a Rust compiler. Build one architecture or both:
 
 ```sh
 ./ops/build-linux-release.sh linux-amd64
@@ -38,9 +38,13 @@ Buildx executes each target architecture. During the image build, the exact
 release binary runs its Rust tests, verifies its version, creates a disposable
 SQLite database, starts both listeners, and passes `/health` and `/ready`.
 After export, the verifier checks the archive checksum, exact allow-listed file
-set, ELF architecture, static linkage, and the binary hash/size in the embedded
-manifest. The separately emitted raw executable is checksum-verified and must
-be byte-identical to the archive's executable. The final scratch image is then
+set, ELF architecture, static linkage, and every field and key in the embedded
+manifest. For locally built, already-trusted artifacts on a matching Linux
+architecture, the release pipeline explicitly compares the executable's
+`--version` and `build-info` output with the manifest. The public verifier does
+not execute an untrusted download. The separately emitted raw executable is
+checksum-verified and must be byte-identical to the archive's executable. The
+final scratch image is then
 executed read-only, without Linux capabilities and with `no-new-privileges`, to
 verify its CLI entry point. A second smoke starts it as its non-root runtime
 identity with Linux host networking, loopback binding, the exact loopback
@@ -48,12 +52,15 @@ trusted proxy, read-only rootfs, 256 MiB memory and 64-PID limits, and proves
 the control health endpoint and data listener are reachable.
 
 The builder image is pinned by multi-platform manifest digest in
-`ops/Dockerfile.release`; the Dockerfile frontend, Buildx version, BuildKit
-driver image, and GitHub Actions are pinned as well. Cargo uses the locked
-dependency graph. Release
+`ops/Dockerfile.release`; its added Alpine package closure, the Dockerfile
+frontend, Buildx version, BuildKit driver image, and GitHub Actions are pinned
+as well. Cargo uses the locked dependency graph. Release
 archives have sorted entries, normalized ownership and timestamps, and
-timestamp-free gzip output. `sourceRevision` is the current Git commit when one
-is available or the explicitly supplied `SOURCE_REVISION` value.
+timestamp-free gzip output. `sourceRevision` is always the full lowercase
+40-character Git commit for the clean source checkout. Both native and Docker
+release builders compile an immutable `git archive` of that commit rather than
+the mutable worktree. The root package and lockfile versions and the Rust
+package and lockfile versions must all match.
 
 ## Verify a downloaded binary or archive
 
@@ -65,6 +72,11 @@ shasum -a 256 -c blackglass-server-vVERSION-linux-ARCH.tar.gz.sha256
   linux-ARCH \
   blackglass-server-vVERSION-linux-ARCH.tar.gz
 ```
+
+Use `verify-linux-release.sh` from the matching `vVERSION` source tag. The
+verifier intentionally binds the archive to that release's pinned Rust
+toolchain and builder image, so a verifier from a later tag may reject an older
+valid artifact after those pins are advanced.
 
 The raw `blackglass-server-vVERSION-linux-ARCH` asset has its own adjacent
 checksum and is the same executable contained by the archive:
@@ -84,6 +96,9 @@ gh attestation verify \
 
 Do not use an archive whose filename, checksum, embedded `version`, target,
 binary hash, or provenance does not match the intended release.
+`verify-linux-release.sh` performs static checks by default; never opt into its
+trusted-binary execution mode before provenance and source are independently
+authenticated.
 
 ## Safe container deployment
 

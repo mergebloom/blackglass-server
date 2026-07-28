@@ -5,7 +5,6 @@ project_root=$(
     unset CDPATH
     cd -- "$(dirname -- "$0")/.." && pwd
 )
-cargo_toml="$project_root/apps/server-rust/Cargo.toml"
 dist_dir=${BLACKGLASS_DIST_DIR:-"$project_root/artifacts/releases"}
 # shellcheck source=ops/release-version.sh
 . "$project_root/ops/release-version.sh"
@@ -22,16 +21,72 @@ case "$target" in
     *) usage ;;
 esac
 
-command -v docker >/dev/null 2>&1 || {
-    echo "Docker with Buildx is required" >&2
+source_revision=${SOURCE_REVISION:-}
+if test -n "$source_revision" \
+    && ! blackglass_is_full_source_revision "$source_revision"; then
+    echo "SOURCE_REVISION must be a full lowercase Git commit" >&2
+    exit 1
+fi
+command -v git >/dev/null 2>&1 || {
+    echo "a clean Git checkout is required for a release archive" >&2
     exit 1
 }
-command -v curl >/dev/null 2>&1 || {
-    echo "curl is required for the container reachability smoke" >&2
+git_revision=$(git -C "$project_root" rev-parse --verify 'HEAD^{commit}' 2>/dev/null) || {
+    echo "a clean Git checkout is required for a release archive" >&2
     exit 1
 }
-docker buildx version >/dev/null
+blackglass_is_full_source_revision "$git_revision" || {
+    echo "Git HEAD is not a full lowercase commit revision" >&2
+    exit 1
+}
+if ! worktree_status=$(git -C "$project_root" status --porcelain --untracked-files=all 2>/dev/null); then
+    echo "could not verify that the release checkout is clean" >&2
+    exit 1
+fi
+test -z "$worktree_status" || {
+    echo "refusing a release archive from a dirty worktree; commit the exact source first" >&2
+    exit 1
+}
+if test -n "$source_revision" && test "$source_revision" != "$git_revision"; then
+    echo "SOURCE_REVISION does not match the clean checkout HEAD" >&2
+    exit 1
+fi
+source_revision=$git_revision
 
+# Every build input comes from this immutable commit-addressed export. A
+# concurrent worktree edit or branch move cannot change the source labeled by
+# source_revision after it has been resolved.
+temporary=$(mktemp -d "${TMPDIR:-/tmp}/blackglass-release.XXXXXX")
+source_archive="$temporary/source.tar"
+source_context="$temporary/source"
+image=
+container=
+publish_staging=
+cleanup() {
+    if test -n "$container"; then
+        docker rm -f "$container" >/dev/null 2>&1 || true
+    fi
+    if test -n "$image"; then
+        docker image rm -f "$image" >/dev/null 2>&1 || true
+    fi
+    if test -n "$publish_staging"; then
+        rm -rf "$publish_staging"
+    fi
+    rm -rf "$temporary"
+}
+trap cleanup EXIT HUP INT TERM
+mkdir "$source_context"
+git -C "$project_root" archive \
+    --format=tar \
+    --output="$source_archive" \
+    "$source_revision" || {
+    echo "could not export the immutable release source commit" >&2
+    exit 1
+}
+tar -xf "$source_archive" -C "$source_context"
+
+"$source_context/ops/verify-release-metadata.sh" "$source_context"
+cargo_toml="$source_context/apps/server-rust/Cargo.toml"
 version=$(awk '
     $0 == "[package]" { in_package = 1; next }
     in_package && /^\[/ { exit }
@@ -51,55 +106,27 @@ blackglass_is_supported_release_version "$version" || {
     exit 1
 }
 
-source_revision=${SOURCE_REVISION:-unknown}
-if command -v git >/dev/null 2>&1 && git -C "$project_root" rev-parse --verify HEAD >/dev/null 2>&1; then
-    if test -n "$(git -C "$project_root" status --porcelain --untracked-files=all 2>/dev/null)"; then
-        echo "refusing a release archive from a dirty worktree; commit the exact source first" >&2
-        exit 1
-    fi
-    git_revision=$(git -C "$project_root" rev-parse --verify HEAD)
-    if test "$source_revision" != unknown && test "$source_revision" != "$git_revision"; then
-        echo "SOURCE_REVISION does not match the clean checkout HEAD" >&2
-        exit 1
-    fi
-    source_revision=$git_revision
-fi
-test "$source_revision" != unknown || {
-    echo "a verified source revision is required" >&2
+command -v docker >/dev/null 2>&1 || {
+    echo "Docker with Buildx is required" >&2
     exit 1
 }
-case "$source_revision" in
-    *[!A-Za-z0-9._-]*)
-        echo "SOURCE_REVISION contains unsupported characters" >&2
-        exit 1
-        ;;
-esac
+command -v curl >/dev/null 2>&1 || {
+    echo "curl is required for the container reachability smoke" >&2
+    exit 1
+}
+docker buildx version >/dev/null
 
 mkdir -p "$dist_dir"
-temporary=$(mktemp -d "${TMPDIR:-/tmp}/blackglass-release.XXXXXX")
 image="blackglass-server-smoke:${version}-${target}-$$"
-container=
-publish_staging=
-cleanup() {
-    if test -n "$container"; then
-        docker rm -f "$container" >/dev/null 2>&1 || true
-    fi
-    docker image rm -f "$image" >/dev/null 2>&1 || true
-    if test -n "$publish_staging"; then
-        rm -rf "$publish_staging"
-    fi
-    rm -rf "$temporary"
-}
-trap cleanup EXIT HUP INT TERM
 
 docker buildx build \
     --platform "$platform" \
-    --file "$project_root/ops/Dockerfile.release" \
+    --file "$source_context/ops/Dockerfile.release" \
     --target release \
     --build-arg "VERSION=$version" \
     --build-arg "SOURCE_REVISION=$source_revision" \
     --output "type=local,dest=$temporary/out" \
-    "$project_root"
+    "$source_context"
 
 archive_name="blackglass-server-v${version}-${target}.tar.gz"
 archive="$dist_dir/$archive_name"
@@ -115,17 +142,19 @@ test -f "$staged_archive"
 test -f "$staged_checksum"
 test -f "$staged_raw_binary"
 test -f "$staged_raw_checksum"
-"$project_root/ops/verify-linux-release.sh" "$target" "$staged_archive" "$staged_raw_binary"
+"$source_context/ops/verify-linux-release.sh" \
+    "$target" "$staged_archive" "$staged_raw_binary" "$source_revision" \
+    --execute-trusted-binary
 
 docker buildx build \
     --platform "$platform" \
-    --file "$project_root/ops/Dockerfile.release" \
+    --file "$source_context/ops/Dockerfile.release" \
     --target runtime \
     --build-arg "VERSION=$version" \
     --build-arg "SOURCE_REVISION=$source_revision" \
     --load \
     --tag "$image" \
-    "$project_root"
+    "$source_context"
 
 actual_version=$(docker run --rm \
     --platform "$platform" \
@@ -204,5 +233,7 @@ for name in "$archive_name" "$archive_name.sha256" "$raw_binary_name" "$raw_bina
 done
 rm -rf "$publish_staging"
 publish_staging=
-"$project_root/ops/verify-linux-release.sh" "$target" "$archive" "$raw_binary"
+"$source_context/ops/verify-linux-release.sh" \
+    "$target" "$archive" "$raw_binary" "$source_revision" \
+    --execute-trusted-binary
 echo "release ready: $archive and $raw_binary"
