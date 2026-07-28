@@ -53,8 +53,9 @@ the control health endpoint and data listener are reachable.
 
 The package job then subjects the exact raw binary to the full protocol and
 recovery workload in a server-only, no-swap 256 MiB cgroup. Publication requires
-zero OOM events, bounded cgroup and process high-water measurements, matching
-artifact and in-image hashes, and a graceful exit.
+zero OOM events, a bounded process high-water measurement, an observed cgroup
+high-water measurement, matching artifact and in-image hashes, and a graceful
+exit.
 
 The builder image is pinned by multi-platform manifest digest in
 `ops/Dockerfile.release`; its added Alpine package closure, the Dockerfile

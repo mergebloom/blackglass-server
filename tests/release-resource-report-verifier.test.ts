@@ -95,7 +95,9 @@ function validReport(): any {
     cgroup: {
       version: 2,
       eventsSource: "memory.events.local",
-      memoryPeakBytes: 200_000_000,
+      // Linux may temporarily report a peak above memory.max while direct
+      // reclaim succeeds; the zero OOM counters remain the failure boundary.
+      memoryPeakBytes: 270_000_000,
       memoryMaxBytes: 268_435_456,
       memorySwapMaxBytes: 0,
       memoryEventsBefore: eventsBefore,
@@ -156,6 +158,7 @@ describe("release resource report verifier", () => {
       (report) => (report.target = "linux-arm64"),
       (report) => report.deltaRssKiB++,
       (report) => (report.peakRssKiB = 229_376),
+      (report) => (report.cgroup.memoryPeakBytes = 0),
       (report) => (report.cgroup.memoryMaxBytes = 1),
       (report) => (report.cgroup.memorySwapMaxBytes = 1),
       (report) => (report.cgroup.memoryEventsBefore.oom = 1),

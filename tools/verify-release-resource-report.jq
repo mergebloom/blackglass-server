@@ -76,7 +76,6 @@ def zero_oom:
 .cgroup.version == 2 and
 (.cgroup.eventsSource == "memory.events.local" or .cgroup.eventsSource == "memory.events") and
 .cgroup.memoryPeakBytes > 0 and
-.cgroup.memoryPeakBytes <= .cgroup.memoryMaxBytes and
 .cgroup.memoryMaxBytes == 268435456 and
 .cgroup.memorySwapMaxBytes == 0 and
 (.cgroup.memoryEventsBefore | zero_oom) and

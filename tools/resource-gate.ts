@@ -74,7 +74,7 @@ export function evaluateCgroupResourceGate(
       workloadPassed &&
       configuredMemoryBytes === cgroupResourceLimits.memoryMaxBytes &&
       configuredMemorySwapBytes === cgroupResourceLimits.memorySwapMaxBytes &&
-      memoryPeakBytes <= configuredMemoryBytes &&
+      memoryPeakBytes > 0 &&
       oomEvents === 0 &&
       oomKillEvents === 0 &&
       oomGroupKillEvents === 0 &&

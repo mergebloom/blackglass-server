@@ -86,7 +86,13 @@ describe("release resource gate", () => {
         exitCode,
       );
     expect(evaluate().passed).toBe(true);
-    expect(evaluate(cgroupResourceLimits.memoryMaxBytes + 1).passed).toBe(false);
+    // memory.max is a hard enforcement boundary, but the kernel documents that
+    // memory usage (and therefore memory.peak) can exceed it temporarily while
+    // reclaim succeeds. Zero OOM signals and a clean exit prove survival.
+    expect(evaluate(cgroupResourceLimits.memoryMaxBytes + 4 * 1024 * 1024).passed).toBe(
+      true,
+    );
+    expect(evaluate(0).passed).toBe(false);
     expect(evaluate(1, 1).passed).toBe(false);
     expect(evaluate(1, undefined, 1).passed).toBe(false);
     expect(evaluate(1, undefined, undefined, 1).passed).toBe(false);

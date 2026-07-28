@@ -288,13 +288,16 @@ large history response, and ten sign-in attempts at the maximum accepted
 Argon2id work parameters (`m=65536,t=5,p=4`). A separate phase requires that
 maximum-cost password work and the reserved Sync lane both complete.
 
-Qualification requires cgroup `memory.peak` to stay within 256 MiB; startup and
-final OOM counters to remain zero; exact artifact, staged, and in-image hashes
-to match; and a graceful non-OOM exit. Kernel `VmHWM` remains an additional
-gate: peak process RSS must stay below 224 MiB and the measured idle-to-peak
-increase below 128 MiB. The 192 MiB `MemoryHigh` threshold remains an
-intentional pressure signal rather than a kill boundary. The per-target report
-binds all measurements to the binary SHA-256, native target, and source
+Qualification requires the configured cgroup `memory.max` to remain exactly
+256 MiB with swap disabled; startup and final OOM counters to remain zero;
+exact artifact, staged, and in-image hashes to match; and a graceful non-OOM
+exit. The report records `memory.peak` and `memory.events.max`, but does not
+treat successful direct reclaim as an OOM: Linux permits temporary usage above
+`memory.max` while reclaim brings it back down. Kernel `VmHWM` remains an
+independent gate: peak process RSS must stay below 224 MiB and the measured
+idle-to-peak increase below 128 MiB. The 192 MiB `MemoryHigh` threshold remains
+an intentional pressure signal rather than a kill boundary. The per-target
+report binds all measurements to the binary SHA-256, native target, and source
 revision; any rebuild requires a new report.
 
 ## Deletion and retention
