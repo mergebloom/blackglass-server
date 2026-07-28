@@ -26,7 +26,7 @@ describe("production Rust server", () => {
     const binary = join(root, "apps/server-rust/target/debug/blackglass-server");
     const version = Bun.spawnSync([binary, "--version"], { stdout: "pipe", stderr: "pipe" });
     expect(version.exitCode, version.stderr.toString()).toBe(0);
-    expect(version.stdout.toString().trim()).toBe("blackglass-server 0.2.0");
+    expect(version.stdout.toString().trim()).toBe("blackglass-server 0.2.1");
     const help = Bun.spawnSync([binary, "--help"], { stdout: "pipe", stderr: "pipe" });
     expect(help.exitCode, help.stderr.toString()).toBe(0);
     expect(help.stdout.toString()).toContain("backup <database> <output>");
@@ -52,7 +52,7 @@ describe("production Rust server", () => {
         SELFHOST_ALLOW_PLAINTEXT_PASSWORD: "1",
         SELFHOST_NAME: "Rust test owner",
         SELFHOST_PER_FILE_MAX: String(8 * 1024 * 1024),
-        SELFHOST_ALLOWED_ORIGIN: "app://obsidian.md",
+        SELFHOST_ALLOWED_ORIGINS: "app://obsidian.md,http://localhost",
         SELFHOST_LOG_FORMAT: "pretty",
       },
     });
@@ -107,12 +107,34 @@ describe("production Rust server", () => {
       body: JSON.stringify({ token }),
     });
     expect(rejected.status).toBe(403);
-    const preflight = await fetch(`http://127.0.0.1:${controlPort}/user/info`, {
+    for (const origin of ["app://obsidian.md", "http://localhost"]) {
+      const preflight = await fetch(`http://127.0.0.1:${controlPort}/user/info`, {
+        method: "OPTIONS",
+        headers: { origin },
+      });
+      expect(preflight.status).toBe(204);
+      expect(preflight.headers.get("access-control-allow-origin")).toBe(origin);
+
+      const info = await fetch(`http://127.0.0.1:${controlPort}/user/info`, {
+        method: "POST",
+        headers: { "content-type": "application/json", origin },
+        body: JSON.stringify({ token }),
+      });
+      expect(info.status).toBe(200);
+      expect(info.headers.get("access-control-allow-origin")).toBe(origin);
+      expect(await info.json()).toMatchObject({ email: "owner@example.test" });
+    }
+    const nearMiss = await fetch(`http://127.0.0.1:${controlPort}/user/info`, {
       method: "OPTIONS",
-      headers: { origin: "app://obsidian.md" },
+      headers: { origin: "http://localhost.evil.example" },
     });
-    expect(preflight.status).toBe(204);
-    expect(preflight.headers.get("access-control-allow-origin")).toBe("app://obsidian.md");
+    expect(nearMiss.status).toBe(403);
+
+    const mobileSocket = await Probe.connect(`ws://127.0.0.1:${dataPort}`, "http://localhost");
+    mobileSocket.socket.close();
+    await expect(
+      Probe.connect(`ws://127.0.0.1:${dataPort}`, "http://localhost.evil.example"),
+    ).rejects.toThrow("websocket failed");
   });
 
   test("round-trips multi-piece opaque ciphertext with bounded staging", async () => {
@@ -219,7 +241,7 @@ describe("production Rust server", () => {
     expect(await (await fetch(`http://127.0.0.1:${controlPort}/health`)).json()).toMatchObject({
       implementation: "rust",
       service: "blackglass-server",
-      version: "0.2.0",
+      version: "0.2.1",
     });
     expect((await fetch(`http://127.0.0.1:${controlPort}/ready`)).status).toBe(200);
     const errorsBeforeClose = metricValue(
@@ -277,7 +299,7 @@ async function freePort(): Promise<number> { return new Promise((resolve, reject
 class Probe {
   private queue: unknown[] = []; private waiters: Array<(v: unknown) => void> = [];
   private constructor(readonly socket: WebSocket) { socket.binaryType = "arraybuffer"; socket.addEventListener("message", (e) => { const v = typeof e.data === "string" ? JSON.parse(e.data) : e.data; const waiter = this.waiters.shift(); waiter ? waiter(v) : this.queue.push(v); }); }
-  static connect(url: string): Promise<Probe> { return new Promise((resolve, reject) => { const ws = new WebSocket(url); sockets.push(ws); const probe = new Probe(ws); ws.addEventListener("open", () => resolve(probe), { once: true }); ws.addEventListener("error", () => reject(new Error("websocket failed")), { once: true }); }); }
+  static connect(url: string, origin?: string): Promise<Probe> { return new Promise((resolve, reject) => { const ws = origin ? new WebSocket(url, { headers: { Origin: origin } } as any) : new WebSocket(url); sockets.push(ws); const probe = new Probe(ws); ws.addEventListener("open", () => resolve(probe), { once: true }); ws.addEventListener("error", () => reject(new Error("websocket failed")), { once: true }); }); }
   json(v: Record<string, unknown>) { this.socket.send(JSON.stringify(v)); }
   async nextJson(): Promise<any> { const value = await this.next(); if (value instanceof ArrayBuffer) throw new Error("expected JSON"); return value; }
   async nextBinary(): Promise<ArrayBuffer> { const value = await this.next(); if (!(value instanceof ArrayBuffer)) throw new Error(`expected binary: ${JSON.stringify(value)}`); return value; }

@@ -66,10 +66,15 @@ Copy `ops/Caddyfile.example`, replace both names, and set
 adapter with the matching HTTPS control origin and data host. Do not put the
 control and data services directly on a public interface.
 
-The control service accepts only the configured renderer Origin (default
-`app://obsidian.md`). Sign-in is globally limited to ten attempts per minute in
-the process. If a proxy or firewall adds rate limiting, treat that as a second
-layer rather than a replacement.
+The control and data services accept only the configured exact renderer origins.
+`SELFHOST_ALLOWED_ORIGINS` is a comma-separated list of at most eight origins;
+the default remains `app://obsidian.md`. Desktop plus Android deployments should
+use `app://obsidian.md,http://localhost`. The legacy singular
+`SELFHOST_ALLOWED_ORIGIN` remains accepted for one origin, but must not be set at
+the same time as the plural variable. Never use wildcard CORS. Sign-in is
+globally limited to ten attempts per minute in the process. If a proxy or
+firewall adds rate limiting, treat that as a second layer rather than a
+replacement.
 
 ## Health, metrics, and logs
 

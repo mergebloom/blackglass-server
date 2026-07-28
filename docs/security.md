@@ -21,7 +21,7 @@ E2EE does not hide those facts.
 | Password theft | Argon2id verifier supplied by a root-readable environment file; plaintext production configuration is rejected |
 | Token theft | Random 256-bit sessions, SHA-256 digests at rest, bounded lifetime, sign-out revocation, and an offline revoke-all command |
 | Login guessing/CPU exhaustion | Uniform credential error, global ten-attempt/minute limiter, and Argon2 work off the async reactor |
-| Cross-origin control calls | Exact configured renderer Origin, explicit preflight, bounded 64 KiB JSON bodies |
+| Cross-origin control calls | Bounded exact renderer-origin allowlist, matched-origin preflight responses, bounded 64 KiB JSON bodies |
 | Memory/disk exhaustion | 2 MiB frames, declared-size/piece validation, per-file cap, upload semaphore, private staging files, and external disk monitoring |
 | Partial uploads/crashes | Unique mode-0600 staging files, commit only after exact byte/piece match and fsync, startup cleanup |
 | SQLite corruption | WAL, foreign keys, transactional migrations, graceful checkpoint, online backup API, integrity checks, and restore drills |

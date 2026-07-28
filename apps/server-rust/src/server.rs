@@ -208,10 +208,11 @@ async fn metrics(State(s): State<AppState>) -> Response {
         .into_response()
 }
 async fn preflight(State(s): State<AppState>, headers: HeaderMap) -> Response {
-    if !origin_allowed(&s, &headers) {
-        return StatusCode::FORBIDDEN.into_response();
-    }
-    let mut response = api(&s, Value::Null, StatusCode::NO_CONTENT);
+    let request_origin = match permitted_origin(&s, &headers) {
+        Ok(origin) => origin,
+        Err(()) => return StatusCode::FORBIDDEN.into_response(),
+    };
+    let mut response = api_for_origin(&s, Value::Null, StatusCode::NO_CONTENT, request_origin);
     let h = response.headers_mut();
     h.insert(
         header::ACCESS_CONTROL_ALLOW_METHODS,
@@ -226,17 +227,27 @@ async fn preflight(State(s): State<AppState>, headers: HeaderMap) -> Response {
 
 async fn control(State(s): State<AppState>, uri: Uri, headers: HeaderMap, body: Bytes) -> Response {
     s.metrics.control.fetch_add(1, Ordering::Relaxed);
-    if !origin_allowed(&s, &headers) {
-        warn!(event="origin_rejected",route=%uri.path());
-        return api(
-            &s,
-            json!({"error":"Origin not allowed"}),
-            StatusCode::FORBIDDEN,
-        );
-    }
+    let request_origin = match permitted_origin(&s, &headers) {
+        Ok(origin) => origin,
+        Err(()) => {
+            warn!(event="origin_rejected",route=%uri.path());
+            return api(
+                &s,
+                json!({"error":"Origin not allowed"}),
+                StatusCode::FORBIDDEN,
+            );
+        }
+    };
     let value: Value = match serde_json::from_slice(&body) {
         Ok(v) => v,
-        Err(_) => return api(&s, json!({"error":"Invalid JSON"}), StatusCode::BAD_REQUEST),
+        Err(_) => {
+            return api_for_origin(
+                &s,
+                json!({"error":"Invalid JSON"}),
+                StatusCode::BAD_REQUEST,
+                request_origin,
+            );
+        }
     };
     let result = if uri.path() == "/user/signin" {
         signin(&s, value).await
@@ -244,10 +255,10 @@ async fn control(State(s): State<AppState>, uri: Uri, headers: HeaderMap, body: 
         authorized_control(&s, uri.path(), value)
     };
     match result {
-        Ok(v) => api(&s, v, StatusCode::OK),
+        Ok(v) => api_for_origin(&s, v, StatusCode::OK, request_origin),
         Err(message) => {
             s.metrics.errors.fetch_add(1, Ordering::Relaxed);
-            api(&s, json!({"error":message}), StatusCode::OK)
+            api_for_origin(&s, json!({"error":message}), StatusCode::OK, request_origin)
         }
     }
 }
@@ -402,7 +413,7 @@ fn delete_vault(s: &AppState, v: Value) -> std::result::Result<Value, String> {
 }
 
 async fn upgrade(State(s): State<AppState>, headers: HeaderMap, ws: WebSocketUpgrade) -> Response {
-    if !origin_allowed(&s, &headers) {
+    if permitted_origin(&s, &headers).is_err() {
         return StatusCode::FORBIDDEN.into_response();
     }
     ws.max_frame_size(PIECE_SIZE as usize)
@@ -826,20 +837,44 @@ fn internal(e: impl std::fmt::Display) -> String {
     "Internal server error".into()
 }
 fn api(s: &AppState, value: Value, status: StatusCode) -> Response {
+    api_for_origin(s, value, status, None)
+}
+fn api_for_origin(
+    s: &AppState,
+    value: Value,
+    status: StatusCode,
+    request_origin: Option<&str>,
+) -> Response {
     let mut h = HeaderMap::new();
     h.insert(header::CACHE_CONTROL, HeaderValue::from_static("no-store"));
+    let allowed_origin = request_origin
+        .or_else(|| s.config.allowed_origins.first().map(String::as_str))
+        .unwrap_or("app://obsidian.md");
     h.insert(
         header::ACCESS_CONTROL_ALLOW_ORIGIN,
-        HeaderValue::from_str(&s.config.allowed_origin)
+        HeaderValue::from_str(allowed_origin)
             .unwrap_or(HeaderValue::from_static("app://obsidian.md")),
     );
     h.insert(header::VARY, HeaderValue::from_static("Origin"));
     (status, h, Json(value)).into_response()
 }
-fn origin_allowed(s: &AppState, h: &HeaderMap) -> bool {
-    h.get(header::ORIGIN)
-        .and_then(|v| v.to_str().ok())
-        .is_none_or(|o| o == s.config.allowed_origin)
+fn permitted_origin<'a>(
+    s: &AppState,
+    h: &'a HeaderMap,
+) -> std::result::Result<Option<&'a str>, ()> {
+    let Some(value) = h.get(header::ORIGIN) else {
+        return Ok(None);
+    };
+    let origin = value.to_str().map_err(|_| ())?;
+    if s.config
+        .allowed_origins
+        .iter()
+        .any(|allowed| allowed == origin)
+    {
+        Ok(Some(origin))
+    } else {
+        Err(())
+    }
 }
 fn now_ms() -> i64 {
     SystemTime::now()

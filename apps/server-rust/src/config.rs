@@ -16,7 +16,7 @@ pub struct Config {
     pub display_name: String,
     pub per_file_max: u64,
     pub session_ttl: Duration,
-    pub allowed_origin: String,
+    pub allowed_origins: Vec<String>,
     pub max_concurrent_uploads: usize,
     pub json_logs: bool,
 }
@@ -74,10 +74,17 @@ impl Config {
         if !(1..=64).contains(&max_concurrent_uploads) {
             bail!("SELFHOST_MAX_CONCURRENT_UPLOADS must be between 1 and 64");
         }
-        let allowed_origin =
-            value("SELFHOST_ALLOWED_ORIGIN").unwrap_or_else(|| "app://obsidian.md".into());
-        axum::http::HeaderValue::from_str(&allowed_origin)
-            .context("SELFHOST_ALLOWED_ORIGIN is not a valid HTTP Origin value")?;
+        let allowed_origins = match (
+            value("SELFHOST_ALLOWED_ORIGINS"),
+            value("SELFHOST_ALLOWED_ORIGIN"),
+        ) {
+            (Some(_), Some(_)) => {
+                bail!("set SELFHOST_ALLOWED_ORIGINS or legacy SELFHOST_ALLOWED_ORIGIN, not both")
+            }
+            (Some(origins), None) => parse_allowed_origins(&origins)?,
+            (None, Some(origin)) => parse_allowed_origins(&origin)?,
+            (None, None) => vec!["app://obsidian.md".into()],
+        };
         let public_data_host =
             value("SELFHOST_DATA_HOST").unwrap_or_else(|| format!("127.0.0.1:{data_port}"));
         if public_data_host.len() > 255
@@ -99,7 +106,7 @@ impl Config {
             display_name: value("SELFHOST_NAME").unwrap_or_else(|| "Blackglass user".into()),
             per_file_max,
             session_ttl: Duration::from_secs(session_ttl_seconds),
-            allowed_origin,
+            allowed_origins,
             max_concurrent_uploads,
             json_logs: value("SELFHOST_LOG_FORMAT").as_deref() != Some("pretty"),
         })
@@ -119,7 +126,7 @@ impl Config {
             display_name: "Test owner".into(),
             per_file_max: 8 * 1024 * 1024,
             session_ttl: Duration::from_secs(3600),
-            allowed_origin: "app://obsidian.md".into(),
+            allowed_origins: vec!["app://obsidian.md".into()],
             max_concurrent_uploads: 2,
             json_logs: false,
         })
@@ -128,6 +135,40 @@ impl Config {
 
 fn value(name: &str) -> Option<String> {
     env::var(name).ok().filter(|v| !v.is_empty())
+}
+
+fn parse_allowed_origins(raw: &str) -> Result<Vec<String>> {
+    let origins: Vec<String> = raw.split(',').map(str::trim).map(str::to_owned).collect();
+    if origins.is_empty() || origins.len() > 8 || origins.iter().any(String::is_empty) {
+        bail!("SELFHOST_ALLOWED_ORIGINS must contain between one and eight origins");
+    }
+    let mut seen = std::collections::HashSet::new();
+    for origin in &origins {
+        if origin.len() > 255 || origin == "*" || origin.eq_ignore_ascii_case("null") {
+            bail!("SELFHOST_ALLOWED_ORIGINS must contain exact, bounded origins");
+        }
+        let Some((scheme, authority)) = origin.split_once("://") else {
+            bail!("SELFHOST_ALLOWED_ORIGINS contains an invalid origin");
+        };
+        let valid_scheme = scheme.chars().enumerate().all(|(index, c)| {
+            (index == 0 && c.is_ascii_alphabetic())
+                || (index > 0 && (c.is_ascii_alphanumeric() || matches!(c, '+' | '-' | '.')))
+        });
+        if !valid_scheme
+            || authority.is_empty()
+            || authority
+                .chars()
+                .any(|c| c.is_whitespace() || matches!(c, '/' | '?' | '#' | '@'))
+        {
+            bail!("SELFHOST_ALLOWED_ORIGINS contains an invalid origin");
+        }
+        axum::http::HeaderValue::from_str(origin)
+            .context("SELFHOST_ALLOWED_ORIGINS contains an invalid HTTP Origin value")?;
+        if !seen.insert(origin) {
+            bail!("SELFHOST_ALLOWED_ORIGINS must not contain duplicates");
+        }
+    }
+    Ok(origins)
 }
 fn required(name: &str) -> Result<String> {
     value(name).with_context(|| format!("{name} is required"))
@@ -155,5 +196,28 @@ mod tests {
         assert!(c.bind_host.is_loopback());
         assert_eq!(c.public_data_host, "127.0.0.1:3103");
         assert!(c.database_path.starts_with(dir.path()));
+    }
+
+    #[test]
+    fn parses_a_bounded_list_of_exact_origins() {
+        assert_eq!(
+            parse_allowed_origins("app://obsidian.md, http://localhost").unwrap(),
+            vec!["app://obsidian.md", "http://localhost"]
+        );
+        for invalid in [
+            "",
+            "*",
+            "null",
+            "https://example.test/path",
+            "https://example.test?query",
+            "https://example.test#fragment",
+            "https://example.test,https://example.test",
+            "https://a.test,https://b.test,https://c.test,https://d.test,https://e.test,https://f.test,https://g.test,https://h.test,https://i.test",
+        ] {
+            assert!(
+                parse_allowed_origins(invalid).is_err(),
+                "accepted {invalid}"
+            );
+        }
     }
 }
