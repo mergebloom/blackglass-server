@@ -11,6 +11,30 @@ const MAX_ARGON2_TIME_COST: u32 = 5;
 const MIN_ARGON2_PARALLELISM: u32 = 1;
 const MAX_ARGON2_PARALLELISM: u32 = 4;
 const MAX_PASSWORD_HASH_LENGTH: usize = 512;
+pub(crate) const MAX_CONCURRENT_PASSWORD_CHECKS: usize = 1;
+const SERVICE_MEMORY_LIMIT_KIB: usize = 256 * 1024;
+const MAX_WS_FRAME_MEMORY_KIB: usize = crate::config::MAX_WS_CONNECTIONS_LIMIT * 2 * 1024;
+const MIN_BASE_RUNTIME_HEADROOM_KIB: usize = 32 * 1024;
+const MAX_CONTROL_BODY_MEMORY_KIB: usize = (crate::server::MAX_CONTROL_BODY_READERS
+    + crate::server::MAX_CONTROL_REQUESTS)
+    * crate::server::MAX_CONTROL_BODY_BYTES
+    / 1024;
+const MAX_EVENT_BUFFER_MEMORY_KIB: usize = (crate::server::EVENT_CAPACITY
+    + crate::config::MAX_WS_CONNECTIONS_LIMIT)
+    * crate::server::MAX_EVENT_BYTES
+    / 1024;
+const MAX_LARGE_RESPONSE_WORKING_MEMORY_KIB: usize = 24 * 1024;
+const MAX_PASSWORD_CHECK_MEMORY_KIB: usize =
+    MAX_ARGON2_MEMORY_KIB as usize * MAX_CONCURRENT_PASSWORD_CHECKS;
+const _: () = assert!(
+    MAX_PASSWORD_CHECK_MEMORY_KIB
+        + MAX_WS_FRAME_MEMORY_KIB
+        + MAX_CONTROL_BODY_MEMORY_KIB
+        + MAX_EVENT_BUFFER_MEMORY_KIB
+        + MAX_LARGE_RESPONSE_WORKING_MEMORY_KIB
+        + MIN_BASE_RUNTIME_HEADROOM_KIB
+        <= SERVICE_MEMORY_LIMIT_KIB
+);
 
 pub fn hash_password(password: &str) -> Result<String> {
     let salt = SaltString::generate(&mut password_hash::rand_core::OsRng);
@@ -116,6 +140,33 @@ mod tests {
             MAX_ARGON2_PARALLELISM,
         );
         assert!(password_hash_is_production_grade(&bounded));
+    }
+
+    #[test]
+    fn password_verification_budget_fits_the_service_memory_limit() {
+        let service = include_str!("../../../ops/blackglass-server.service");
+        let memory_limit_kib = service
+            .lines()
+            .find_map(|line| line.strip_prefix("MemoryMax="))
+            .and_then(|value| value.strip_suffix('M'))
+            .and_then(|value| value.parse::<usize>().ok())
+            .unwrap()
+            * 1024;
+        assert_eq!(memory_limit_kib, SERVICE_MEMORY_LIMIT_KIB);
+        assert_eq!(MAX_PASSWORD_CHECK_MEMORY_KIB, 64 * 1024);
+        assert_eq!(MAX_WS_FRAME_MEMORY_KIB, 32 * 1024);
+        assert_eq!(MAX_CONTROL_BODY_MEMORY_KIB, 3 * 1024);
+        assert_eq!(MAX_EVENT_BUFFER_MEMORY_KIB, 1536);
+        assert_eq!(MAX_LARGE_RESPONSE_WORKING_MEMORY_KIB, 24 * 1024);
+        assert!(
+            MAX_PASSWORD_CHECK_MEMORY_KIB
+                + MAX_WS_FRAME_MEMORY_KIB
+                + MAX_CONTROL_BODY_MEMORY_KIB
+                + MAX_EVENT_BUFFER_MEMORY_KIB
+                + MAX_LARGE_RESPONSE_WORKING_MEMORY_KIB
+                + MIN_BASE_RUNTIME_HEADROOM_KIB
+                <= memory_limit_kib
+        );
     }
 
     fn with_argon2_params(encoded: &str, memory: u32, time: u32, parallelism: u32) -> String {

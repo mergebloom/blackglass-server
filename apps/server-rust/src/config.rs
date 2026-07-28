@@ -6,6 +6,9 @@ use std::{
     time::Duration,
 };
 
+pub(crate) const MAX_WS_CONNECTIONS_LIMIT: usize = 16;
+pub(crate) const DEFAULT_MAX_WS_CONNECTIONS: usize = 16;
+
 #[derive(Clone, Debug)]
 pub struct Config {
     pub bind_host: IpAddr,
@@ -31,11 +34,12 @@ impl Config {
             .unwrap_or_else(|| "127.0.0.1".into())
             .parse::<IpAddr>()
             .context("SELFHOST_BIND_HOST must be an IP address")?;
-        if !bind_host.is_loopback() {
-            bail!(
-                "SELFHOST_BIND_HOST must be loopback; put a TLS reverse proxy in front of the service"
-            );
-        }
+        let external_bind_acknowledged = match value("SELFHOST_ACKNOWLEDGE_EXTERNAL_BIND") {
+            None => false,
+            Some(value) if value == "1" => true,
+            Some(_) => bail!("SELFHOST_ACKNOWLEDGE_EXTERNAL_BIND must be exactly 1 when set"),
+        };
+        validate_bind_host(bind_host, external_bind_acknowledged)?;
         let control_port = number("SELFHOST_CONTROL_PORT", 3000u16)?;
         let data_port = number("SELFHOST_DATA_PORT", 3003u16)?;
         let database_path = PathBuf::from(
@@ -78,9 +82,9 @@ impl Config {
         if !(1..=64).contains(&max_concurrent_uploads) {
             bail!("SELFHOST_MAX_CONCURRENT_UPLOADS must be between 1 and 64");
         }
-        let max_ws_connections = number("SELFHOST_MAX_WS_CONNECTIONS", 256usize)?;
-        if !(1..=4096).contains(&max_ws_connections) {
-            bail!("SELFHOST_MAX_WS_CONNECTIONS must be between 1 and 4096");
+        let max_ws_connections = number("SELFHOST_MAX_WS_CONNECTIONS", DEFAULT_MAX_WS_CONNECTIONS)?;
+        if !(1..=MAX_WS_CONNECTIONS_LIMIT).contains(&max_ws_connections) {
+            bail!("SELFHOST_MAX_WS_CONNECTIONS must be between 1 and {MAX_WS_CONNECTIONS_LIMIT}");
         }
         let allowed_origins = match (
             value("SELFHOST_ALLOWED_ORIGINS"),
@@ -94,10 +98,7 @@ impl Config {
             (None, None) => vec!["app://obsidian.md".into()],
         };
         let public_data_host =
-            value("SELFHOST_DATA_HOST").unwrap_or_else(|| format!("127.0.0.1:{data_port}"));
-        if !is_canonical_data_host(&public_data_host) {
-            bail!("SELFHOST_DATA_HOST must be a canonical hostname[:port]");
-        }
+            resolve_public_data_host(bind_host, data_port, value("SELFHOST_DATA_HOST"))?;
         Ok(Self {
             bind_host,
             control_port,
@@ -133,7 +134,7 @@ impl Config {
             session_ttl: Duration::from_secs(3600),
             allowed_origins: vec!["app://obsidian.md".into()],
             max_concurrent_uploads: 2,
-            max_ws_connections: 16,
+            max_ws_connections: DEFAULT_MAX_WS_CONNECTIONS,
             json_logs: false,
         })
     }
@@ -141,6 +142,59 @@ impl Config {
 
 fn value(name: &str) -> Option<String> {
     env::var(name).ok().filter(|v| !v.is_empty())
+}
+
+fn validate_bind_host(bind_host: IpAddr, external_bind_acknowledged: bool) -> Result<()> {
+    if bind_host.is_loopback() {
+        return Ok(());
+    }
+    if !bind_host.is_unspecified() {
+        bail!("SELFHOST_BIND_HOST must be loopback or an unspecified container bind address")
+    }
+    if !external_bind_acknowledged {
+        bail!(
+            "binding outside loopback requires SELFHOST_ACKNOWLEDGE_EXTERNAL_BIND=1 and a private container network with a TLS ingress boundary"
+        )
+    }
+    Ok(())
+}
+
+fn resolve_public_data_host(
+    bind_host: IpAddr,
+    data_port: u16,
+    configured: Option<String>,
+) -> Result<String> {
+    let public_data_host = match configured {
+        Some(host) => host,
+        None if bind_host == IpAddr::V4(Ipv4Addr::LOCALHOST) => {
+            format!("127.0.0.1:{data_port}")
+        }
+        None => {
+            bail!("SELFHOST_DATA_HOST is required when SELFHOST_BIND_HOST is not 127.0.0.1")
+        }
+    };
+    validate_public_data_host(&public_data_host)?;
+    if bind_host != IpAddr::V4(Ipv4Addr::LOCALHOST) && direct_loopback_host(&public_data_host) {
+        bail!("loopback SELFHOST_DATA_HOST requires SELFHOST_BIND_HOST=127.0.0.1")
+    }
+    validate_direct_loopback_port(&public_data_host, data_port)?;
+    Ok(public_data_host)
+}
+
+fn direct_loopback_host(value: &str) -> bool {
+    value
+        .rsplit_once(':')
+        .is_some_and(|(host, _)| matches!(host, "localhost" | "127.0.0.1"))
+}
+
+fn validate_direct_loopback_port(value: &str, data_port: u16) -> Result<()> {
+    let Some((host, port)) = value.rsplit_once(':') else {
+        return Ok(());
+    };
+    if matches!(host, "localhost" | "127.0.0.1") && port != data_port.to_string() {
+        bail!("loopback SELFHOST_DATA_HOST port must match SELFHOST_DATA_PORT")
+    }
+    Ok(())
 }
 
 fn parse_allowed_origins(raw: &str) -> Result<Vec<String>> {
@@ -209,10 +263,14 @@ fn is_canonical_data_host(value: &str) -> bool {
         let Ok(parsed) = address.parse::<Ipv6Addr>() else {
             return false;
         };
-        if parsed.to_string() != address {
+        if parsed.is_loopback()
+            || parsed.is_unspecified()
+            || parsed.is_multicast()
+            || parsed.to_string() != address
+        {
             return false;
         }
-        return suffix.is_empty() || valid_port_suffix(suffix);
+        return suffix.is_empty() || (suffix != ":443" && valid_port_suffix(suffix));
     }
 
     if value.contains('[') || value.contains(']') || value.matches(':').count() > 1 {
@@ -222,11 +280,15 @@ fn is_canonical_data_host(value: &str) -> bool {
         Some((host, port)) => (host, Some(port)),
         None => (value, None),
     };
-    if port.is_some_and(|port| !valid_port(port)) || host.is_empty() {
+    if port.is_some_and(|port| !valid_port(port) || port == "443") || host.is_empty() {
         return false;
     }
     if let Ok(address) = host.parse::<Ipv4Addr>() {
-        return address.to_string() == host;
+        if address.is_unspecified() || address.is_multicast() || address.is_broadcast() {
+            return false;
+        }
+        return (!address.is_loopback() || (address == Ipv4Addr::LOCALHOST && port.is_some()))
+            && address.to_string() == host;
     }
     if host
         .bytes()
@@ -235,6 +297,12 @@ fn is_canonical_data_host(value: &str) -> bool {
         return false;
     }
     if host.bytes().any(|byte| byte.is_ascii_uppercase()) || host.len() > 253 {
+        return false;
+    }
+    if (host.starts_with("localhost") && host != "localhost")
+        || (host.starts_with("127.0.0.1") && host != "127.0.0.1")
+        || (host == "localhost" && port.is_none())
+    {
         return false;
     }
     host.split('.').all(|label| {
@@ -246,6 +314,13 @@ fn is_canonical_data_host(value: &str) -> bool {
             && !label.starts_with('-')
             && !label.ends_with('-')
     })
+}
+
+pub(crate) fn validate_public_data_host(value: &str) -> Result<()> {
+    if !is_canonical_data_host(value) {
+        bail!("SELFHOST_DATA_HOST must be a canonical hostname[:port]")
+    }
+    Ok(())
 }
 
 fn valid_port_suffix(value: &str) -> bool {
@@ -268,6 +343,66 @@ mod tests {
         assert!(c.bind_host.is_loopback());
         assert_eq!(c.public_data_host, "127.0.0.1:3103");
         assert!(c.database_path.starts_with(dir.path()));
+    }
+
+    #[test]
+    fn external_bind_requires_an_explicit_container_acknowledgement() {
+        assert!(validate_bind_host("127.0.0.1".parse().unwrap(), false).is_ok());
+        assert!(validate_bind_host("::1".parse().unwrap(), false).is_ok());
+        assert!(validate_bind_host("0.0.0.0".parse().unwrap(), false).is_err());
+        assert!(validate_bind_host("::".parse().unwrap(), false).is_err());
+        assert!(validate_bind_host("0.0.0.0".parse().unwrap(), true).is_ok());
+        assert!(validate_bind_host("::".parse().unwrap(), true).is_ok());
+        assert!(validate_bind_host("192.0.2.10".parse().unwrap(), true).is_err());
+    }
+
+    #[test]
+    fn advertised_data_host_defaults_only_for_direct_ipv4_loopback() {
+        assert_eq!(
+            resolve_public_data_host("127.0.0.1".parse().unwrap(), 3003, None).unwrap(),
+            "127.0.0.1:3003"
+        );
+        for bind in ["::1", "0.0.0.0", "::"] {
+            assert!(
+                resolve_public_data_host(bind.parse().unwrap(), 3003, None).is_err(),
+                "omitted data host passed for {bind}"
+            );
+        }
+        assert_eq!(
+            resolve_public_data_host(
+                "0.0.0.0".parse().unwrap(),
+                3003,
+                Some("sync-data.example".into())
+            )
+            .unwrap(),
+            "sync-data.example"
+        );
+        assert!(
+            resolve_public_data_host(
+                "0.0.0.0".parse().unwrap(),
+                3003,
+                Some("127.0.0.1:3003".into())
+            )
+            .is_err()
+        );
+    }
+
+    #[test]
+    fn direct_loopback_advertisements_require_the_listener_port() {
+        for host in ["127.0.0.1", "localhost", "127.0.0.1:3004", "localhost:3004"] {
+            assert!(
+                resolve_public_data_host("127.0.0.1".parse().unwrap(), 3003, Some(host.into()))
+                    .is_err(),
+                "invalid direct loopback host passed: {host}"
+            );
+        }
+        for host in ["127.0.0.1:3003", "localhost:3003"] {
+            assert_eq!(
+                resolve_public_data_host("127.0.0.1".parse().unwrap(), 3003, Some(host.into()))
+                    .unwrap(),
+                host
+            );
+        }
     }
 
     #[test]
@@ -297,9 +432,9 @@ mod tests {
     fn public_data_hosts_must_be_canonical() {
         for accepted in [
             "blackglass.example",
-            "blackglass.example:443",
+            "blackglass.example:8443",
             "127.0.0.1:3003",
-            "[::1]:3003",
+            "[2001:db8::1]:8443",
             "xn--bcher-kva.example",
         ] {
             assert!(
@@ -317,13 +452,27 @@ mod tests {
             "user@blackglass.example",
             "blackglass.example\\path",
             "blackglass.example:0",
+            "blackglass.example:443",
+            "[::1]:443",
             "blackglass.example:0443",
             "blackglass.example:65536",
             "blackglass..example",
             "-blackglass.example",
             "127.000.000.001:3003",
+            "127.0.0.2:3003",
+            "127.0.0.1",
+            "localhost",
+            "0.0.0.0",
+            "0.0.0.0:3003",
+            "224.0.0.1:3003",
+            "255.255.255.255:3003",
+            "localhost.evil.example:8080",
+            "127.0.0.1.evil.example:8080",
             "::1",
+            "[::1]:3003",
             "[0:0:0:0:0:0:0:1]:3003",
+            "[::]",
+            "[ff02::1]:3003",
         ] {
             assert!(
                 !is_canonical_data_host(rejected),

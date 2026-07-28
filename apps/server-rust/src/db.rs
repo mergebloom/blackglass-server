@@ -1,6 +1,6 @@
 use crate::{
     auth,
-    model::{NewRevision, PullInfo, Revision, Vault},
+    model::{NewRevision, PullInfo, PushNotice, Revision, Vault},
 };
 use anyhow::{Context, Result, bail};
 use rusqlite::{Connection, OptionalExtension, params, types::Value};
@@ -11,9 +11,12 @@ use std::{
     sync::{Arc, Mutex},
     time::{SystemTime, UNIX_EPOCH},
 };
+use uuid::Uuid;
 
-const CURRENT_SCHEMA_VERSION: i64 = 2;
-const SUPPORTED_MIGRATIONS: &[i64] = &[1, 2];
+const CURRENT_SCHEMA_VERSION: i64 = 3;
+const SUPPORTED_MIGRATIONS: &[i64] = &[1, 2, 3];
+pub(crate) const MAX_VAULTS: i64 = 100;
+pub(crate) const MAX_JS_SAFE_INTEGER: i64 = 9_007_199_254_740_991;
 
 #[derive(Clone)]
 pub struct Db(Arc<Mutex<Connection>>);
@@ -25,6 +28,7 @@ impl Db {
                 if !metadata.is_file() {
                     bail!("server database is not a regular file: {}", path.display())
                 }
+                reject_hardlinked_file(&metadata, path, "server database")?;
                 true
             }
             Err(error) if error.kind() == io::ErrorKind::NotFound => false,
@@ -81,6 +85,9 @@ impl Db {
                 migrate(&conn)?;
             }
             verify_connection(&conn)?;
+            if !existed {
+                sync_parent_directory(path)?;
+            }
             Ok(Self(Arc::new(Mutex::new(conn))))
         })();
 
@@ -129,11 +136,29 @@ impl Db {
         self.with(|c| Ok(c.query_row("SELECT EXISTS(SELECT 1 FROM sessions WHERE token_hash=? AND expires_at>? AND revoked_at IS NULL)", params![hash, now], |r| r.get::<_,i64>(0))? == 1)).unwrap_or(false)
     }
 
+    pub fn valid_session_for_vault(&self, hash: &str, vault: &str) -> bool {
+        if hash.len() != 64 || vault.is_empty() {
+            return false;
+        }
+        let now = now_ms();
+        self.with(|c| {
+            Ok(c.query_row(
+                "SELECT EXISTS(
+                    SELECT 1 FROM sessions
+                     WHERE token_hash=? AND expires_at>? AND revoked_at IS NULL
+                 ) AND EXISTS(SELECT 1 FROM vaults WHERE id=?)",
+                params![hash, now, vault],
+                |row| row.get::<_, i64>(0),
+            )? == 1)
+        })
+        .unwrap_or(false)
+    }
+
     pub fn revoke_session(&self, token: &str) -> Result<()> {
         let hash = auth::token_hash(token);
         self.with(|c| {
             c.execute(
-                "UPDATE sessions SET revoked_at=? WHERE token_hash=?",
+                "UPDATE sessions SET revoked_at=MAX(?,created_at) WHERE token_hash=?",
                 params![now_ms(), hash],
             )?;
             Ok(())
@@ -143,17 +168,35 @@ impl Db {
     pub fn revoke_all_sessions(&self) -> Result<usize> {
         self.with(|c| {
             Ok(c.execute(
-                "UPDATE sessions SET revoked_at=? WHERE revoked_at IS NULL",
+                "UPDATE sessions SET revoked_at=MAX(?,created_at) WHERE revoked_at IS NULL",
                 [now_ms()],
             )?)
         })
     }
 
     pub fn create_vault(&self, vault: &Vault) -> Result<()> {
-        self.with(|c| { c.execute("INSERT INTO vaults(id,name,keyhash,salt,host,region,encryption_version,size,created,password,version) VALUES(?,?,?,?,?,?,?,?,?,?,0)", params![vault.id,vault.name,vault.keyhash,vault.salt,vault.host,vault.region,vault.encryption_version,vault.size,vault.created,vault.password])?; Ok(()) })
+        self.with(|c| {
+            let tx = c.transaction()?;
+            let count: i64 = tx.query_row("SELECT COUNT(*) FROM vaults", [], |row| row.get(0))?;
+            if count >= MAX_VAULTS {
+                bail!("vault limit reached")
+            }
+            tx.execute("INSERT INTO vaults(id,name,keyhash,salt,host,region,encryption_version,size,created,password,version) VALUES(?,?,?,?,?,?,?,?,?,?,0)", params![vault.id,vault.name,vault.keyhash,vault.salt,vault.host,vault.region,vault.encryption_version,vault.size,vault.created,vault.password])?;
+            tx.commit()?;
+            Ok(())
+        })
     }
     pub fn list_vaults(&self) -> Result<Vec<Vault>> {
-        self.with(|c| { let mut q=c.prepare("SELECT id,name,keyhash,salt,host,region,encryption_version,size,created,password FROM vaults ORDER BY created ASC")?; Ok(q.query_map([], vault_row)?.collect::<rusqlite::Result<Vec<_>>>()?) })
+        self.with(|c| { let mut q=c.prepare("SELECT id,name,keyhash,salt,host,region,encryption_version,size,created,password FROM vaults ORDER BY created ASC LIMIT ?")?; Ok(q.query_map([MAX_VAULTS], vault_row)?.collect::<rusqlite::Result<Vec<_>>>()?) })
+    }
+    pub fn mismatched_data_hosts(&self, expected: &str) -> Result<Vec<String>> {
+        self.with(|c| {
+            let mut query =
+                c.prepare("SELECT DISTINCT host FROM vaults WHERE host<>? ORDER BY host")?;
+            Ok(query
+                .query_map([expected], |row| row.get::<_, String>(0))?
+                .collect::<rusqlite::Result<Vec<_>>>()?)
+        })
     }
     pub fn find_vault(&self, id: &str) -> Result<Option<Vault>> {
         self.with(|c| Ok(c.query_row("SELECT id,name,keyhash,salt,host,region,encryption_version,size,created,password FROM vaults WHERE id=?",[id],vault_row).optional()?))
@@ -176,6 +219,38 @@ impl Db {
     }
     pub fn delete_vault(&self, id: &str) -> Result<bool> {
         self.with(|c| Ok(c.execute("DELETE FROM vaults WHERE id=?", [id])? == 1))
+    }
+    pub fn migrate_vault(&self, source_id: &str, replacement: &Vault) -> Result<bool> {
+        self.with(|c| {
+            let tx = c.transaction()?;
+            let exists = tx.query_row(
+                "SELECT EXISTS(SELECT 1 FROM vaults WHERE id=?)",
+                [source_id],
+                |row| row.get::<_, i64>(0),
+            )? == 1;
+            if !exists {
+                return Ok(false);
+            }
+            tx.execute(
+                "INSERT INTO vaults(id,name,keyhash,salt,host,region,encryption_version,size,created,password,version)
+                 VALUES(?,?,?,?,?,?,?,?,?,?,0)",
+                params![
+                    replacement.id,
+                    replacement.name,
+                    replacement.keyhash,
+                    replacement.salt,
+                    replacement.host,
+                    replacement.region,
+                    replacement.encryption_version,
+                    replacement.size,
+                    replacement.created,
+                    replacement.password
+                ],
+            )?;
+            tx.execute("DELETE FROM vaults WHERE id=?", [source_id])?;
+            tx.commit()?;
+            Ok(true)
+        })
     }
     pub fn current_version(&self, id: &str) -> Result<i64> {
         self.with(|c| {
@@ -215,6 +290,9 @@ impl Db {
             tx.execute("INSERT INTO revisions(vault_id,path,relatedpath,extension,hash,ctime,mtime,folder,deleted,size,pieces,content,device,user_id,ts) VALUES(?,?,?,?,?,?,?,?,?,?,?,NULL,?,?,?)",
                 params![revision.vault_id,revision.path,revision.relatedpath,revision.extension,revision.hash,revision.ctime,revision.mtime,revision.folder as i64,revision.deleted as i64,revision.size,revision.pieces,revision.device,revision.user_id,ts])?;
             let uid=tx.last_insert_rowid();
+            if uid > MAX_JS_SAFE_INTEGER {
+                bail!("revision UID exceeds the JavaScript safe-integer range")
+            }
             tx.execute("INSERT INTO revision_content(uid,content) VALUES(?,zeroblob(?))",params![uid,revision.size])?;
             {
                 let mut input=File::open(file_path)?;
@@ -274,8 +352,54 @@ impl Db {
             ],
         )
     }
-    pub fn list_deleted(&self, vault: &str, suppress: bool) -> Result<Vec<Revision>> {
-        self.query_revisions(&format!("SELECT {cols} FROM revisions r JOIN (SELECT path,MAX(uid) uid FROM revisions WHERE vault_id=? GROUP BY path) heads ON heads.uid=r.uid WHERE r.deleted=1 AND (?=0 OR NOT EXISTS (SELECT 1 FROM revisions live JOIN (SELECT path,MAX(uid) uid FROM revisions WHERE vault_id=r.vault_id GROUP BY path) live_heads ON live_heads.uid=live.uid WHERE live.deleted=0 AND live.relatedpath=r.path)) ORDER BY r.uid ASC",cols=prefixed_columns("r")),vec![Value::Text(vault.into()),Value::Integer(suppress as i64)])
+    pub fn list_deleted_page(
+        &self,
+        vault: &str,
+        suppress: bool,
+        after: i64,
+        limit: i64,
+    ) -> Result<Vec<Revision>> {
+        self.query_revisions(
+            &format!(
+                "SELECT {cols}
+                   FROM revisions r
+                   JOIN (
+                       SELECT path,MAX(uid) uid
+                         FROM revisions
+                        WHERE vault_id=?
+                        GROUP BY path
+                   ) heads ON heads.uid=r.uid
+                  WHERE r.deleted=1
+                    AND r.uid>?
+                    AND EXISTS (
+                        SELECT 1 FROM revisions prior
+                         WHERE prior.vault_id=r.vault_id
+                           AND prior.path=r.path
+                           AND prior.uid<r.uid
+                           AND prior.deleted=0
+                    )
+                    AND (?=0 OR NOT EXISTS (
+                        SELECT 1
+                          FROM revisions live
+                          JOIN (
+                              SELECT path,MAX(uid) uid
+                                FROM revisions
+                               WHERE vault_id=r.vault_id
+                               GROUP BY path
+                          ) live_heads ON live_heads.uid=live.uid
+                         WHERE live.deleted=0 AND live.relatedpath=r.path
+                    ))
+                  ORDER BY r.uid ASC
+                  LIMIT ?",
+                cols = prefixed_columns("r")
+            ),
+            vec![
+                Value::Text(vault.into()),
+                Value::Integer(after.max(0)),
+                Value::Integer(suppress as i64),
+                Value::Integer(limit.clamp(1, 1024)),
+            ],
+        )
     }
     pub fn history(
         &self,
@@ -306,6 +430,9 @@ impl Db {
         let Some(source_uid)=source_uid else{return Ok(None)}; let ts=now_ms();
         tx.execute("INSERT INTO revisions(vault_id,path,relatedpath,extension,hash,ctime,mtime,folder,deleted,size,pieces,content,device,user_id,ts) SELECT vault_id,?,NULL,extension,hash,ctime,mtime,folder,0,size,pieces,NULL,?,1,? FROM revisions WHERE uid=?",params![path,device,ts,source_uid])?;
         let new_uid=tx.last_insert_rowid();
+        if new_uid > MAX_JS_SAFE_INTEGER {
+            bail!("revision UID exceeds the JavaScript safe-integer range")
+        }
         let source_size:i64=tx.query_row("SELECT size FROM revisions WHERE uid=?",[source_uid],|r|r.get(0))?;
         if source_size>0 {
             tx.execute("INSERT INTO revision_content(uid,content) VALUES(?,zeroblob(?))",params![new_uid,source_size])?;
@@ -315,13 +442,22 @@ impl Db {
             let copied=io::copy(&mut source,&mut destination)?;
             if copied!=source_size as u64 { bail!("restored content size changed during copy"); }
         }
+        let restored = tx.query_row(
+            &format!("SELECT {REVISION_COLUMNS} FROM revisions WHERE uid=?"),
+            [new_uid],
+            revision_row,
+        )?;
+        let notice_size = serde_json::to_vec(&PushNotice::from(restored.clone()))?.len();
+        if notice_size > crate::server::MAX_EVENT_BYTES {
+            bail!("restored revision metadata exceeds the bounded event size")
+        }
         refresh_vault(&tx,vault,new_uid)?; tx.commit()?;
-        Ok(Some(c.query_row(&format!("SELECT {REVISION_COLUMNS} FROM revisions WHERE uid=?"),[new_uid],revision_row)?))
+        Ok(Some(restored))
     })
     }
 
     pub fn purge(&self, vault: &str) -> Result<()> {
-        self.with(|c|{let tx=c.transaction()?;tx.execute("DELETE FROM revisions WHERE vault_id=? AND uid NOT IN (SELECT r.uid FROM revisions r JOIN (SELECT path,MAX(uid) uid FROM revisions WHERE vault_id=? GROUP BY path) heads ON heads.uid=r.uid WHERE r.deleted=0)",params![vault,vault])?;let version: i64=tx.query_row("SELECT version FROM vaults WHERE id=?",[vault],|r|r.get(0))?;refresh_vault(&tx,vault,version)?;tx.commit()?;Ok(())})
+        self.with(|c|{let tx=c.transaction()?;tx.execute("DELETE FROM revisions WHERE vault_id=? AND uid NOT IN (SELECT MAX(uid) FROM revisions WHERE vault_id=? GROUP BY path)",params![vault,vault])?;let version: i64=tx.query_row("SELECT version FROM vaults WHERE id=?",[vault],|r|r.get(0))?;refresh_vault(&tx,vault,version)?;tx.commit()?;Ok(())})
     }
     pub fn checkpoint(&self) -> Result<()> {
         self.with(|c| {
@@ -388,6 +524,9 @@ fn add_revision(c: &mut Connection, r: &NewRevision, content: Option<&[u8]>) -> 
     let ts = now_ms();
     tx.execute("INSERT INTO revisions(vault_id,path,relatedpath,extension,hash,ctime,mtime,folder,deleted,size,pieces,content,device,user_id,ts) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)",params![r.vault_id,r.path,r.relatedpath,r.extension,r.hash,r.ctime,r.mtime,r.folder as i64,r.deleted as i64,r.size,r.pieces,content,r.device,r.user_id,ts])?;
     let uid = tx.last_insert_rowid();
+    if uid > MAX_JS_SAFE_INTEGER {
+        bail!("revision UID exceeds the JavaScript safe-integer range")
+    }
     refresh_vault(&tx, &r.vault_id, uid)?;
     tx.commit()?;
     Ok(c.query_row(
@@ -404,20 +543,59 @@ fn now_ms() -> i64 {
 }
 
 fn migrate(c: &Connection) -> Result<()> {
-    c.execute_batch("BEGIN IMMEDIATE;
-      CREATE TABLE IF NOT EXISTS schema_migrations(version INTEGER PRIMARY KEY, applied_at INTEGER NOT NULL);
-      CREATE TABLE IF NOT EXISTS vaults(id TEXT PRIMARY KEY,name TEXT NOT NULL,keyhash TEXT,salt TEXT,host TEXT NOT NULL,region TEXT NOT NULL,encryption_version INTEGER NOT NULL,size INTEGER NOT NULL DEFAULT 0,created INTEGER NOT NULL,password TEXT,version INTEGER NOT NULL DEFAULT 0);
-      CREATE TABLE IF NOT EXISTS revisions(uid INTEGER PRIMARY KEY AUTOINCREMENT,vault_id TEXT NOT NULL REFERENCES vaults(id) ON DELETE CASCADE,path TEXT NOT NULL,relatedpath TEXT,extension TEXT NOT NULL,hash TEXT NOT NULL,ctime INTEGER NOT NULL,mtime INTEGER NOT NULL,folder INTEGER NOT NULL,deleted INTEGER NOT NULL,size INTEGER NOT NULL,pieces INTEGER NOT NULL,content BLOB,device TEXT NOT NULL,user_id INTEGER NOT NULL,ts INTEGER NOT NULL DEFAULT 0);
-      CREATE TABLE IF NOT EXISTS revision_content(uid INTEGER PRIMARY KEY REFERENCES revisions(uid) ON DELETE CASCADE,content BLOB NOT NULL);
-      CREATE TABLE IF NOT EXISTS sessions(token_hash TEXT PRIMARY KEY,created_at INTEGER NOT NULL,expires_at INTEGER NOT NULL,revoked_at INTEGER);
-      CREATE INDEX IF NOT EXISTS revisions_vault_uid ON revisions(vault_id,uid);
-      CREATE INDEX IF NOT EXISTS revisions_vault_path ON revisions(vault_id,path,uid);
-      CREATE INDEX IF NOT EXISTS sessions_expiry ON sessions(expires_at);
-      INSERT OR IGNORE INTO schema_migrations(version,applied_at) VALUES(1,unixepoch()*1000);
-      INSERT OR IGNORE INTO schema_migrations(version,applied_at) VALUES(2,unixepoch()*1000);
-      UPDATE revisions SET ts=CASE WHEN mtime>0 THEN mtime ELSE unixepoch()*1000 END WHERE ts=0;
-      UPDATE vaults SET version=COALESCE((SELECT MAX(uid) FROM revisions WHERE vault_id=vaults.id),version,0) WHERE version=0;
-      COMMIT;")?;
+    let versions = if table_exists(c, "schema_migrations")? {
+        migration_versions(c)?
+    } else {
+        Vec::new()
+    };
+    reject_newer_migrations(&versions)?;
+    if !SUPPORTED_MIGRATIONS.starts_with(&versions) {
+        bail!(
+            "unsupported Blackglass migration history: expected a prefix of {:?}, found {:?}",
+            SUPPORTED_MIGRATIONS,
+            versions
+        )
+    }
+    for version in SUPPORTED_MIGRATIONS.iter().skip(versions.len()).copied() {
+        let sql = match version {
+            1 => MIGRATION_1_SQL,
+            2 => MIGRATION_2_SQL,
+            3 => MIGRATION_3_SQL,
+            _ => bail!("no implementation for database migration {version}"),
+        };
+        apply_migration(c, version, sql)?;
+    }
+    Ok(())
+}
+
+const MIGRATION_1_SQL: &str = "
+    CREATE TABLE IF NOT EXISTS schema_migrations(version INTEGER PRIMARY KEY, applied_at INTEGER NOT NULL);
+    CREATE TABLE IF NOT EXISTS vaults(id TEXT PRIMARY KEY,name TEXT NOT NULL,keyhash TEXT,salt TEXT,host TEXT NOT NULL,region TEXT NOT NULL,encryption_version INTEGER NOT NULL,size INTEGER NOT NULL DEFAULT 0,created INTEGER NOT NULL,password TEXT,version INTEGER NOT NULL DEFAULT 0);
+    CREATE TABLE IF NOT EXISTS revisions(uid INTEGER PRIMARY KEY AUTOINCREMENT,vault_id TEXT NOT NULL REFERENCES vaults(id) ON DELETE CASCADE,path TEXT NOT NULL,relatedpath TEXT,extension TEXT NOT NULL,hash TEXT NOT NULL,ctime INTEGER NOT NULL,mtime INTEGER NOT NULL,folder INTEGER NOT NULL,deleted INTEGER NOT NULL,size INTEGER NOT NULL,pieces INTEGER NOT NULL,content BLOB,device TEXT NOT NULL,user_id INTEGER NOT NULL,ts INTEGER NOT NULL DEFAULT 0);
+    CREATE INDEX IF NOT EXISTS revisions_vault_uid ON revisions(vault_id,uid);
+    CREATE INDEX IF NOT EXISTS revisions_vault_path ON revisions(vault_id,path,uid);
+    UPDATE revisions SET ts=CASE WHEN mtime>0 THEN mtime ELSE unixepoch()*1000 END WHERE ts=0;
+    UPDATE vaults SET version=COALESCE((SELECT MAX(uid) FROM revisions WHERE vault_id=vaults.id),version,0) WHERE version=0;
+";
+const MIGRATION_2_SQL: &str = "
+    CREATE TABLE revision_content(uid INTEGER PRIMARY KEY REFERENCES revisions(uid) ON DELETE CASCADE,content BLOB NOT NULL);
+    CREATE TABLE sessions(token_hash TEXT PRIMARY KEY,created_at INTEGER NOT NULL,expires_at INTEGER NOT NULL,revoked_at INTEGER);
+    CREATE INDEX sessions_expiry ON sessions(expires_at);
+";
+// Version 3 marks the recovery epoch contract. Copy-first migration to this
+// version rotates every vault identity after schema application, forcing stale
+// clients to reselect and take a fresh snapshot.
+const MIGRATION_3_SQL: &str = "";
+
+fn apply_migration(c: &Connection, version: i64, sql: &str) -> Result<()> {
+    let tx = c.unchecked_transaction()?;
+    tx.execute_batch(sql)?;
+    tx.execute(
+        "INSERT INTO schema_migrations(version,applied_at) VALUES(?,?)",
+        params![version, now_ms()],
+    )?;
+    verify_schema_at_version(&tx, version)?;
+    tx.commit()?;
     Ok(())
 }
 
@@ -451,12 +629,47 @@ pub fn verify_database(path: &Path) -> Result<()> {
 
 fn verify_connection(c: &Connection) -> Result<()> {
     verify_sqlite_integrity(c)?;
-    if table_exists(c, "schema_migrations")? {
-        verify_migration_history(c)?;
+    let version = verify_recorded_schema(c)?;
+    if version != CURRENT_SCHEMA_VERSION {
+        bail!(
+            "database schema version {version} requires offline migration to version {CURRENT_SCHEMA_VERSION}; use `blackglass-server migrate <source> <new-database>`"
+        )
     }
-    verify_blackglass_schema(c)?;
-    verify_foreign_keys(c)?;
-    verify_logical_invariants(c, true)?;
+    Ok(())
+}
+
+fn verify_recorded_schema(c: &Connection) -> Result<i64> {
+    if !table_exists(c, "schema_migrations")? {
+        bail!("database has no Blackglass migration metadata")
+    }
+    let versions = migration_versions(c)?;
+    reject_newer_migrations(&versions)?;
+    if versions.is_empty() || !SUPPORTED_MIGRATIONS.starts_with(&versions) {
+        bail!(
+            "unsupported Blackglass migration history: expected a non-empty prefix of {:?}, found {:?}",
+            SUPPORTED_MIGRATIONS,
+            versions
+        )
+    }
+    let version = *versions.last().unwrap();
+    verify_schema_at_version(c, version)?;
+    Ok(version)
+}
+
+fn verify_schema_at_version(c: &Connection, version: i64) -> Result<()> {
+    match version {
+        1 => {
+            verify_v1_schema(c)?;
+            verify_foreign_keys(c)?;
+            verify_logical_invariants(c, false)?;
+        }
+        2 | 3 => {
+            verify_blackglass_schema(c)?;
+            verify_foreign_keys(c)?;
+            verify_logical_invariants(c, true)?;
+        }
+        _ => bail!("no validator for database schema version {version}"),
+    }
     Ok(())
 }
 
@@ -478,7 +691,30 @@ fn verify_sqlite_integrity(c: &Connection) -> Result<()> {
 pub fn restore_database(source: &Path, destination: &Path) -> Result<()> {
     let src = open_existing_read_only(source, "restore source")?;
     verify_connection(&src).context("restore source validation failed")?;
-    copy_database(&src, destination, "restore destination")
+    with_new_database(destination, "restore destination", |target| {
+        run_online_backup(&src, target)?;
+        set_portable_journal(target)?;
+        verify_connection(target).context("copied restore source validation failed")?;
+        rotate_recovery_epoch(target)?;
+        verify_connection(target)
+    })
+}
+
+pub fn migrate_versioned_database(source: &Path, destination: &Path) -> Result<()> {
+    let source = open_existing_read_only(source, "versioned migration source")?;
+    verify_sqlite_integrity(&source).context("versioned migration source validation failed")?;
+    verify_recorded_schema(&source).context("versioned migration source validation failed")?;
+
+    with_new_database(destination, "versioned migration destination", |target| {
+        run_online_backup(&source, target)?;
+        verify_sqlite_integrity(target).context("copied migration source validation failed")?;
+        verify_recorded_schema(target).context("copied migration source validation failed")?;
+        target.pragma_update(None, "foreign_keys", "ON")?;
+        migrate(target)?;
+        rotate_recovery_epoch(target)?;
+        set_portable_journal(target)?;
+        verify_connection(target)
+    })
 }
 
 fn copy_database(source: &Connection, destination: &Path, label: &str) -> Result<()> {
@@ -499,9 +735,49 @@ pub fn migrate_legacy_database(source: &Path, destination: &Path) -> Result<()> 
         validate_migration_history_for_upgrade(target)?;
         target.pragma_update(None, "foreign_keys", "ON")?;
         migrate(target)?;
+        rotate_recovery_epoch(target)?;
         set_portable_journal(target)?;
         verify_connection(target)
     })
+}
+
+/// Establish a new recovery epoch after restoring or upgrading a copied
+/// database. Vault IDs are protocol identities, so rotating them prevents a
+/// stale device whose revision cursor is ahead of the restored history from
+/// silently skipping data even after the new server's global UID counter has
+/// overtaken that cursor. Sessions are cleared in the same transaction so a
+/// token captured in an older backup can never be resurrected by restore.
+fn rotate_recovery_epoch(connection: &mut Connection) -> Result<usize> {
+    let vault_ids = {
+        let mut query = connection.prepare("SELECT id FROM vaults ORDER BY id")?;
+        query
+            .query_map([], |row| row.get::<_, String>(0))?
+            .collect::<rusqlite::Result<Vec<_>>>()?
+    };
+    let replacements = vault_ids
+        .into_iter()
+        .map(|old_id| (old_id, Uuid::new_v4().to_string()))
+        .collect::<Vec<_>>();
+
+    let transaction = connection.transaction()?;
+    for (old_id, new_id) in &replacements {
+        transaction.execute(
+            "INSERT INTO vaults(
+                 id,name,keyhash,salt,host,region,encryption_version,size,created,password,version
+             )
+             SELECT ?,name,keyhash,salt,host,region,encryption_version,size,created,password,version
+               FROM vaults WHERE id=?",
+            params![new_id, old_id],
+        )?;
+        transaction.execute(
+            "UPDATE revisions SET vault_id=? WHERE vault_id=?",
+            params![new_id, old_id],
+        )?;
+        transaction.execute("DELETE FROM vaults WHERE id=?", [old_id])?;
+    }
+    transaction.execute("DELETE FROM sessions", [])?;
+    transaction.commit()?;
+    Ok(replacements.len())
 }
 
 fn run_online_backup(source: &Connection, destination: &mut Connection) -> Result<()> {
@@ -549,6 +825,7 @@ fn resolve_existing_regular_file(path: &Path, label: &str) -> Result<PathBuf> {
     if !metadata.is_file() {
         bail!("{label} is not a regular file: {}", path.display())
     }
+    reject_hardlinked_file(&metadata, path, label)?;
     let resolved = std::fs::canonicalize(path)
         .with_context(|| format!("resolve {label}: {}", path.display()))?;
     let resolved_metadata = std::fs::symlink_metadata(&resolved)
@@ -616,6 +893,7 @@ fn with_new_database(
         }
         return Err(error);
     }
+    sync_parent_directory(path)?;
     Ok(())
 }
 
@@ -633,6 +911,85 @@ pub fn revoke_all_sessions(path: &Path) -> Result<usize> {
     connection.pragma_update(None, "foreign_keys", "ON")?;
     verify_connection(&connection).context("session database validation failed")?;
     Db(Arc::new(Mutex::new(connection))).revoke_all_sessions()
+}
+
+pub fn rebind_data_host(path: &Path, new_host: &str, backup: &Path) -> Result<usize> {
+    crate::config::validate_public_data_host(new_host)?;
+    let _state_lock = crate::server::acquire_database_lock(path)?;
+    backup_database(path, backup).context("pre-rebind backup failed")?;
+
+    let mut connection = open_existing_read_write(path, "data-host rebind database")?;
+    connection.busy_timeout(std::time::Duration::from_secs(5))?;
+    connection.pragma_update(None, "foreign_keys", "ON")?;
+    verify_connection(&connection).context("data-host rebind database validation failed")?;
+    let transaction = connection.transaction()?;
+    let changed = transaction.execute(
+        "UPDATE vaults SET host=? WHERE host<>?",
+        params![new_host, new_host],
+    )?;
+    transaction.commit()?;
+    verify_connection(&connection).context("post-rebind database validation failed")?;
+    Ok(changed)
+}
+
+fn verify_v1_schema(c: &Connection) -> Result<()> {
+    verify_schema_objects(
+        c,
+        &[
+            ("index", "revisions_vault_path", "revisions"),
+            ("index", "revisions_vault_uid", "revisions"),
+            ("index", "sqlite_autoindex_vaults_1", "vaults"),
+            ("table", "revisions", "revisions"),
+            ("table", "schema_migrations", "schema_migrations"),
+            ("table", "sqlite_sequence", "sqlite_sequence"),
+            ("table", "vaults", "vaults"),
+        ],
+        "Blackglass v1",
+    )?;
+    verify_exact_table(
+        c,
+        "schema_migrations",
+        SCHEMA_MIGRATION_COLUMNS,
+        "Blackglass v1",
+    )?;
+    verify_exact_table(c, "vaults", VAULT_COLUMNS, "Blackglass v1")?;
+    verify_exact_table(c, "revisions", REVISION_TABLE_COLUMNS, "Blackglass v1")?;
+    verify_exact_table(
+        c,
+        "sqlite_sequence",
+        SQLITE_SEQUENCE_COLUMNS,
+        "Blackglass v1",
+    )?;
+    verify_exact_indexes(c, "schema_migrations", &[], "Blackglass v1")?;
+    verify_exact_indexes(
+        c,
+        "vaults",
+        &[IndexExpectation::primary_key(
+            "sqlite_autoindex_vaults_1",
+            &["id"],
+        )],
+        "Blackglass v1",
+    )?;
+    verify_exact_indexes(
+        c,
+        "revisions",
+        &[
+            IndexExpectation::ordinary("revisions_vault_path", &["vault_id", "path", "uid"]),
+            IndexExpectation::ordinary("revisions_vault_uid", &["vault_id", "uid"]),
+        ],
+        "Blackglass v1",
+    )?;
+    verify_exact_indexes(c, "sqlite_sequence", &[], "Blackglass v1")?;
+    verify_exact_foreign_keys(c, "schema_migrations", &[], "Blackglass v1")?;
+    verify_exact_foreign_keys(c, "vaults", &[], "Blackglass v1")?;
+    verify_exact_foreign_keys(
+        c,
+        "revisions",
+        &[ForeignKeyExpectation::cascade("vaults", "vault_id", "id")],
+        "Blackglass v1",
+    )?;
+    verify_exact_foreign_keys(c, "sqlite_sequence", &[], "Blackglass v1")?;
+    Ok(())
 }
 
 fn verify_blackglass_schema(c: &Connection) -> Result<()> {
@@ -883,6 +1240,17 @@ fn verify_exact_table(
     if !table_exists(c, table)? {
         bail!("not a {label} database: missing required table {table}")
     }
+    let creation_sql: String = c.query_row(
+        "SELECT sql FROM sqlite_schema WHERE type='table' AND name=?",
+        [table],
+        |row| row.get(0),
+    )?;
+    let normalized_sql = creation_sql.to_ascii_uppercase();
+    for unsupported in ["CHECK", "COLLATE", "DEFERRABLE", "WITHOUT ROWID", "STRICT"] {
+        if normalized_sql.contains(unsupported) {
+            bail!("invalid {label} table {table}: unsupported schema clause {unsupported}")
+        }
+    }
     // table_xinfo also exposes generated and hidden columns. table_info would
     // silently omit those and let a schema with extra columns pass verification.
     let sql = format!("PRAGMA table_xinfo(\"{table}\")");
@@ -1128,45 +1496,88 @@ fn verify_exact_foreign_keys(
 fn verify_logical_invariants(c: &Connection, external_content: bool) -> Result<()> {
     reject_invalid_row(
         c,
-        "SELECT id FROM vaults WHERE
-            typeof(id) <> 'text' OR length(id) = 0 OR
-            typeof(name) <> 'text' OR length(name) = 0 OR
+        &format!(
+            "SELECT id FROM vaults WHERE
+            typeof(id) <> 'text' OR length(id) NOT BETWEEN 1 AND 64 OR
+            typeof(name) <> 'text' OR length(name) NOT BETWEEN 1 AND 256 OR
             (keyhash IS NOT NULL AND typeof(keyhash) <> 'text') OR
             (salt IS NOT NULL AND typeof(salt) <> 'text') OR
-            typeof(host) <> 'text' OR length(host) = 0 OR
-            typeof(region) <> 'text' OR length(region) = 0 OR
+            typeof(host) <> 'text' OR length(host) NOT BETWEEN 1 AND 255 OR
+            typeof(region) <> 'text' OR length(region) NOT BETWEEN 1 AND 256 OR
             typeof(encryption_version) <> 'integer' OR encryption_version NOT BETWEEN 0 AND 3 OR
-            typeof(size) <> 'integer' OR size < 0 OR
-            typeof(created) <> 'integer' OR created < 0 OR
+            typeof(size) <> 'integer' OR size NOT BETWEEN 0 AND {max_safe} OR
+            typeof(created) <> 'integer' OR created NOT BETWEEN 0 AND {max_safe} OR
             (password IS NOT NULL AND typeof(password) <> 'text') OR
-            typeof(version) <> 'integer' OR version < 0
+            typeof(version) <> 'integer' OR version NOT BETWEEN 0 AND {max_safe}
          LIMIT 1",
+            max_safe = MAX_JS_SAFE_INTEGER
+        ),
         "vault field types and ranges",
+    )?;
+    reject_invalid_row(
+        c,
+        "SELECT id FROM vaults WHERE NOT (
+            (
+                password IS NULL AND
+                keyhash IS NOT NULL AND typeof(keyhash) = 'text' AND
+                length(keyhash) BETWEEN 1 AND 4096 AND
+                salt IS NOT NULL AND typeof(salt) = 'text' AND
+                length(salt) BETWEEN 1 AND 4096
+            ) OR (
+                password IS NOT NULL AND typeof(password) = 'text' AND
+                length(password) = 64 AND password NOT GLOB '*[^0-9a-f]*' AND
+                salt IS NOT NULL AND typeof(salt) = 'text' AND
+                length(salt) = 32 AND salt NOT GLOB '*[^0-9a-f]*' AND
+                (
+                    keyhash IS NULL OR
+                    (typeof(keyhash) = 'text' AND length(keyhash) BETWEEN 1 AND 4096)
+                )
+            )
+         ) LIMIT 1",
+        "vault encryption credential shape",
+    )?;
+    reject_invalid_row(
+        c,
+        &format!(
+            "SELECT CAST(COUNT(*) AS TEXT) FROM vaults HAVING COUNT(*) > {}",
+            MAX_VAULTS
+        ),
+        "vault count limit",
     )?;
     let revision_metadata = format!(
         "SELECT CAST(uid AS TEXT) FROM revisions WHERE
-            typeof(uid) <> 'integer' OR uid <= 0 OR
-            typeof(vault_id) <> 'text' OR length(vault_id) = 0 OR
-            typeof(path) <> 'text' OR length(path) = 0 OR
-            (relatedpath IS NOT NULL AND typeof(relatedpath) <> 'text') OR
-            typeof(extension) <> 'text' OR
-            typeof(hash) <> 'text' OR
-            typeof(ctime) <> 'integer' OR typeof(mtime) <> 'integer' OR
+            typeof(uid) <> 'integer' OR uid NOT BETWEEN 1 AND {max_safe} OR
+            typeof(vault_id) <> 'text' OR length(vault_id) NOT BETWEEN 1 AND 64 OR
+            typeof(path) <> 'text' OR length(path) NOT BETWEEN 1 AND 16384 OR
+            (relatedpath IS NOT NULL AND (typeof(relatedpath) <> 'text' OR length(relatedpath) > 16384)) OR
+            typeof(extension) <> 'text' OR length(extension) > 256 OR
+            typeof(hash) <> 'text' OR length(hash) > 4096 OR
+            typeof(ctime) <> 'integer' OR ctime NOT BETWEEN 0 AND {max_safe} OR
+            typeof(mtime) <> 'integer' OR mtime NOT BETWEEN 0 AND {max_safe} OR
             typeof(folder) <> 'integer' OR folder NOT IN (0,1) OR
             typeof(deleted) <> 'integer' OR deleted NOT IN (0,1) OR
-            typeof(size) <> 'integer' OR size < 0 OR
+            typeof(size) <> 'integer' OR size NOT BETWEEN 0 AND {max_safe} OR
             typeof(pieces) <> 'integer' OR pieces < 0 OR
             pieces <> CASE WHEN size=0 THEN 0 ELSE (size + {overhead}) / {piece_size} END OR
             ((folder=1 OR deleted=1) AND (size <> 0 OR pieces <> 0)) OR
             (content IS NOT NULL AND typeof(content) <> 'blob') OR
-            typeof(device) <> 'text' OR length(device) = 0 OR
+            typeof(device) <> 'text' OR length(device) NOT BETWEEN 1 AND 256 OR
             typeof(user_id) <> 'integer' OR user_id <> 1 OR
-            typeof(ts) <> 'integer' OR ts < 0
+            typeof(ts) <> 'integer' OR ts NOT BETWEEN 0 AND {max_safe}
          LIMIT 1",
         overhead = REVISION_PIECE_SIZE - 1,
         piece_size = REVISION_PIECE_SIZE,
+        max_safe = MAX_JS_SAFE_INTEGER,
     );
     reject_invalid_row(c, &revision_metadata, "revision metadata")?;
+    let mut revisions = c.prepare(&format!("SELECT {REVISION_COLUMNS} FROM revisions"))?;
+    let revisions = revisions.query_map([], revision_row)?;
+    for revision in revisions {
+        let notice = serde_json::to_vec(&PushNotice::from(revision?))?;
+        if notice.len() > crate::server::MAX_EVENT_BYTES {
+            bail!("revision notice exceeds the bounded wire size")
+        }
+    }
 
     if external_content {
         reject_invalid_row(
@@ -1198,9 +1609,13 @@ fn verify_logical_invariants(c: &Connection, external_content: bool) -> Result<(
 
     reject_invalid_row(
         c,
-        "SELECT name FROM sqlite_sequence
-          WHERE name <> 'revisions' OR typeof(seq) <> 'integer' OR seq < 0
-          LIMIT 1",
+        &format!(
+            "SELECT name FROM sqlite_sequence
+              WHERE name <> 'revisions' OR typeof(seq) <> 'integer'
+                 OR seq NOT BETWEEN 0 AND {}
+              LIMIT 1",
+            MAX_JS_SAFE_INTEGER
+        ),
         "revision sequence",
     )?;
     reject_invalid_row(
@@ -1241,24 +1656,32 @@ fn verify_logical_invariants(c: &Connection, external_content: bool) -> Result<(
     if table_exists(c, "schema_migrations")? {
         reject_invalid_row(
             c,
-            "SELECT CAST(version AS TEXT) FROM schema_migrations
+            &format!(
+                "SELECT CAST(version AS TEXT) FROM schema_migrations
               WHERE typeof(version) <> 'integer' OR
-                    typeof(applied_at) <> 'integer' OR applied_at < 0
+                    typeof(applied_at) <> 'integer' OR applied_at NOT BETWEEN 0 AND {}
               LIMIT 1",
+                MAX_JS_SAFE_INTEGER
+            ),
             "migration metadata",
         )?;
     }
     if table_exists(c, "sessions")? {
         reject_invalid_row(
             c,
-            "SELECT token_hash FROM sessions
+            &format!(
+                "SELECT token_hash FROM sessions
               WHERE typeof(token_hash) <> 'text' OR length(token_hash) <> 64 OR
                     token_hash GLOB '*[^0-9a-f]*' OR
-                    typeof(created_at) <> 'integer' OR created_at < 0 OR
-                    typeof(expires_at) <> 'integer' OR expires_at <= created_at OR
+                    typeof(created_at) <> 'integer' OR created_at NOT BETWEEN 0 AND {max_safe} OR
+                    typeof(expires_at) <> 'integer' OR expires_at NOT BETWEEN 1 AND {max_safe} OR
+                    expires_at <= created_at OR
                     (revoked_at IS NOT NULL AND
-                     (typeof(revoked_at) <> 'integer' OR revoked_at < created_at))
+                     (typeof(revoked_at) <> 'integer' OR
+                      revoked_at NOT BETWEEN created_at AND {max_safe}))
               LIMIT 1",
+                max_safe = MAX_JS_SAFE_INTEGER
+            ),
             "session token and timestamps",
         )?;
     }
@@ -1273,19 +1696,6 @@ fn reject_invalid_row(c: &Connection, sql: &str, invariant: &str) -> Result<()> 
         .optional()?;
     if let Some(identity) = invalid {
         bail!("database logical invariant failed ({invariant}): {identity}")
-    }
-    Ok(())
-}
-
-fn verify_migration_history(c: &Connection) -> Result<()> {
-    let versions = migration_versions(c)?;
-    reject_newer_migrations(&versions)?;
-    if versions != SUPPORTED_MIGRATIONS {
-        bail!(
-            "unsupported Blackglass migration history: expected {:?}, found {:?}",
-            SUPPORTED_MIGRATIONS,
-            versions
-        )
     }
     Ok(())
 }
@@ -1351,9 +1761,10 @@ fn sqlite_sidecar(path: &Path, suffix: &str) -> PathBuf {
 
 fn remove_database_files(path: &Path) -> Result<()> {
     let mut first_error = None;
+    let mut removed = false;
     for candidate in std::iter::once(path.to_path_buf()).chain(sqlite_sidecars(path)) {
         match std::fs::remove_file(&candidate) {
-            Ok(()) => {}
+            Ok(()) => removed = true,
             Err(error) if error.kind() == io::ErrorKind::NotFound => {}
             Err(error) if first_error.is_none() => {
                 first_error = Some(anyhow::Error::new(error).context(format!(
@@ -1364,7 +1775,39 @@ fn remove_database_files(path: &Path) -> Result<()> {
             Err(_) => {}
         }
     }
+    if first_error.is_none() && removed {
+        sync_parent_directory(path)?;
+    }
     first_error.map_or(Ok(()), Err)
+}
+
+fn sync_parent_directory(path: &Path) -> Result<()> {
+    #[cfg(unix)]
+    {
+        let parent = path
+            .parent()
+            .filter(|parent| !parent.as_os_str().is_empty())
+            .unwrap_or_else(|| Path::new("."));
+        File::open(parent)
+            .with_context(|| format!("open parent directory for sync: {}", parent.display()))?
+            .sync_all()
+            .with_context(|| format!("sync parent directory: {}", parent.display()))?;
+    }
+    Ok(())
+}
+
+fn reject_hardlinked_file(metadata: &std::fs::Metadata, path: &Path, label: &str) -> Result<()> {
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::MetadataExt;
+        if metadata.nlink() != 1 {
+            bail!(
+                "{label} must have exactly one filesystem link: {}",
+                path.display()
+            )
+        }
+    }
+    Ok(())
 }
 
 fn secure_file(path: &Path) -> Result<()> {
@@ -1452,6 +1895,23 @@ mod tests {
         drop(connection);
     }
 
+    fn create_v1_database(path: &Path) {
+        create_legacy_database(path);
+        let connection = Connection::open(path).unwrap();
+        connection
+            .execute_batch(
+                "CREATE TABLE schema_migrations(
+                    version INTEGER PRIMARY KEY,
+                    applied_at INTEGER NOT NULL
+                 );
+                 INSERT INTO schema_migrations(version,applied_at) VALUES(1,1);",
+            )
+            .unwrap();
+        drop(connection);
+        let connection = open_existing_read_only(path, "v1 test database").unwrap();
+        assert_eq!(verify_recorded_schema(&connection).unwrap(), 1);
+    }
+
     fn execute_sql(path: &Path, sql: &str) {
         let connection = Connection::open(path).unwrap();
         connection.execute_batch(sql).unwrap();
@@ -1506,6 +1966,173 @@ mod tests {
                 0o600
             );
         }
+    }
+
+    #[test]
+    fn versioned_migration_is_copy_first_validated_and_transactional() {
+        let dir = tempfile::tempdir().unwrap();
+        let source = dir.path().join("v1.sqlite");
+        let destination = dir.path().join("v2.sqlite");
+        create_v1_database(&source);
+        let source_before = std::fs::read(&source).unwrap();
+
+        migrate_versioned_database(&source, &destination).unwrap();
+
+        assert_eq!(std::fs::read(&source).unwrap(), source_before);
+        verify_database(&destination).unwrap();
+        let migrated = Db::open(&destination).unwrap();
+        let migrated_vault = migrated.list_vaults().unwrap().pop().unwrap();
+        assert_ne!(migrated_vault.id, "legacy-vault");
+        let revision = migrated
+            .list_changes_page(&migrated_vault.id, 0, i64::MAX, 10)
+            .unwrap()
+            .pop()
+            .unwrap();
+        assert_eq!(
+            migrated.content_chunk(revision.uid, 0, 3).unwrap(),
+            [1, 2, 3]
+        );
+
+        let rollback = dir.path().join("rollback-v1.sqlite");
+        create_v1_database(&rollback);
+        let connection = Connection::open(&rollback).unwrap();
+        connection
+            .pragma_update(None, "foreign_keys", "ON")
+            .unwrap();
+        assert_error_contains(
+            apply_migration(
+                &connection,
+                2,
+                "CREATE TABLE sessions(
+                    token_hash TEXT PRIMARY KEY,
+                    created_at INTEGER NOT NULL,
+                    expires_at INTEGER NOT NULL,
+                    revoked_at INTEGER
+                 );",
+            ),
+            "unexpected Blackglass schema objects",
+        );
+        assert!(!table_exists(&connection, "sessions").unwrap());
+        assert_eq!(migration_versions(&connection).unwrap(), vec![1]);
+        assert_eq!(verify_recorded_schema(&connection).unwrap(), 1);
+    }
+
+    #[test]
+    fn vault_replacement_rolls_back_on_failure_and_removes_old_history_on_success() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("vault-migration.sqlite");
+        let database = Db::open(&path).unwrap();
+        let source = Vault {
+            id: "old-vault".into(),
+            name: "Vault".into(),
+            keyhash: Some("old-key".into()),
+            salt: Some("old-salt".into()),
+            host: "old.example".into(),
+            region: "Blackglass Server".into(),
+            encryption_version: 2,
+            size: 0,
+            created: 1,
+            password: None,
+        };
+        database.create_vault(&source).unwrap();
+        database
+            .add_empty_revision(&NewRevision {
+                vault_id: source.id.clone(),
+                path: "opaque".into(),
+                relatedpath: None,
+                extension: "md".into(),
+                hash: "hash".into(),
+                ctime: 1,
+                mtime: 2,
+                folder: false,
+                deleted: false,
+                size: 0,
+                pieces: 0,
+                device: "test".into(),
+                user_id: 1,
+            })
+            .unwrap();
+
+        let conflicting = Vault {
+            id: source.id.clone(),
+            encryption_version: 3,
+            created: 2,
+            ..source.clone()
+        };
+        assert!(database.migrate_vault(&source.id, &conflicting).is_err());
+        assert!(database.find_vault(&source.id).unwrap().is_some());
+        assert_eq!(database.current_version(&source.id).unwrap(), 1);
+
+        let replacement = Vault {
+            id: "new-vault".into(),
+            name: source.name.clone(),
+            keyhash: Some("new-key".into()),
+            salt: Some("new-salt".into()),
+            host: "new.example".into(),
+            region: "Blackglass Server".into(),
+            encryption_version: 3,
+            size: 0,
+            created: 3,
+            password: None,
+        };
+        assert!(database.migrate_vault(&source.id, &replacement).unwrap());
+        assert!(database.find_vault(&source.id).unwrap().is_none());
+        assert_eq!(
+            database.find_vault(&replacement.id).unwrap().unwrap().size,
+            0
+        );
+        assert!(
+            database
+                .list_changes_page(&replacement.id, 0, i64::MAX, 10)
+                .unwrap()
+                .is_empty()
+        );
+    }
+
+    #[test]
+    fn data_host_rebind_requires_a_verified_copy_first_backup() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("rebind.sqlite");
+        let database = Db::open(&path).unwrap();
+        database
+            .create_vault(&Vault {
+                id: "vault".into(),
+                name: "Vault".into(),
+                keyhash: Some("key".into()),
+                salt: Some("salt".into()),
+                host: "old.example".into(),
+                region: "Blackglass Server".into(),
+                encryption_version: 3,
+                size: 0,
+                created: 1,
+                password: None,
+            })
+            .unwrap();
+        database.checkpoint().unwrap();
+        drop(database);
+
+        let blocked_backup = dir.path().join("blocked.sqlite");
+        std::fs::write(&blocked_backup, b"preserve").unwrap();
+        assert!(rebind_data_host(&path, "new.example", &blocked_backup).is_err());
+        assert_eq!(std::fs::read(&blocked_backup).unwrap(), b"preserve");
+        assert_eq!(
+            Db::open(&path).unwrap().list_vaults().unwrap()[0].host,
+            "old.example"
+        );
+
+        let backup = dir.path().join("pre-rebind.sqlite");
+        assert_eq!(
+            rebind_data_host(&path, "new.example:8443", &backup).unwrap(),
+            1
+        );
+        assert_eq!(
+            Db::open(&path).unwrap().list_vaults().unwrap()[0].host,
+            "new.example:8443"
+        );
+        assert_eq!(
+            Db::open(&backup).unwrap().list_vaults().unwrap()[0].host,
+            "old.example"
+        );
     }
 
     #[test]
@@ -1619,6 +2246,8 @@ mod tests {
         let active = db.issue_session(60).unwrap();
         assert_eq!(db.revoke_all_sessions().unwrap(), 1);
         assert!(!db.valid_session(&active));
+        let backup_active = db.issue_session(60).unwrap();
+        assert!(db.valid_session(&backup_active));
         let vault = Vault {
             id: "v1".into(),
             name: "Vault".into(),
@@ -1663,8 +2292,12 @@ mod tests {
         assert!(!dir.path().join("restored.sqlite-shm").exists());
         assert!(!dir.path().join("restored.sqlite-journal").exists());
         let copy = Db::open(&restored).unwrap();
-        assert_eq!(copy.list_vaults().unwrap().len(), 1);
-        assert_eq!(copy.current_version("v1").unwrap(), 1);
+        let restored_vault = copy.list_vaults().unwrap().pop().unwrap();
+        assert_ne!(restored_vault.id, "v1");
+        assert_eq!(copy.current_version("v1").unwrap(), 0);
+        assert_eq!(copy.current_version(&restored_vault.id).unwrap(), 1);
+        assert!(!copy.valid_session(&backup_active));
+        assert!(db.valid_session(&backup_active));
     }
 
     #[test]
@@ -1730,6 +2363,19 @@ mod tests {
             std::os::unix::fs::symlink(&database, &symlink).unwrap();
             assert_error_contains(verify_database(&symlink), "is not a regular file");
             assert_error_contains(revoke_all_sessions(&symlink), "is not a regular file");
+
+            let hardlink_database = dir.path().join("hardlink-database.sqlite");
+            create_current_database(&hardlink_database);
+            let hardlink = dir.path().join("hardlink-alias.sqlite");
+            std::fs::hard_link(&hardlink_database, &hardlink).unwrap();
+            assert_error_contains(
+                verify_database(&hardlink_database),
+                "must have exactly one filesystem link",
+            );
+            assert_error_contains(
+                verify_database(&hardlink),
+                "must have exactly one filesystem link",
+            );
         }
     }
 
@@ -1755,10 +2401,7 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let empty = dir.path().join("empty.sqlite");
         File::create(&empty).unwrap();
-        assert_error_contains(
-            verify_database(&empty),
-            "unexpected Blackglass schema objects",
-        );
+        assert_error_contains(verify_database(&empty), "no Blackglass migration metadata");
 
         let wrong = dir.path().join("wrong.sqlite");
         let connection = Connection::open(&wrong).unwrap();
@@ -1901,6 +2544,45 @@ mod tests {
             verify_database(&generated).is_err(),
             "generated column drift passed verification"
         );
+
+        for (name, mutate, expected) in [
+            (
+                "check",
+                "CHECK (size >= 0)",
+                "unsupported schema clause CHECK",
+            ),
+            ("strict", "STRICT", "unsupported schema clause STRICT"),
+        ] {
+            let path = dir.path().join(format!("table-option-{name}.sqlite"));
+            create_current_database(&path);
+            let connection = Connection::open(&path).unwrap();
+            let definition: String = connection
+                .query_row(
+                    "SELECT sql FROM sqlite_schema WHERE type='table' AND name='vaults'",
+                    [],
+                    |row| row.get(0),
+                )
+                .unwrap();
+            let changed = if name == "check" {
+                format!("{}, {mutate})", definition.strip_suffix(')').unwrap())
+            } else {
+                format!("{definition} {mutate}")
+            };
+            connection
+                .pragma_update(None, "writable_schema", "ON")
+                .unwrap();
+            connection
+                .execute(
+                    "UPDATE sqlite_schema SET sql=? WHERE type='table' AND name='vaults'",
+                    [changed],
+                )
+                .unwrap();
+            connection
+                .pragma_update(None, "writable_schema", "OFF")
+                .unwrap();
+            drop(connection);
+            assert_error_contains(verify_database(&path), expected);
+        }
     }
 
     #[test]
@@ -1931,6 +2613,31 @@ mod tests {
                 "pieces",
                 "UPDATE revisions SET pieces=2;",
                 "revision metadata",
+            ),
+            (
+                "vault-name-bound",
+                "UPDATE vaults SET name=printf('%0257d',0);",
+                "vault field types and ranges",
+            ),
+            (
+                "revision-path-bound",
+                "UPDATE revisions SET path=printf('%016385d',0);",
+                "revision metadata",
+            ),
+            (
+                "revision-wire-bound",
+                "UPDATE revisions SET path=replace(printf('%06000d',0),'0',char(1));",
+                "revision notice exceeds the bounded wire size",
+            ),
+            (
+                "vault-count-bound",
+                "WITH RECURSIVE numbers(n) AS (
+                    SELECT 1 UNION ALL SELECT n+1 FROM numbers WHERE n<100
+                 )
+                 INSERT INTO vaults(id,name,keyhash,salt,host,region,encryption_version,size,created,password,version)
+                 SELECT printf('extra-%d',n),'extra','key','salt','127.0.0.1:3003','Blackglass Server',3,0,n,NULL,0
+                 FROM numbers;",
+                "vault count limit",
             ),
             (
                 "sequence-duplicate",
@@ -1966,6 +2673,26 @@ mod tests {
                  VALUES('aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa',10,20,9);",
                 "session token and timestamps",
             ),
+            (
+                "missing-vault-credentials",
+                "UPDATE vaults SET keyhash=NULL,salt=NULL,password=NULL;",
+                "vault encryption credential shape",
+            ),
+            (
+                "empty-custom-vault-credentials",
+                "UPDATE vaults SET keyhash='',salt='salt',password=NULL;",
+                "vault encryption credential shape",
+            ),
+            (
+                "malformed-managed-vault-credentials",
+                "UPDATE vaults SET keyhash=NULL,salt='abcd',password='abcd';",
+                "vault encryption credential shape",
+            ),
+            (
+                "empty-managed-keyhash",
+                "UPDATE vaults SET keyhash='',salt=lower(hex(zeroblob(16))),password=lower(hex(zeroblob(32)));",
+                "vault encryption credential shape",
+            ),
         ] {
             let path = create_migrated_database(dir.path(), name);
             execute_sql(&path, mutation);
@@ -2000,7 +2727,7 @@ mod tests {
         let connection = Connection::open(&source).unwrap();
         connection
             .execute(
-                "INSERT INTO schema_migrations(version, applied_at) VALUES(3, 3)",
+                "INSERT INTO schema_migrations(version, applied_at) VALUES(4, 4)",
                 [],
             )
             .unwrap();
@@ -2015,7 +2742,7 @@ mod tests {
             revoke_all_sessions(&source).map(|_| ()),
             Db::open(&source).map(|_| ()),
         ] {
-            assert_error_contains(result, "schema version 3 is newer");
+            assert_error_contains(result, "schema version 4 is newer");
         }
         assert!(!backup.exists());
         assert!(!restored.exists());
@@ -2149,10 +2876,11 @@ mod tests {
         let migrated = Db::open(&destination).unwrap();
         let vaults = migrated.list_vaults().unwrap();
         assert_eq!(vaults.len(), 1);
-        assert_eq!(vaults[0].id, "legacy-vault");
-        let through = migrated.current_version("legacy-vault").unwrap();
+        assert_ne!(vaults[0].id, "legacy-vault");
+        let migrated_vault_id = vaults[0].id.clone();
+        let through = migrated.current_version(&migrated_vault_id).unwrap();
         let revisions = migrated
-            .list_changes_page("legacy-vault", 0, through, 1024)
+            .list_changes_page(&migrated_vault_id, 0, through, 1024)
             .unwrap();
         assert_eq!(revisions.len(), 1);
         assert_eq!(
@@ -2231,7 +2959,7 @@ mod tests {
         let connection = Connection::open(&current).unwrap();
         connection
             .execute(
-                "INSERT INTO schema_migrations(version, applied_at) VALUES(3, 3)",
+                "INSERT INTO schema_migrations(version, applied_at) VALUES(4, 4)",
                 [],
             )
             .unwrap();
@@ -2239,7 +2967,7 @@ mod tests {
         let future_destination = dir.path().join("future-destination.sqlite");
         assert_error_contains(
             migrate_legacy_database(&current, &future_destination),
-            "schema version 3 is newer",
+            "schema version 4 is newer",
         );
         assert!(!future_destination.exists());
     }

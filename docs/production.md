@@ -10,15 +10,18 @@ compatible. Prefer a custom vault password when the server operator must not be
 able to derive the vault key; managed mode stores its generated recovery
 password in SQLite and backups.
 
-The server has two loopback listeners. A TLS reverse proxy is the only public
-listener:
+Native installs have two loopback listeners. A TLS reverse proxy is the only
+public listener:
 
 ```text
 Obsidian -> HTTPS control hostname -> Caddy -> 127.0.0.1:3000
 Obsidian -> WSS data hostname      -> Caddy -> 127.0.0.1:3003
 ```
 
-The process refuses non-loopback binding. SQLite runs in WAL mode with
+The native default refuses non-loopback binding. The OCI image makes the
+narrowly scoped `0.0.0.0` plus acknowledgement opt-in required for private
+bridge/Pod networking; a TLS ingress remains the only client-facing boundary.
+SQLite runs in WAL mode with
 `synchronous=FULL`, so an acknowledged commit is durable across operating-system
 crashes and power loss within SQLite's documented filesystem assumptions.
 Connections enable SQLite defensive mode and disable trusted schemas. Encrypted
@@ -72,19 +75,28 @@ restricted syscall/address-family surface.
 ## TLS and client endpoints
 
 Copy `ops/Caddyfile.example`, replace both names, and set
-`SELFHOST_DATA_HOST` to the data hostname without a scheme. Generate the client
-adapter with the matching HTTPS control origin and data host. Do not put the
-control and data services directly on a public interface.
+`SELFHOST_DATA_HOST` to a stable data hostname without a scheme. Generate the
+client adapter with the matching HTTPS control origin and data host. Explicit
+`:443`, deceptive `localhost*`/`127.0.0.1*` names, IPv6 loopback, and non-exact
+127/8 addresses are rejected because Obsidian 1.12.7 would choose the wrong
+WebSocket transport. Do not put the control and data services directly on a
+public interface.
 
 The control and data services accept only the configured exact renderer origins.
 `SELFHOST_ALLOWED_ORIGINS` is a comma-separated list of at most eight origins;
-the default remains `app://obsidian.md`. Desktop plus Android deployments should
-use `app://obsidian.md,http://localhost`. The legacy singular
+the desktop default is `app://obsidian.md`. Mobile clients are not qualified.
+The legacy singular
 `SELFHOST_ALLOWED_ORIGIN` remains accepted for one origin, but must not be set at
-the same time as the plural variable. Never use wildcard CORS. Sign-in is
-globally limited to ten attempts per minute in the process. If a proxy or
-firewall adds rate limiting, treat that as a second layer rather than a
-replacement.
+the same time as the plural variable. Never use wildcard CORS.
+
+At most two Argon2 password checks run concurrently, capping their worst-case
+working memory at 128 MiB under the supplied 256 MiB systemd limit. The process
+does not apply a global hard login bucket, because one attacker could keep the
+owner locked out. The TLS ingress or firewall must instead rate-limit sign-in
+per real source address and cap connections; do not trust forwarded client-IP
+headers unless the ingress overwrites them and untrusted peers cannot reach the
+service. `SELFHOST_MAX_WS_CONNECTIONS` defaults to 16 and is constrained to
+1..32 by the same memory envelope.
 
 ## Health, metrics, and logs
 
@@ -150,9 +162,39 @@ paired with this command.
 
 Back up and verify before every server upgrade. Install a versioned binary,
 stop the service, change the `/opt/blackglass-server/blackglass-server`
-symlink, and start it. Migrations are transactional and forward-only. Rollback
-therefore means restoring the pre-upgrade database together with the previous
-binary, not running an older binary against a migrated database.
+symlink, and start it. Startup never mutates an older recognized schema. When a
+release requires a schema change, keep the service stopped and create a new,
+fully validated copy first:
+
+```sh
+blackglass-server migrate server-vOLD.sqlite server-vNEW.sqlite
+```
+
+Only after `verify server-vNEW.sqlite` succeeds should configuration point at
+the new file. The source stays unchanged. Each migration step validates its
+input/output inside the transaction and rolls back on failure. Rollback means
+restoring the pre-upgrade database together with the previous binary, not
+running an older binary against a migrated database.
+
+### Changing the public data host
+
+Vault records and existing client profiles persist the returned data host.
+Prefer stable DNS so routine server moves need no change. If the domain or port
+must change, stop the service and create a verified backup before the
+transactional rebind:
+
+```sh
+blackglass-server rebind-data-host \
+  /var/lib/blackglass-server/server.sqlite \
+  new-sync-data.example.com \
+  /var/backups/blackglass-server/pre-rebind.sqlite
+```
+
+Set `SELFHOST_DATA_HOST` to exactly the same canonical value and restart. The
+server refuses mixed or mismatched persisted hosts with an actionable error.
+Existing clients still know the old endpoint and must reconnect/reselect the
+remote vault through a newly adapted client endpoint. Keep the old DNS route
+available during that controlled transition when possible.
 
 ### One-time migration from the pre-Blackglass service name
 
@@ -161,7 +203,7 @@ The branding change moved the default database from
 `/var/lib/blackglass-server/server.sqlite`. Do not start the new unit against an
 empty database and assume that the old vaults were deleted.
 
-Stop both units, retain an off-host backup, and use the online SQLite
+Stop both units, retain an off-host backup, and use the offline copy-first SQLite
 legacy migration path to create a verified, migrated copy without changing or
 deleting the legacy database. Normal `verify`, `backup`, and `restore` commands
 require current Blackglass migration metadata; `migrate-legacy` is the only
@@ -192,8 +234,11 @@ the newly generated local build. The server URL does not need to change.
 
 Each active upload holds at most one WebSocket frame (2 MiB) plus small
 metadata in memory and one ciphertext staging file on disk. Upload concurrency
-defaults to four and is configurable. Pulls read SQLite in 2 MiB pieces. This
-keeps memory bounded by concurrency, not vault or attachment size. SQLite is
+defaults to four and is configurable. WebSocket admission defaults to 16 and
+cannot exceed 32; two 64 MiB Argon2 checks, 32 worst-case 2 MiB frames, and 32
+MiB of base headroom fit the supplied 256 MiB service cap. Pulls read SQLite in
+2 MiB pieces. This keeps memory bounded by concurrency, not vault or attachment
+size. SQLite is
 the correct database while the deployment remains a single writer node; do
 not place its files on a network filesystem.
 

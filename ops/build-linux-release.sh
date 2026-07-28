@@ -24,6 +24,10 @@ command -v docker >/dev/null 2>&1 || {
     echo "Docker with Buildx is required" >&2
     exit 1
 }
+command -v curl >/dev/null 2>&1 || {
+    echo "curl is required for the container reachability smoke" >&2
+    exit 1
+}
 docker buildx version >/dev/null
 
 version=$(awk '
@@ -90,10 +94,17 @@ docker buildx build \
 archive_name="blackglass-server-v${version}-${target}.tar.gz"
 archive="$dist_dir/$archive_name"
 checksum="$archive.sha256"
+raw_binary_name="blackglass-server-v${version}-${target}"
+raw_binary="$dist_dir/$raw_binary_name"
+raw_checksum="$raw_binary.sha256"
 test -f "$temporary/out/$archive_name"
 test -f "$temporary/out/$archive_name.sha256"
+test -f "$temporary/out/$raw_binary_name"
+test -f "$temporary/out/$raw_binary_name.sha256"
 cp "$temporary/out/$archive_name" "$archive"
 cp "$temporary/out/$archive_name.sha256" "$checksum"
+cp "$temporary/out/$raw_binary_name" "$raw_binary"
+cp "$temporary/out/$raw_binary_name.sha256" "$raw_checksum"
 
 docker buildx build \
     --platform "$platform" \
@@ -121,24 +132,37 @@ password_hash=$(printf '%s\n' release-runtime-password | docker run --rm -i \
     "$image" hash-password)
 container=$(docker run --detach --rm \
     --platform "$platform" \
-    --network none \
+    --stop-timeout 30 \
+    --publish 127.0.0.1::3000 \
+    --publish 127.0.0.1::3003 \
     --read-only \
+    --memory 256m \
+    --pids-limit 64 \
+    --tmpfs /tmp:rw,noexec,nosuid,nodev,size=32m,mode=1777 \
     --cap-drop ALL \
     --security-opt no-new-privileges \
     --env SELFHOST_EMAIL=release-runtime@example.test \
+    --env SELFHOST_DATA_HOST=sync-data.example.test \
     --env "SELFHOST_PASSWORD_HASH=$password_hash" \
     "$image" serve)
+control_address=$(docker port "$container" 3000/tcp)
+data_address=$(docker port "$container" 3003/tcp)
+test -n "$control_address"
+test -n "$data_address"
 started=0
 for _attempt in 1 2 3 4 5 6 7 8 9 10; do
-    if docker logs "$container" 2>&1 | grep -q '"event":"server_started"'; then
+    if curl --fail --silent "http://$control_address/health" > "$temporary/container-health.json" \
+        && curl --silent --output /dev/null "http://$data_address/" \
+        && docker logs "$container" 2>&1 | grep -q '"event":"server_started"'; then
         started=1
         break
     fi
     sleep 1
 done
 test "$started" -eq 1
-docker stop --time 10 "$container" >/dev/null
+grep -q '"service":"blackglass-server"' "$temporary/container-health.json"
+docker stop --time 30 "$container" >/dev/null
 container=
 
-"$project_root/ops/verify-linux-release.sh" "$target" "$archive"
-echo "release ready: $archive"
+"$project_root/ops/verify-linux-release.sh" "$target" "$archive" "$raw_binary"
+echo "release ready: $archive and $raw_binary"

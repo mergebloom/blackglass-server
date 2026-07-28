@@ -4,7 +4,8 @@ After=network.target
 
 [Service]
 Type=simple
-DynamicUser=yes
+User=blackglass-server
+Group=blackglass-server
 StateDirectory=blackglass-server
 StateDirectoryMode=0700
 EnvironmentFile=/etc/blackglass-server/server.env

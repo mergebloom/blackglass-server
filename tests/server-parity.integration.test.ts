@@ -5,6 +5,8 @@ import { tmpdir } from "node:os";
 import { join, resolve } from "node:path";
 
 const root = resolve(import.meta.dir, "..");
+const configuredBinary = process.env.BLACKGLASS_RUST_BINARY;
+const rustBinary = configuredBinary ?? join(root, "apps/server-rust/target/debug/blackglass-server");
 const children: Array<ReturnType<typeof Bun.spawn>> = [];
 const sockets: WebSocket[] = [];
 let oracle: Endpoint;
@@ -21,9 +23,11 @@ describe("Bun oracle and Rust protocol parity", () => {
       cwd: root, stdout: "pipe", stderr: "pipe",
       env: { ...process.env, SELFHOST_BIND_HOST: "127.0.0.1", SELFHOST_CONTROL_PORT: String(ports[0]), SELFHOST_DATA_PORT: String(ports[1]), SELFHOST_DATA_HOST: `127.0.0.1:${ports[1]}`, SELFHOST_DATABASE: join(directory, "oracle.sqlite"), SELFHOST_EMAIL: "owner@example.test", SELFHOST_PASSWORD: "test-password", SELFHOST_TOKEN: staticToken, SELFHOST_NAME: "Parity owner", SELFHOST_PER_FILE_MAX: String(8 * 1024 * 1024) },
     });
-    const rustBuild = Bun.spawnSync(["cargo", "build", "--manifest-path", join(root, "apps/server-rust/Cargo.toml")], { cwd: root, stdout: "pipe", stderr: "pipe" });
-    if (rustBuild.exitCode !== 0) throw new Error(rustBuild.stderr.toString());
-    const rustChild = Bun.spawn([join(root, "apps/server-rust/target/debug/blackglass-server"), "serve"], {
+    if (!configuredBinary) {
+      const rustBuild = Bun.spawnSync(["cargo", "build", "--manifest-path", join(root, "apps/server-rust/Cargo.toml")], { cwd: root, stdout: "pipe", stderr: "pipe" });
+      if (rustBuild.exitCode !== 0) throw new Error(rustBuild.stderr.toString());
+    }
+    const rustChild = Bun.spawn([rustBinary, "serve"], {
       cwd: root, stdout: "pipe", stderr: "pipe",
       env: { ...process.env, SELFHOST_BIND_HOST: "127.0.0.1", SELFHOST_CONTROL_PORT: String(ports[2]), SELFHOST_DATA_PORT: String(ports[3]), SELFHOST_DATA_HOST: `127.0.0.1:${ports[3]}`, SELFHOST_DATABASE: join(directory, "rust.sqlite"), SELFHOST_STAGING_DIR: join(directory, "uploads"), SELFHOST_EMAIL: "owner@example.test", SELFHOST_PASSWORD: "test-password", SELFHOST_ALLOW_PLAINTEXT_PASSWORD: "1", SELFHOST_NAME: "Parity owner", SELFHOST_PER_FILE_MAX: String(8 * 1024 * 1024), SELFHOST_ALLOWED_ORIGIN: "app://obsidian.md", SELFHOST_LOG_FORMAT: "pretty" },
     });

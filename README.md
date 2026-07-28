@@ -41,10 +41,12 @@ mobile clients, Windows servers, and 32-bit hosts are not supported yet.
 
 ## Architecture
 
-The server runs one Rust process with two loopback listeners: HTTP for account
-and vault control, and WebSocket for encrypted Sync data. A TLS reverse proxy is
-the only public listener. SQLite stores opaque ciphertext and protocol state.
-Blackglass Bridge owns the small, release-specific client endpoint adapter.
+The server runs one Rust process with separate HTTP control and WebSocket Sync
+listeners. Native installs default to loopback; the OCI image uses an explicit
+container-only external-bind acknowledgement so a private bridge or Pod network
+can reach it. A TLS reverse proxy or ingress is the only public listener. SQLite
+stores opaque ciphertext and protocol state. Blackglass Bridge owns the small,
+release-specific client endpoint adapter.
 
 See [architecture](docs/architecture.md) for the component and trust boundaries.
 
@@ -71,8 +73,9 @@ Plaintext credentials and transport are for loopback development only.
 
 ## Deploy
 
-Tagged releases produce checksummed static-musl archives for `linux-amd64` and
-`linux-arm64`, plus a minimal non-root multi-architecture OCI image. Start with
+Tagged releases produce checksummed static-musl archives and separately
+downloadable raw binaries for `linux-amd64` and `linux-arm64`, plus a minimal
+non-root multi-architecture OCI image. Start with
 [distribution](docs/distribution.md) to select and verify an artifact, then use
 [production operations](docs/production.md) for TLS, systemd, backups,
 monitoring, upgrades, and recovery.
@@ -93,8 +96,9 @@ revision ordering. In the built-in managed-encryption mode, the server securely
 generates and stores the recovery password, so the operator is additionally in
 the confidentiality trust boundary. Account passwords use Argon2id; sessions
 are expiring, revocable bearer tokens whose digests are stored. Production
-binds only to loopback behind HTTPS/WSS, and memory use is bounded by frame and
-concurrency limits.
+defaults to loopback behind HTTPS/WSS, and memory use is bounded by frame and
+concurrency limits. Container binding is allowed only through the image's
+explicit opt-in and must remain on a private network behind TLS ingress.
 
 Read the full [security model](docs/security.md). Report vulnerabilities using
 [SECURITY.md](SECURITY.md), not a public issue.

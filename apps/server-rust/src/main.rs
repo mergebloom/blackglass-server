@@ -13,8 +13,12 @@ use tracing_subscriber::EnvFilter;
 
 const NAME: &str = "blackglass-server";
 const VERSION: &str = env!("CARGO_PKG_VERSION");
+pub(crate) const SOURCE_REVISION: &str = match option_env!("BLACKGLASS_SOURCE_REVISION") {
+    Some(revision) => revision,
+    None => "unknown",
+};
 
-#[tokio::main]
+#[tokio::main(worker_threads = 2)]
 async fn main() -> Result<()> {
     let args = std::env::args().skip(1).collect::<Vec<_>>();
     match args.as_slice() {
@@ -34,6 +38,17 @@ async fn main() -> Result<()> {
         }
         [command] if command == "--version" || command == "-V" || command == "version" => {
             println!("{NAME} {VERSION}");
+            Ok(())
+        }
+        [command] if command == "build-info" => {
+            println!(
+                "{}",
+                serde_json::json!({
+                    "name": NAME,
+                    "version": VERSION,
+                    "sourceRevision": SOURCE_REVISION,
+                })
+            );
             Ok(())
         }
         [command] if command == "hash-password" => {
@@ -77,6 +92,27 @@ async fn main() -> Result<()> {
             );
             Ok(())
         }
+        [command, source, destination] if command == "migrate" => {
+            let source = PathBuf::from(source);
+            let destination = PathBuf::from(destination);
+            db::migrate_versioned_database(&source, &destination)?;
+            println!(
+                "versioned migration verified: {} -> {}",
+                source.display(),
+                destination.display()
+            );
+            Ok(())
+        }
+        [command, database, data_host, backup] if command == "rebind-data-host" => {
+            let database = PathBuf::from(database);
+            let backup = PathBuf::from(backup);
+            let changed = db::rebind_data_host(&database, data_host, &backup)?;
+            println!(
+                "rebound {changed} vault(s) to {data_host}; verified backup: {}",
+                backup.display()
+            );
+            Ok(())
+        }
         [command, path] if command == "revoke-all-sessions" => {
             let path = PathBuf::from(path);
             println!("revoked sessions: {}", db::revoke_all_sessions(&path)?);
@@ -91,8 +127,10 @@ fn print_help() {
         "{NAME} {VERSION}\n\n\
 Usage:\n  {NAME} serve\n  {NAME} hash-password\n  {NAME} backup <database> <output>\n  \
 {NAME} verify <database>\n  {NAME} restore <backup> <new-database>\n  \
+{NAME} migrate <versioned-database> <new-database>\n  \
 {NAME} migrate-legacy <legacy-database> <new-database>\n  \
-{NAME} revoke-all-sessions <database>\n  {NAME} --version\n  {NAME} --help"
+{NAME} rebind-data-host <database> <new-host> <backup>\n  \
+{NAME} revoke-all-sessions <database>\n  {NAME} build-info\n  {NAME} --version\n  {NAME} --help"
     );
 }
 fn init_tracing(json: bool) {

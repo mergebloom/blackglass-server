@@ -100,7 +100,7 @@ describe("single-user compatibility service", () => {
     expect(signin).toMatchObject({
       email: config.email,
       token: config.token,
-      license: "selfhosted-sync",
+      license: null,
     });
 
     const regions = await post(service.controlOrigin, "/vault/regions", {

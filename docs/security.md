@@ -20,14 +20,15 @@ E2EE does not hide those facts.
 
 | Risk | Control |
 | --- | --- |
-| Internet exposure | Server refuses non-loopback binds; Caddy is the public TLS/WSS boundary |
+| Internet exposure | Native default is loopback; OCI external binding requires an explicit acknowledgement and private bridge/Pod network; Caddy/Ingress is the only public TLS/WSS boundary |
 | Password theft | Argon2id verifier supplied by a root-readable environment file; plaintext production configuration is rejected; accepted PHC work parameters are bounded before verification |
 | Token theft | Random 256-bit sessions, SHA-256 digests at rest, bounded lifetime, sign-out revocation, and an offline revoke-all command |
-| Login guessing/CPU exhaustion | Uniform credential error, global ten-attempt/minute limiter, and Argon2 work off the async reactor |
+| Login guessing/CPU exhaustion | Uniform credential error, at most two bounded Argon2 checks off the async reactor, and mandatory ingress/firewall per-source rate limiting without a globally exhaustible owner lockout |
 | Cross-origin control calls | Bounded exact renderer-origin allowlist, matched-origin preflight responses, bounded 64 KiB JSON bodies |
-| Memory/disk exhaustion | 2 MiB frames, declared-size/piece validation, per-file cap, upload semaphore, private staging files, and external disk monitoring |
-| Partial uploads/crashes | Unique mode-0600 staging files, commit only after exact byte/piece match and fsync, startup cleanup |
-| SQLite corruption or hostile schema | WAL with FULL synchronous commits, foreign keys, defensive/untrusted-schema connections, transactional migrations, graceful checkpoint, online backup API, exact schema/logical verification, and restore drills |
+| Memory/disk exhaustion | 2 MiB frames, 16 default/32 maximum WebSockets, declared-size/piece validation, per-file cap, upload semaphore, private staging files, ingress connection limits, and external disk monitoring |
+| Partial uploads/crashes | Unique mode-0600 staging files, commit only after exact byte/piece match and fsync, cleanup on every commit result, and startup cleanup |
+| SQLite corruption or hostile schema | WAL with FULL synchronous commits, foreign keys, defensive/untrusted-schema connections, copy-first offline per-version migrations with transactional validation/rollback, graceful checkpoint, online backup API, exact schema/logical verification, and restore drills |
+| Endpoint rotation | Canonical data-host validation, startup equality gate across persisted vaults, and a verified-backup-first transactional rebind command |
 | Data leakage through logs | Structured events omit credentials, tokens, ciphertext paths/hashes/bodies, and managed vault recovery passwords |
 | Privilege escalation | Dynamic unprivileged systemd user, empty capabilities, strict filesystem/device/kernel protections, syscall and address-family restrictions |
 | Client drift | Version-specific deterministic patch anchors, upstream/generated hashes, updates disabled in the copied profile, and official-client E2E qualification |

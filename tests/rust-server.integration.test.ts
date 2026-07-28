@@ -1,5 +1,5 @@
 import { afterAll, beforeAll, describe, expect, test } from "bun:test";
-import { createServer } from "node:net";
+import { createConnection, createServer } from "node:net";
 import { createHash, randomBytes } from "node:crypto";
 import { mkdtemp, readFile, readdir, stat } from "node:fs/promises";
 import { tmpdir } from "node:os";
@@ -8,7 +8,8 @@ import { Database } from "bun:sqlite";
 
 const root = resolve(import.meta.dir, "..");
 const manifest = join(root, "apps/server-rust/Cargo.toml");
-const binary = join(root, "apps/server-rust/target/debug/blackglass-server");
+const configuredBinary = process.env.BLACKGLASS_RUST_BINARY;
+const binary = configuredBinary ?? join(root, "apps/server-rust/target/debug/blackglass-server");
 const perFileMax = 8 * 1024 * 1024;
 const aesGcmWireOverhead = 12 + 16;
 let directory = "";
@@ -21,19 +22,30 @@ const sockets: WebSocket[] = [];
 
 describe("production Rust server", () => {
   beforeAll(async () => {
-    const build = Bun.spawnSync(["cargo", "build", "--manifest-path", manifest], {
-      cwd: root,
-      stdout: "pipe",
-      stderr: "pipe",
-    });
-    if (build.exitCode !== 0) throw new Error(build.stderr.toString());
+    if (!configuredBinary) {
+      const build = Bun.spawnSync(["cargo", "build", "--manifest-path", manifest], {
+        cwd: root,
+        stdout: "pipe",
+        stderr: "pipe",
+      });
+      if (build.exitCode !== 0) throw new Error(build.stderr.toString());
+    }
     const version = Bun.spawnSync([binary, "--version"], { stdout: "pipe", stderr: "pipe" });
     expect(version.exitCode, version.stderr.toString()).toBe(0);
-    expect(version.stdout.toString().trim()).toBe("blackglass-server 0.2.1");
+    expect(version.stdout.toString().trim()).toBe("blackglass-server 0.2.2");
+    const buildInfo = Bun.spawnSync([binary, "build-info"], { stdout: "pipe", stderr: "pipe" });
+    expect(buildInfo.exitCode, buildInfo.stderr.toString()).toBe(0);
+    expect(JSON.parse(buildInfo.stdout.toString())).toMatchObject({
+      name: "blackglass-server",
+      version: "0.2.2",
+      sourceRevision: process.env.BLACKGLASS_EXPECTED_SOURCE_REVISION ?? "unknown",
+    });
     const help = Bun.spawnSync([binary, "--help"], { stdout: "pipe", stderr: "pipe" });
     expect(help.exitCode, help.stderr.toString()).toBe(0);
     expect(help.stdout.toString()).toContain("backup <database> <output>");
+    expect(help.stdout.toString()).toContain("migrate <versioned-database> <new-database>");
     expect(help.stdout.toString()).toContain("migrate-legacy <legacy-database> <new-database>");
+    expect(help.stdout.toString()).toContain("rebind-data-host <database> <new-host> <backup>");
     directory = await mkdtemp(join(tmpdir(), "obsidian-rust-sync-"));
     [controlPort, dataPort] = await Promise.all([freePort(), freePort()]);
     processHandle = spawnRustServer(directory, controlPort, dataPort, {
@@ -47,7 +59,7 @@ describe("production Rust server", () => {
     });
     expect(signin).toMatchObject({
       email: "owner@example.test",
-      license: "selfhosted-sync",
+      license: null,
     });
     expect(signin.token).toHaveLength(64);
     token = signin.token;
@@ -76,6 +88,28 @@ describe("production Rust server", () => {
       size: 0,
     });
     expect(vault.password).toBeUndefined();
+    expect(await post("/user/info", { token })).toMatchObject({
+      email: "owner@example.test",
+      license: null,
+    });
+    expect(await post("/subscription/list", { token })).toEqual({ sync: true, publish: false });
+    for (const path of ["/user/signup", "/user/forgetpass", "/user/resendconfirmation"]) {
+      expect(await post(path, {})).toEqual({
+        error: "Accounts are managed by the Blackglass Server administrator",
+      });
+    }
+    const signup = await fetch(`http://127.0.0.1:${controlPort}/user/signup`, {
+      method: "POST",
+      headers: { "content-type": "application/json", origin: "http://localhost" },
+      body: "{}",
+    });
+    expect(signup.headers.get("access-control-allow-origin")).toBe("http://localhost");
+    expect(await signup.json()).toEqual({
+      error: "Accounts are managed by the Blackglass Server administrator",
+    });
+    expect(await post("/subscription/business", { token })).toEqual({
+      error: "Business subscriptions are unavailable on a self-hosted server",
+    });
     const listed = await post("/vault/list", { token });
     expect(listed.vaults).toHaveLength(1);
     const rejected = await fetch(`http://127.0.0.1:${controlPort}/user/info`, {
@@ -225,6 +259,199 @@ describe("production Rust server", () => {
     }
   }, 30_000);
 
+  test("migrates legacy encryption atomically, invalidates old sockets, and supports v3 recovery", async () => {
+    const migrationDirectory = await mkdtemp(join(tmpdir(), "blackglass-vault-migrate-"));
+    const [migrationControlPort, migrationDataPort] = await Promise.all([freePort(), freePort()]);
+    let child = spawnRustServer(migrationDirectory, migrationControlPort, migrationDataPort);
+    try {
+      await waitForHealthAt(migrationControlPort, child);
+      let signin = await postAt(migrationControlPort, "/user/signin", {
+        email: "owner@example.test",
+        password: "test-password",
+      });
+      const legacy = await postAt(migrationControlPort, "/vault/create", {
+        token: signin.token,
+        name: "Legacy custom vault",
+        keyhash: "legacy-key",
+        salt: "legacy-salt",
+        region: "selfhost",
+        encryption_version: 2,
+      });
+      const oldSocket = await Probe.connect(`ws://127.0.0.1:${migrationDataPort}`);
+      await initializeFor(oldSocket, signin.token, legacy, "Legacy device", 0, true);
+      oldSocket.json(push("old-history", "old-history-hash", 0, 0));
+      expect(await oldSocket.nextJson()).toMatchObject({ op: "push", path: "old-history" });
+      expect(await oldSocket.nextJson()).toEqual({ res: "ok" });
+
+      expect(await postAt(migrationControlPort, "/vault/migrate", {
+        token: signin.token,
+        vault_uid: legacy.id,
+        keyhash: "incomplete-new-key",
+        salt: null,
+        region: "selfhost",
+        encryption_version: 3,
+      })).toEqual({ error: "Invalid encryption credentials" });
+      oldSocket.json({ op: "ping" });
+      expect(await oldSocket.nextJson()).toEqual({ op: "pong" });
+
+      const unfinished = new TextEncoder().encode("unfinished ciphertext");
+      oldSocket.json(push("pending-during-migration", "pending-hash", unfinished.length, 1));
+      expect(await oldSocket.nextJson()).toEqual({ res: "next" });
+      expect(await stagedParts(join(migrationDirectory, "uploads"))).toHaveLength(1);
+      const replacement = await postAt(migrationControlPort, "/vault/migrate", {
+        token: signin.token,
+        vault_uid: legacy.id,
+        keyhash: "v3-key",
+        salt: "v3-salt",
+        region: "selfhost",
+        encryption_version: 3,
+      });
+      expect(replacement).toMatchObject({
+        name: "Legacy custom vault",
+        keyhash: "v3-key",
+        salt: "v3-salt",
+        host: `127.0.0.1:${migrationDataPort}`,
+        encryption_version: 3,
+        size: 0,
+      });
+      expect(replacement.id).not.toBe(legacy.id);
+      expect(replacement.password).toBeUndefined();
+      expect((await waitForClose(oldSocket, 2_000)).code).toBe(1008);
+      await waitForDirectoryEmpty(join(migrationDirectory, "uploads"), 2_000);
+      expect(await postAt(migrationControlPort, "/vault/access", {
+        token: signin.token,
+        vault_uid: legacy.id,
+        keyhash: "legacy-key",
+        host: legacy.host,
+        encryption_version: 2,
+      })).toEqual({ error: "Unable to access vault" });
+
+      const recovery = await Probe.connect(`ws://127.0.0.1:${migrationDataPort}`);
+      await initializeFor(recovery, signin.token, replacement, "Recovery device", 0, true);
+      recovery.json(push("reuploaded", "reuploaded-hash", 0, 0));
+      expect(await recovery.nextJson()).toMatchObject({ op: "push", path: "reuploaded" });
+      expect(await recovery.nextJson()).toEqual({ res: "ok" });
+      expect(await postAt(migrationControlPort, "/vault/migrate", {
+        token: signin.token,
+        vault_uid: replacement.id,
+        keyhash: "should-not-replace-v3",
+        salt: "should-not-replace-v3",
+        region: "selfhost",
+        encryption_version: 3,
+      })).toEqual({ error: "Vault already uses encryption version 3" });
+      recovery.json({ op: "history", path: "reuploaded", last: null });
+      expect(await recovery.nextJson()).toMatchObject({
+        items: [{ path: "reuploaded", hash: "reuploaded-hash" }],
+      });
+      recovery.socket.close();
+
+      const managedLegacy = await postAt(migrationControlPort, "/vault/create", {
+        token: signin.token,
+        name: "Legacy managed vault",
+        keyhash: null,
+        salt: null,
+        region: "selfhost",
+        encryption_version: 1,
+      });
+      const managedReplacement = await postAt(migrationControlPort, "/vault/migrate", {
+        token: signin.token,
+        vault_uid: managedLegacy.id,
+        keyhash: null,
+        region: "selfhost",
+        encryption_version: 3,
+      });
+      expect(managedReplacement).toMatchObject({
+        name: "Legacy managed vault",
+        keyhash: null,
+        host: `127.0.0.1:${migrationDataPort}`,
+        encryption_version: 3,
+        size: 0,
+      });
+      expect(managedReplacement.password).toMatch(/^[0-9a-f]{64}$/);
+      expect(managedReplacement.salt).toMatch(/^[0-9a-f]{32}$/);
+      expect(await postAt(migrationControlPort, "/vault/access", {
+        token: signin.token,
+        vault_uid: managedReplacement.id,
+        keyhash: "managed-v3-keyhash",
+        host: managedReplacement.host,
+        encryption_version: 3,
+      })).toEqual({});
+
+      child.kill("SIGTERM");
+      expect(await child.exited).toBe(0);
+      child = spawnRustServer(migrationDirectory, migrationControlPort, migrationDataPort);
+      await waitForHealthAt(migrationControlPort, child);
+      signin = await postAt(migrationControlPort, "/user/signin", {
+        email: "owner@example.test",
+        password: "test-password",
+      });
+      expect(await postAt(migrationControlPort, "/vault/access", {
+        token: signin.token,
+        vault_uid: managedReplacement.id,
+        keyhash: "managed-v3-keyhash",
+        host: managedReplacement.host,
+        encryption_version: 3,
+      })).toEqual({});
+      const listed = await postAt(migrationControlPort, "/vault/list", { token: signin.token });
+      expect(listed.vaults.map((item: any) => item.id).sort()).toEqual(
+        [replacement.id, managedReplacement.id].sort(),
+      );
+    } finally {
+      if (child.exitCode === null) child.kill("SIGTERM");
+      await child.exited;
+    }
+  }, 45_000);
+
+  test("serializes rename with destructive encryption migration", async () => {
+    const raceDirectory = await mkdtemp(join(tmpdir(), "blackglass-vault-race-"));
+    const [raceControlPort, raceDataPort] = await Promise.all([freePort(), freePort()]);
+    const child = spawnRustServer(raceDirectory, raceControlPort, raceDataPort);
+    try {
+      await waitForHealthAt(raceControlPort, child);
+      const signin = await postAt(raceControlPort, "/user/signin", {
+        email: "owner@example.test",
+        password: "test-password",
+      });
+      for (let iteration = 0; iteration < 3; iteration++) {
+        const sourceName = `Migration race ${iteration}`;
+        const renamedName = `Migration race renamed ${iteration}`;
+        const source = await postAt(raceControlPort, "/vault/create", {
+          token: signin.token,
+          name: sourceName,
+          keyhash: `race-key-${iteration}`,
+          salt: `race-salt-${iteration}`,
+          region: "selfhost",
+          encryption_version: 2,
+        });
+        const [rename, migration] = await Promise.all([
+          postAt(raceControlPort, "/vault/rename", {
+            token: signin.token,
+            vault_uid: source.id,
+            name: renamedName,
+          }),
+          postAt(raceControlPort, "/vault/migrate", {
+            token: signin.token,
+            vault_uid: source.id,
+            keyhash: `race-v3-key-${iteration}`,
+            salt: `race-v3-salt-${iteration}`,
+            region: "selfhost",
+            encryption_version: 3,
+          }),
+        ]);
+        expect(migration.error).toBeUndefined();
+        if (rename.error === undefined) {
+          expect(migration.name).toBe(renamedName);
+        } else {
+          expect(rename).toEqual({ error: "Unable to rename vault" });
+          expect(migration.name).toBe(sourceName);
+        }
+      }
+    } finally {
+      if (child.exitCode === null) child.kill("SIGTERM");
+      await child.exited;
+    }
+  }, 20_000);
+
   test("bounds unauthenticated WebSockets and requires prompt initialization", async () => {
     const unauthenticatedPing = await Probe.connect(`ws://127.0.0.1:${dataPort}`);
     unauthenticatedPing.json({ op: "ping" });
@@ -245,16 +472,183 @@ describe("production Rust server", () => {
       const first = await Probe.connect(`ws://127.0.0.1:${cappedDataPort}`);
       const second = await Probe.connect(`ws://127.0.0.1:${cappedDataPort}`);
       await expectWebSocketRejected(`ws://127.0.0.1:${cappedDataPort}`, "app://obsidian.md");
-      first.socket.close();
-      await waitForClose(first, 2_000);
+      first.socket.send(new Uint8Array(2 * 1024 * 1024));
+      second.socket.send(new Uint8Array(2 * 1024 * 1024));
+      expect((await waitForClose(first, 2_000)).code).toBe(1008);
+      expect((await waitForClose(second, 2_000)).code).toBe(1008);
       const replacement = await Probe.connect(`ws://127.0.0.1:${cappedDataPort}`);
-      second.socket.close();
       replacement.socket.close();
     } finally {
       if (child.exitCode === null) child.kill("SIGTERM");
       await child.exited;
     }
+
+    const overCapDirectory = await mkdtemp(join(tmpdir(), "blackglass-ws-over-cap-"));
+    const [overCapControlPort, overCapDataPort] = await Promise.all([freePort(), freePort()]);
+    const overCap = spawnRustServer(overCapDirectory, overCapControlPort, overCapDataPort, {
+      SELFHOST_MAX_WS_CONNECTIONS: "33",
+    });
+    expect(await promiseWithTimeout(overCap.exited, 3_000, "over-cap server did not fail")).not.toBe(0);
+    expect(await new Response(overCap.stderr as ReadableStream<Uint8Array>).text()).toContain(
+      "SELFHOST_MAX_WS_CONNECTIONS must be between 1 and 16",
+    );
   }, 20_000);
+
+  test("requires an explicit acknowledgement for container-reachable binds", async () => {
+    const deniedDirectory = await mkdtemp(join(tmpdir(), "blackglass-external-bind-denied-"));
+    const [deniedControlPort, deniedDataPort] = await Promise.all([freePort(), freePort()]);
+    const denied = spawnRustServer(deniedDirectory, deniedControlPort, deniedDataPort, {
+      SELFHOST_BIND_HOST: "0.0.0.0",
+      SELFHOST_ACKNOWLEDGE_EXTERNAL_BIND: "",
+    });
+    expect(await promiseWithTimeout(denied.exited, 3_000, "unacknowledged bind did not fail")).not.toBe(0);
+    expect(await new Response(denied.stderr as ReadableStream<Uint8Array>).text()).toContain(
+      "SELFHOST_ACKNOWLEDGE_EXTERNAL_BIND=1",
+    );
+
+    const allowedDirectory = await mkdtemp(join(tmpdir(), "blackglass-external-bind-allowed-"));
+    const [allowedControlPort, allowedDataPort] = await Promise.all([freePort(), freePort()]);
+    const allowed = spawnRustServer(allowedDirectory, allowedControlPort, allowedDataPort, {
+      SELFHOST_BIND_HOST: "0.0.0.0",
+      SELFHOST_ACKNOWLEDGE_EXTERNAL_BIND: "1",
+    });
+    try {
+      await waitForHealthAt(allowedControlPort, allowed);
+      expect((await fetch(`http://127.0.0.1:${allowedControlPort}/health`)).status).toBe(200);
+    } finally {
+      if (allowed.exitCode === null) allowed.kill("SIGTERM");
+      await allowed.exited;
+    }
+
+    for (const bind of ["0.0.0.0", "::1", "::"]) {
+      const missingDirectory = await mkdtemp(join(tmpdir(), "blackglass-data-host-missing-"));
+      const [missingControlPort, missingDataPort] = await Promise.all([freePort(), freePort()]);
+      const missing = spawnRustServer(missingDirectory, missingControlPort, missingDataPort, {
+        SELFHOST_BIND_HOST: bind,
+        SELFHOST_ACKNOWLEDGE_EXTERNAL_BIND: bind === "::1" ? "" : "1",
+        SELFHOST_DATA_HOST: "",
+      });
+      expect(await promiseWithTimeout(missing.exited, 3_000, `missing data host passed for ${bind}`)).not.toBe(0);
+      expect(await new Response(missing.stderr as ReadableStream<Uint8Array>).text()).toContain(
+        "SELFHOST_DATA_HOST is required",
+      );
+    }
+
+    for (const host of [
+      "localhost",
+      "127.0.0.1",
+      "127.0.0.1:1",
+      "0.0.0.0:3003",
+      "224.0.0.1:3003",
+      "255.255.255.255:3003",
+      "[::]",
+      "[ff02::1]:3003",
+    ]) {
+      const invalidDirectory = await mkdtemp(join(tmpdir(), "blackglass-data-host-invalid-"));
+      const [invalidControlPort, invalidDataPort] = await Promise.all([freePort(), freePort()]);
+      const invalid = spawnRustServer(invalidDirectory, invalidControlPort, invalidDataPort, {
+        SELFHOST_DATA_HOST: host,
+      });
+      expect(await promiseWithTimeout(invalid.exited, 3_000, `invalid data host passed: ${host}`)).not.toBe(0);
+    }
+  }, 30_000);
+
+  test("fails closed on persisted data-host drift and supports backup-first domain and port rebinding", async () => {
+    const rebindDirectory = await mkdtemp(join(tmpdir(), "blackglass-host-rebind-"));
+    const [rebindControlPort, rebindDataPort] = await Promise.all([freePort(), freePort()]);
+    const databasePath = join(rebindDirectory, "server.sqlite");
+    let child = spawnRustServer(rebindDirectory, rebindControlPort, rebindDataPort);
+    try {
+      await waitForHealthAt(rebindControlPort, child);
+      const signin = await postAt(rebindControlPort, "/user/signin", {
+        email: "owner@example.test",
+        password: "test-password",
+      });
+      const original = await postAt(rebindControlPort, "/vault/create", {
+        token: signin.token,
+        name: "Rebound vault",
+        keyhash: "rebind-keyhash",
+        salt: "rebind-salt",
+        region: "selfhost",
+        encryption_version: 3,
+      });
+      child.kill("SIGTERM");
+      expect(await child.exited).toBe(0);
+
+      child = spawnRustServer(rebindDirectory, rebindControlPort, rebindDataPort, {
+        SELFHOST_DATA_HOST: "sync-data.example.test",
+      });
+      expect(await promiseWithTimeout(child.exited, 3_000, "mismatched host did not fail")).not.toBe(0);
+      expect(await new Response(child.stderr as ReadableStream<Uint8Array>).text()).toContain(
+        "rebind-data-host",
+      );
+
+      const firstBackup = join(rebindDirectory, "before-domain-rebind.sqlite");
+      const domainRebind = Bun.spawnSync([
+        binary,
+        "rebind-data-host",
+        databasePath,
+        "sync-data.example.test",
+        firstBackup,
+      ], { cwd: root, stdout: "pipe", stderr: "pipe" });
+      expect(domainRebind.exitCode, domainRebind.stderr.toString()).toBe(0);
+      expect(domainRebind.stdout.toString()).toContain("rebound 1 vault(s)");
+
+      child = spawnRustServer(rebindDirectory, rebindControlPort, rebindDataPort);
+      expect(await promiseWithTimeout(child.exited, 3_000, "stale configured host did not fail")).not.toBe(0);
+      child = spawnRustServer(rebindDirectory, rebindControlPort, rebindDataPort, {
+        SELFHOST_DATA_HOST: "sync-data.example.test",
+      });
+      await waitForHealthAt(rebindControlPort, child);
+      let currentSignin = await postAt(rebindControlPort, "/user/signin", {
+        email: "owner@example.test",
+        password: "test-password",
+      });
+      let listed = await postAt(rebindControlPort, "/vault/list", { token: currentSignin.token });
+      expect(listed.vaults[0]).toMatchObject({ id: original.id, host: "sync-data.example.test" });
+      expect(await postAt(rebindControlPort, "/vault/access", {
+        token: currentSignin.token,
+        vault_uid: original.id,
+        keyhash: original.keyhash,
+        host: original.host,
+        encryption_version: 3,
+      })).toEqual({ error: "Unable to access vault" });
+      expect(await postAt(rebindControlPort, "/vault/access", {
+        token: currentSignin.token,
+        vault_uid: original.id,
+        keyhash: original.keyhash,
+        host: "sync-data.example.test",
+        encryption_version: 3,
+      })).toEqual({});
+      child.kill("SIGTERM");
+      expect(await child.exited).toBe(0);
+
+      const secondBackup = join(rebindDirectory, "before-port-rebind.sqlite");
+      const portRebind = Bun.spawnSync([
+        binary,
+        "rebind-data-host",
+        databasePath,
+        "sync-data.example.test:8443",
+        secondBackup,
+      ], { cwd: root, stdout: "pipe", stderr: "pipe" });
+      expect(portRebind.exitCode, portRebind.stderr.toString()).toBe(0);
+      child = spawnRustServer(rebindDirectory, rebindControlPort, rebindDataPort, {
+        SELFHOST_DATA_HOST: "sync-data.example.test:8443",
+      });
+      await waitForHealthAt(rebindControlPort, child);
+      currentSignin = await postAt(rebindControlPort, "/user/signin", {
+        email: "owner@example.test",
+        password: "test-password",
+      });
+      listed = await postAt(rebindControlPort, "/vault/list", { token: currentSignin.token });
+      expect(listed.vaults[0].host).toBe("sync-data.example.test:8443");
+      expect((await stat(firstBackup)).size).toBeGreaterThan(0);
+      expect((await stat(secondBackup)).size).toBeGreaterThan(0);
+    } finally {
+      if (child.exitCode === null) child.kill("SIGTERM");
+      await child.exited;
+    }
+  }, 35_000);
 
   test("round-trips multi-piece opaque ciphertext with bounded staging", async () => {
     const payload = new Uint8Array(randomBytes(3 * 1024 * 1024 + 17));
@@ -264,14 +658,14 @@ describe("production Rust server", () => {
     expect(await writer.nextJson()).toEqual({ res: "next" });
     writer.socket.send(payload.slice(0, 2 * 1024 * 1024));
     expect(await writer.nextJson()).toEqual({ res: "next" });
-    const staged = await readdir(join(directory, "uploads"));
+    const staged = await stagedParts(join(directory, "uploads"));
     expect(staged).toHaveLength(1);
     expect((await stat(join(directory, "uploads", staged[0]!))).size).toBe(2 * 1024 * 1024);
     writer.socket.send(payload.slice(2 * 1024 * 1024));
     const notice = await writer.nextJson();
     expect(notice).toMatchObject({ op: "push", path: "encrypted-large-path", size: payload.byteLength });
     expect(await writer.nextJson()).toEqual({ res: "ok" });
-    expect(await readdir(join(directory, "uploads"))).toEqual([]);
+    expect(await stagedParts(join(directory, "uploads"))).toEqual([]);
 
     const reader = await Probe.connect(`ws://127.0.0.1:${dataPort}`);
     await initialize(reader, "Reader", notice.uid, false);
@@ -470,14 +864,192 @@ describe("production Rust server", () => {
     expect(await interrupted.nextJson()).toEqual({ res: "next" });
     interrupted.socket.close();
     await Bun.sleep(150);
-    expect(await readdir(join(directory, "uploads"))).toEqual([]);
+    expect(await stagedParts(join(directory, "uploads"))).toEqual([]);
   });
+
+  test("purge retains a compact tombstone for offline-client convergence", async () => {
+    const writer = await Probe.connect(`ws://127.0.0.1:${dataPort}`);
+    const start = databaseVersion(join(directory, "server.sqlite"), vault.id);
+    await initialize(writer, "Purge convergence writer", start, false);
+    const live = await metadata(writer, "purged-offline-path", "purged-live-hash");
+    const deleted = await metadata(writer, "purged-offline-path", "", { deleted: true });
+    writer.json({ op: "purge" });
+    expect(await writer.nextJson()).toEqual({ res: "ok" });
+
+    writer.json({ op: "deleted", suppressrenames: false });
+    expect((await writer.nextJson()).items.some(
+      (item: any) => item.path === "purged-offline-path",
+    )).toBe(false);
+    writer.json({ op: "restore", uid: deleted.uid });
+    expect(await writer.nextJson()).toEqual({ err: "Revision not found" });
+    writer.socket.close();
+
+    const resumed = await Probe.connect(`ws://127.0.0.1:${dataPort}`);
+    resumed.json(init("Offline client after purge", live.uid, false));
+    expect(await resumed.nextJson()).toMatchObject({ res: "ok" });
+    expect(await resumed.nextJson()).toMatchObject({
+      op: "push",
+      uid: deleted.uid,
+      path: "purged-offline-path",
+      deleted: true,
+    });
+    expect(await resumed.nextJson()).toEqual({ op: "ready", version: deleted.uid });
+    resumed.socket.close();
+  });
+
+  test("removes a staged upload when its database commit fails", async () => {
+    const failedDirectory = await mkdtemp(join(tmpdir(), "blackglass-failed-upload-"));
+    const [failedControlPort, failedDataPort] = await Promise.all([freePort(), freePort()]);
+    const child = spawnRustServer(failedDirectory, failedControlPort, failedDataPort);
+    try {
+      await waitForHealthAt(failedControlPort, child);
+      const signin = await postAt(failedControlPort, "/user/signin", {
+        email: "owner@example.test",
+        password: "test-password",
+      });
+      const failedVault = await postAt(failedControlPort, "/vault/create", {
+        token: signin.token,
+        name: "Failed upload vault",
+        keyhash: "failed-upload-keyhash",
+        salt: "failed-upload-salt",
+        region: "selfhost",
+        encryption_version: 3,
+      });
+      const probe = await Probe.connect(`ws://127.0.0.1:${failedDataPort}`);
+      await initializeFor(probe, signin.token, failedVault, "Failed upload", 0, true);
+      const payload = new TextEncoder().encode("opaque upload that must not remain staged");
+      probe.json(push("failed-upload", "failed-upload-hash", payload.byteLength, 1));
+      expect(await probe.nextJson()).toEqual({ res: "next" });
+      expect(await stagedParts(join(failedDirectory, "uploads"))).toHaveLength(1);
+      const database = new Database(join(failedDirectory, "server.sqlite"));
+      try {
+        database.exec("DROP TABLE revision_content");
+      } finally {
+        database.close();
+      }
+      probe.socket.send(payload);
+      await waitForClose(probe, 5_000);
+      await waitForDirectoryEmpty(join(failedDirectory, "uploads"), 2_000);
+      expect((await fetch(`http://127.0.0.1:${failedControlPort}/health`)).status).toBe(200);
+    } finally {
+      if (child.exitCode === null) child.kill("SIGTERM");
+      await child.exited;
+    }
+  }, 20_000);
+
+  test("rejects duplicate database or staging owners before touching active uploads", async () => {
+    const lockedDirectory = await mkdtemp(join(tmpdir(), "blackglass-state-lock-"));
+    const [lockedControlPort, lockedDataPort] = await Promise.all([freePort(), freePort()]);
+    const child = spawnRustServer(lockedDirectory, lockedControlPort, lockedDataPort);
+    try {
+      await waitForHealthAt(lockedControlPort, child);
+      const signin = await postAt(lockedControlPort, "/user/signin", {
+        email: "owner@example.test",
+        password: "test-password",
+      });
+      const lockedVault = await postAt(lockedControlPort, "/vault/create", {
+        token: signin.token,
+        name: "Locked vault",
+        keyhash: "locked-keyhash",
+        salt: "locked-salt",
+        region: "selfhost",
+        encryption_version: 3,
+      });
+      const writer = await Probe.connect(`ws://127.0.0.1:${lockedDataPort}`);
+      await initializeFor(writer, signin.token, lockedVault, "Locked writer", 0, true);
+      const payload = new TextEncoder().encode("active staged ciphertext");
+      writer.json(push("active-lock-upload", "active-lock-hash", payload.length, 1));
+      expect(await writer.nextJson()).toEqual({ res: "next" });
+      expect(await stagedParts(join(lockedDirectory, "uploads"))).toHaveLength(1);
+
+      const [duplicateControlPort, duplicateDataPort] = await Promise.all([freePort(), freePort()]);
+      const duplicate = spawnRustServer(
+        join(lockedDirectory, ".", "alias", ".."),
+        duplicateControlPort,
+        duplicateDataPort,
+        { SELFHOST_DATA_HOST: `127.0.0.1:${lockedDataPort}` },
+      );
+      expect(await promiseWithTimeout(duplicate.exited, 3_000, "duplicate database owner did not fail")).not.toBe(0);
+      expect(await new Response(duplicate.stderr as ReadableStream<Uint8Array>).text()).toContain(
+        "database state is already locked",
+      );
+      expect(await stagedParts(join(lockedDirectory, "uploads"))).toHaveLength(1);
+
+      const separateDirectory = await mkdtemp(join(tmpdir(), "blackglass-shared-staging-"));
+      const [sharedControlPort, sharedDataPort] = await Promise.all([freePort(), freePort()]);
+      const shared = spawnRustServer(separateDirectory, sharedControlPort, sharedDataPort, {
+        SELFHOST_STAGING_DIR: join(lockedDirectory, "uploads", "."),
+      });
+      expect(await promiseWithTimeout(shared.exited, 3_000, "duplicate staging owner did not fail")).not.toBe(0);
+      expect(await new Response(shared.stderr as ReadableStream<Uint8Array>).text()).toContain(
+        "staging state is already locked",
+      );
+      expect(await stagedParts(join(lockedDirectory, "uploads"))).toHaveLength(1);
+
+      writer.socket.send(payload);
+      expect(await writer.nextJson()).toMatchObject({ op: "push", path: "active-lock-upload" });
+      expect(await writer.nextJson()).toEqual({ res: "ok" });
+      expect(await stagedParts(join(lockedDirectory, "uploads"))).toEqual([]);
+      writer.socket.close();
+    } finally {
+      if (child.exitCode === null) child.kill("SIGTERM");
+      await child.exited;
+    }
+  }, 20_000);
+
+  test("vault deletion immediately revokes idle and in-flight sockets", async () => {
+    const deletionDirectory = await mkdtemp(join(tmpdir(), "blackglass-vault-delete-"));
+    const [deletionControlPort, deletionDataPort] = await Promise.all([freePort(), freePort()]);
+    const child = spawnRustServer(deletionDirectory, deletionControlPort, deletionDataPort);
+    try {
+      await waitForHealthAt(deletionControlPort, child);
+      const signin = await postAt(deletionControlPort, "/user/signin", {
+        email: "owner@example.test",
+        password: "test-password",
+      });
+      const deletedVault = await postAt(deletionControlPort, "/vault/create", {
+        token: signin.token,
+        name: "Deleted vault",
+        keyhash: "deleted-keyhash",
+        salt: "deleted-salt",
+        region: "selfhost",
+        encryption_version: 3,
+      });
+      const idle = await Probe.connect(`ws://127.0.0.1:${deletionDataPort}`);
+      const uploading = await Probe.connect(`ws://127.0.0.1:${deletionDataPort}`);
+      await initializeFor(idle, signin.token, deletedVault, "Idle delete", 0, true);
+      await initializeFor(uploading, signin.token, deletedVault, "Upload delete", 0, true);
+      uploading.json(push("pending-delete", "pending-delete-hash", 32, 1));
+      expect(await uploading.nextJson()).toEqual({ res: "next" });
+      expect(await stagedParts(join(deletionDirectory, "uploads"))).toHaveLength(1);
+
+      expect(await postAt(deletionControlPort, "/vault/delete", {
+        token: signin.token,
+        vault_uid: deletedVault.id,
+      })).toEqual({});
+      expect((await waitForClose(idle, 2_000)).code).toBe(1008);
+      expect((await waitForClose(uploading, 2_000)).code).toBe(1008);
+      await waitForDirectoryEmpty(join(deletionDirectory, "uploads"), 2_000);
+      const stale = await Probe.connect(`ws://127.0.0.1:${deletionDataPort}`);
+      stale.json(initFor(signin.token, deletedVault, "Stale deleted vault", 0, false));
+      expect(await stale.nextJson()).toEqual({ res: "err", msg: "Vault not found" });
+      const staleClose = await waitForClose(stale, 2_000);
+      expect(staleClose.code).toBe(1008);
+      expect(staleClose.reason).toBe("Vault not found");
+      expect(await postAt(deletionControlPort, "/vault/list", { token: signin.token })).toMatchObject({
+        vaults: [],
+      });
+    } finally {
+      if (child.exitCode === null) child.kill("SIGTERM");
+      await child.exited;
+    }
+  }, 20_000);
 
   test("exposes safe health/metrics and produces verified live backups", async () => {
     expect(await (await fetch(`http://127.0.0.1:${controlPort}/health`)).json()).toMatchObject({
       implementation: "rust",
       service: "blackglass-server",
-      version: "0.2.1",
+      version: "0.2.2",
     });
     expect((await fetch(`http://127.0.0.1:${controlPort}/ready`)).status).toBe(200);
     const errorsBeforeClose = metricValue(
@@ -540,12 +1112,66 @@ describe("production Rust server", () => {
     writer.socket.close();
   }, 20_000);
 
-  test("keeps a single-worker runtime responsive, honors admin revocation, and shuts down gracefully", async () => {
+  test("fails closed when an existing client is ahead of restored server history", async () => {
+    const ahead = await Probe.connect(`ws://127.0.0.1:${dataPort}`);
+    const serverVersion = databaseVersion(join(directory, "server.sqlite"), vault.id);
+    ahead.json(initFor(token, vault, "Ahead restore client", serverVersion + 100, false));
+    expect(await ahead.nextJson()).toEqual({
+      res: "err",
+      msg: "Client Sync version is ahead of the server; reconnect this vault as a fresh client after restore",
+    });
+    const closed = await waitForClose(ahead, 2_000);
+    expect(closed.code).toBe(1008);
+    expect(closed.reason).toContain("ahead of the server");
+  });
+
+  test("queues bounded database work without invalidating healthy WebSocket bursts", async () => {
+    const burstSignin = await post("/user/signin", {
+      email: "owner@example.test",
+      password: "test-password",
+    });
+    const head = databaseVersion(join(directory, "server.sqlite"), vault.id);
+    const observers = await Promise.all(
+      Array.from({ length: 6 }, () => Probe.connect(`ws://127.0.0.1:${dataPort}`)),
+    );
+    const writer = await Probe.connect(`ws://127.0.0.1:${dataPort}`);
+    try {
+      await Promise.all(observers.map((observer, index) => initializeFor(
+        observer,
+        burstSignin.token,
+        vault,
+        `Burst observer ${index}`,
+        head,
+        false,
+      )));
+      await initializeFor(writer, burstSignin.token, vault, "Burst writer", head, false);
+      writer.json(push("bounded-db-broadcast", "bounded-db-broadcast-hash", 0, 0));
+      expect(await writer.nextJson()).toMatchObject({ op: "push", path: "bounded-db-broadcast" });
+      expect(await writer.nextJson()).toEqual({ res: "ok" });
+      const notices = await promiseWithTimeout(
+        Promise.all(observers.map((observer) => observer.nextJson())),
+        3_000,
+        "healthy observers stalled behind bounded database workers",
+      );
+      for (const notice of notices) expect(notice).toMatchObject({ op: "push", path: "bounded-db-broadcast" });
+
+      for (const observer of observers) observer.json({ op: "ping" });
+      const pongs = await promiseWithTimeout(
+        Promise.all(observers.map((observer) => observer.nextJson())),
+        3_000,
+        "healthy sessions were closed under bounded database concurrency",
+      );
+      expect(pongs).toEqual(observers.map(() => ({ op: "pong" })));
+    } finally {
+      writer.socket.close();
+      for (const observer of observers) observer.socket.close();
+    }
+  }, 15_000);
+
+  test("keeps bounded control/database work responsive, honors admin revocation, and drains on shutdown", async () => {
     const isolatedDirectory = await mkdtemp(join(tmpdir(), "blackglass-reactor-"));
     const [isolatedControlPort, isolatedDataPort] = await Promise.all([freePort(), freePort()]);
-    const child = spawnRustServer(isolatedDirectory, isolatedControlPort, isolatedDataPort, {
-      TOKIO_WORKER_THREADS: "1",
-    });
+    const child = spawnRustServer(isolatedDirectory, isolatedControlPort, isolatedDataPort);
     try {
       await waitForHealthAt(isolatedControlPort, child);
       const signin = await postAt(isolatedControlPort, "/user/signin", {
@@ -563,10 +1189,49 @@ describe("production Rust server", () => {
       const probe = await Probe.connect(`ws://127.0.0.1:${isolatedDataPort}`);
       await initializeFor(probe, signin.token, isolatedVault, "Reactor probe", 0, true);
 
+      const slowRequests = await Promise.all(
+        Array.from({ length: 16 }, () => openSlowControlRequest(isolatedControlPort)),
+      );
+      try {
+        await Bun.sleep(100);
+        const ownerResponse = await promiseWithTimeout(
+          fetch(`http://127.0.0.1:${isolatedControlPort}/user/signin`, {
+            method: "POST",
+            headers: { "content-type": "application/json", origin: "app://obsidian.md" },
+            body: JSON.stringify({ email: "owner@example.test", password: "test-password" }),
+          }),
+          2_000,
+          "slow bodies exhausted admitted control work",
+        );
+        expect(ownerResponse.status).toBe(200);
+        const ownerSignin = await ownerResponse.json();
+        expect(ownerSignin.token).toHaveLength(64);
+        expect(await postAt(isolatedControlPort, "/user/signout", {
+          token: ownerSignin.token,
+        })).toEqual({});
+        expect((await fetch(`http://127.0.0.1:${isolatedControlPort}/health`)).status).toBe(200);
+        expect(await promiseWithTimeout(
+          slowRequests[0]!.response,
+          7_000,
+          "slow control body was not timed out",
+        )).toContain(" 408 ");
+      } finally {
+        for (const request of slowRequests) request.socket.destroy();
+      }
+
       const lock = new Database(join(isolatedDirectory, "server.sqlite"));
       lock.exec("BEGIN IMMEDIATE");
+      let flood: Promise<Response[]> | undefined;
       try {
         probe.json(push("blocked-database-write", "blocked-write", 0, 0));
+        flood = Promise.all(Array.from({ length: 64 }, () => fetch(
+          `http://127.0.0.1:${isolatedControlPort}/user/info`,
+          {
+            method: "POST",
+            headers: { "content-type": "application/json", origin: "app://obsidian.md" },
+            body: JSON.stringify({ token: "0".repeat(64) }),
+          },
+        )));
         await Bun.sleep(100);
         const started = performance.now();
         const response = await promiseWithTimeout(
@@ -576,10 +1241,38 @@ describe("production Rust server", () => {
         );
         expect(response.status).toBe(200);
         expect(performance.now() - started).toBeLessThan(750);
+        const readiness = await promiseWithTimeout(
+          fetch(`http://127.0.0.1:${isolatedControlPort}/ready`),
+          750,
+          "readiness did not fail fast behind SQLite",
+        );
+        expect(readiness.status).toBe(503);
       } finally {
         lock.exec("ROLLBACK");
         lock.close();
       }
+      const floodResponses = await promiseWithTimeout(
+        flood!,
+        7_000,
+        "bounded control flood did not drain",
+      );
+      expect(floodResponses.some((response) => response.status === 503)).toBe(true);
+      for (const response of floodResponses) {
+        expect([200, 503]).toContain(response.status);
+        if (response.status === 503) expect(await response.json()).toEqual({ error: "Server busy" });
+      }
+      const recoveredSignin = await postAt(isolatedControlPort, "/user/signin", {
+        email: "owner@example.test",
+        password: "test-password",
+      });
+      expect(recoveredSignin.token).toHaveLength(64);
+      expect(await postAt(isolatedControlPort, "/user/signout", {
+        token: recoveredSignin.token,
+      })).toEqual({});
+      const boundedMetrics = await (await fetch(
+        `http://127.0.0.1:${isolatedControlPort}/metrics`,
+      )).text();
+      expect(metricValue(boundedMetrics, "blackglass_control_rejections_total")).toBeGreaterThan(0);
       expect(await probe.nextJson()).toMatchObject({ op: "push", path: "blocked-database-write" });
       expect(await probe.nextJson()).toEqual({ res: "ok" });
 
@@ -600,8 +1293,13 @@ describe("production Rust server", () => {
       const head = databaseVersion(join(isolatedDirectory, "server.sqlite"), isolatedVault.id);
       const committing = await Probe.connect(`ws://127.0.0.1:${isolatedDataPort}`);
       const idle = await Probe.connect(`ws://127.0.0.1:${isolatedDataPort}`);
+      const pendingUpload = await Probe.connect(`ws://127.0.0.1:${isolatedDataPort}`);
       await initializeFor(committing, shutdownSignin.token, isolatedVault, "Shutdown writer", head, false);
       await initializeFor(idle, shutdownSignin.token, isolatedVault, "Shutdown idle", head, false);
+      await initializeFor(pendingUpload, shutdownSignin.token, isolatedVault, "Shutdown upload", head, false);
+      pendingUpload.json(push("shutdown-pending-upload", "shutdown-pending-hash", 32, 1));
+      expect(await pendingUpload.nextJson()).toEqual({ res: "next" });
+      expect(await stagedParts(join(isolatedDirectory, "uploads"))).toHaveLength(1);
 
       const shutdownLock = new Database(join(isolatedDirectory, "server.sqlite"));
       shutdownLock.exec("BEGIN IMMEDIATE");
@@ -622,6 +1320,8 @@ describe("production Rust server", () => {
       }
       expect(await promiseWithTimeout(child.exited, 5_000, "server did not finish graceful shutdown")).toBe(0);
       await waitForClose(committing, 2_000);
+      await waitForClose(pendingUpload, 2_000);
+      expect(await stagedParts(join(isolatedDirectory, "uploads"))).toEqual([]);
       const persisted = new Database(join(isolatedDirectory, "server.sqlite"));
       try {
         expect((persisted.query("SELECT COUNT(*) AS count FROM revisions WHERE path='shutdown-committed-write'").get() as { count: number }).count).toBe(1);
@@ -633,19 +1333,40 @@ describe("production Rust server", () => {
       if (child.exitCode === null) child.kill("SIGTERM");
       await child.exited;
     }
-  }, 20_000);
+  }, 35_000);
 
-  test("failed signins do not create a globally exhaustible lockout", async () => {
-    const signin = await post("/user/signin", { email: "owner@example.test", password: "test-password" });
-    expect(await post("/user/signout", { token: signin.token })).toEqual({});
-    expect(await post("/user/info", { token: signin.token })).toEqual({ error: "Not logged in" });
-    for (let attempt = 0; attempt < 12; attempt++) {
-      expect(await post("/user/signin", { email: "owner@example.test", password: "wrong" })).toEqual({ error: "Invalid email or password" });
+  test("bounds password-check concurrency without a globally exhaustible owner lockout", async () => {
+    const limitedDirectory = await mkdtemp(join(tmpdir(), "blackglass-login-rate-"));
+    const [limitedControlPort, limitedDataPort] = await Promise.all([freePort(), freePort()]);
+    const child = spawnRustServer(limitedDirectory, limitedControlPort, limitedDataPort);
+    try {
+      await waitForHealthAt(limitedControlPort, child);
+      const burst = await Promise.all(Array.from({ length: 8 }, () =>
+        postAt(limitedControlPort, "/user/signin", {
+          email: "owner@example.test",
+          password: "wrong",
+        })));
+      expect(burst.some((result) => result.error === "Try again later")).toBe(true);
+      expect(burst.every((result) =>
+        result.error === "Try again later" || result.error === "Invalid email or password",
+      )).toBe(true);
+      for (let attempt = 0; attempt < 12; attempt++) {
+        expect(await postAt(limitedControlPort, "/user/signin", {
+          email: "owner@example.test",
+          password: "wrong",
+        })).toEqual({ error: "Invalid email or password" });
+      }
+      expect(await postAt(limitedControlPort, "/user/signin", {
+        email: "owner@example.test",
+        password: "test-password",
+      })).toMatchObject({
+        email: "owner@example.test",
+        license: null,
+      });
+    } finally {
+      if (child.exitCode === null) child.kill("SIGTERM");
+      await child.exited;
     }
-    expect(await post("/user/signin", { email: "owner@example.test", password: "test-password" })).toMatchObject({
-      email: "owner@example.test",
-      license: "selfhosted-sync",
-    });
   }, 20_000);
 });
 
@@ -709,7 +1430,37 @@ async function post(path: string, body: Record<string, unknown>) { return postAt
 async function postAt(port: number, path: string, body: Record<string, unknown>) { const response = await fetch(`http://127.0.0.1:${port}${path}`, { method: "POST", headers: { "content-type": "application/json", origin: "app://obsidian.md" }, body: JSON.stringify(body) }); return response.json(); }
 function metricValue(metrics: string, name: string): number { const line = metrics.split("\n").find((entry) => entry.startsWith(`${name} `)); if (!line) throw new Error(`missing metric: ${name}`); return Number(line.slice(name.length + 1)); }
 async function waitForHealthAt(port: number, child: ReturnType<typeof Bun.spawn>) { const deadline = Date.now() + 30_000; while (Date.now() < deadline) { if (child.exitCode !== null) throw new Error(`server exited early: ${await new Response(child.stderr as ReadableStream<Uint8Array>).text()}`); try { if ((await fetch(`http://127.0.0.1:${port}/health`)).ok) return; } catch {} await Bun.sleep(50); } throw new Error("Rust server did not become healthy"); }
+async function stagedParts(path: string) { return (await readdir(path)).filter((name) => name.endsWith(".part")); }
+async function waitForDirectoryEmpty(path: string, milliseconds: number) { const deadline = Date.now() + milliseconds; while (Date.now() < deadline) { if ((await stagedParts(path)).length === 0) return; await Bun.sleep(25); } throw new Error(`staging directory still contains partial uploads: ${path}`); }
 async function freePort(): Promise<number> { return new Promise((resolve, reject) => { const server = createServer(); server.once("error", reject); server.listen(0, "127.0.0.1", () => { const address = server.address(); if (!address || typeof address === "string") return reject(new Error("no port")); server.close(() => resolve(address.port)); }); }); }
+
+async function openSlowControlRequest(port: number) {
+  const socket = createConnection({ host: "127.0.0.1", port });
+  let received = "";
+  let resolveResponse!: (value: string) => void;
+  let rejectResponse!: (error: Error) => void;
+  const response = new Promise<string>((resolve, reject) => { resolveResponse = resolve; rejectResponse = reject; });
+  socket.on("data", (chunk) => {
+    received += chunk.toString();
+    if (received.includes(" 408 ")) resolveResponse(received);
+  });
+  socket.on("error", (error) => {
+    if (!received.includes(" 408 ")) rejectResponse(error);
+  });
+  await new Promise<void>((resolveConnected, rejectConnected) => {
+    socket.once("connect", resolveConnected);
+    socket.once("error", rejectConnected);
+  });
+  socket.write(
+    "POST /user/info HTTP/1.1\r\n" +
+    `Host: 127.0.0.1:${port}\r\n` +
+    "Content-Type: application/json\r\n" +
+    "Origin: app://obsidian.md\r\n" +
+    "Content-Length: 65536\r\n" +
+    "Connection: keep-alive\r\n\r\n{",
+  );
+  return { socket, response };
+}
 
 function databaseVersion(path: string, vaultId: string): number { const database = new Database(path, { readonly: true }); try { return (database.query("SELECT version FROM vaults WHERE id=?").get(vaultId) as { version: number }).version; } finally { database.close(); } }
 function expireSession(path: string, sessionToken: string) { const database = new Database(path); try { const hash = createHash("sha256").update(sessionToken).digest("hex"); expect(database.query("UPDATE sessions SET expires_at=0 WHERE token_hash=?").run(hash).changes).toBe(1); } finally { database.close(); } }

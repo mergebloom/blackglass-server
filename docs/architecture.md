@@ -9,7 +9,9 @@ and adaptation live separately in Blackglass Bridge.
 ## Control plane
 
 The Rust service provides one configured user and the account and vault
-operations required to create, connect, rename, and delete a Sync vault.
+operations required to create, connect, migrate encryption, rename, and delete
+a Sync vault. Registration, password-recovery, and business-subscription routes
+return explicit administrator-managed JSON errors instead of transport errors.
 Sharing reports an empty list and invite/remove operations fail cleanly in
 single-user mode. Passwords are verified with Argon2id. Successful sign-in
 creates a random 256-bit bearer session whose digest, expiry, and revocation
@@ -32,6 +34,8 @@ SQLite is the supported database for the single-node, single-owner deployment.
 WAL commits use FULL synchronous durability. Startup, backup, restore, and
 offline session revocation fail closed on unexpected schema objects or logical
 state inconsistencies instead of silently repairing an unknown database.
+Recognized older schemas are upgraded only through an offline, copy-first
+command whose per-version validation runs inside each migration transaction.
 SQLite connections use defensive mode with trusted schemas disabled.
 Current revisions store encrypted paths, encrypted hashes, and encrypted file
 bodies. A separate server timestamp supports history even when a deletion has
@@ -54,13 +58,15 @@ renaming a binary creates a new artifact that must earn a new client E2E record.
 ## Security posture
 
 - Production origins use HTTPS and WSS through a reverse proxy.
-- The application process binds only to loopback.
+- Native installs default to loopback; OCI external binding is explicitly
+  acknowledged and confined to a private network behind TLS ingress.
 - Endpoint authorization uses exact origins.
 - Account tokens and vault key material are never logged.
 - Custom-password vault secrets never reach the server; managed mode stores its
   server-generated recovery password and requires a stronger operator trust
   boundary.
-- Sign-in is rate limited and password verification runs off the async reactor.
+- Password verification has a two-check memory bound and runs off the async
+  reactor; the ingress rate-limits per real client address.
 - Session tokens expire and can be revoked; only token digests are persisted.
 - Upload frames, files, concurrent staging, and metadata fields are bounded.
 - Backups use SQLite's online backup API and verify the exact schema, migration

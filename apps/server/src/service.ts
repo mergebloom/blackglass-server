@@ -202,7 +202,7 @@ function account(config: ServerConfig) {
   return {
     email: config.email,
     name: config.displayName,
-    license: "selfhosted-sync",
+    license: null,
   };
 }
 

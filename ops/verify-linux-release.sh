@@ -2,12 +2,13 @@
 set -eu
 
 usage() {
-    echo "usage: $0 <linux-amd64|linux-arm64> <archive>" >&2
+    echo "usage: $0 <linux-amd64|linux-arm64> <archive> [raw-binary]" >&2
     exit 2
 }
 
 target=${1:-}
 archive=${2:-}
+raw_binary=${3:-}
 case "$target" in
     linux-amd64) file_architecture='x86-64' ;;
     linux-arm64) file_architecture='ARM aarch64' ;;
@@ -50,6 +51,9 @@ expected=$(printf '%s\n' \
     "$bundle/INSTALL.md" \
     "$bundle/LICENSE" \
     "$bundle/blackglass-server" \
+    "$bundle/blackglass-server.env.example" \
+    "$bundle/blackglass-server.service" \
+    "$bundle/blackglass-server.sysusers.conf" \
     "$bundle/manifest.json")
 actual=$(tar -tzf "$archive")
 test "$actual" = "$expected" || {
@@ -80,5 +84,20 @@ grep -q "\"target\": \"$target\"" "$manifest"
 grep -q '"libc": "musl"' "$manifest"
 grep -q "\"binarySha256\": \"$binary_sha\"" "$manifest"
 grep -q "\"binarySize\": $binary_size" "$manifest"
+
+if test -n "$raw_binary"; then
+    test -f "$raw_binary"
+    test -f "$raw_binary.sha256"
+    raw_dir=$(cd -- "$(dirname -- "$raw_binary")" && pwd)
+    raw_name=$(basename -- "$raw_binary")
+    test "$raw_name" = "$bundle"
+    if command -v sha256sum >/dev/null 2>&1; then
+        (cd "$raw_dir" && sha256sum -c "$raw_name.sha256")
+    else
+        (cd "$raw_dir" && shasum -a 256 -c "$raw_name.sha256")
+    fi
+    cmp "$raw_binary" "$binary"
+    test "$(sha256_value "$raw_binary")" = "$binary_sha"
+fi
 
 echo "verified: $archive_name ($target, $binary_size bytes, $binary_sha)"

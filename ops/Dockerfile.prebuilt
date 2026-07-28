@@ -19,10 +19,12 @@ LABEL org.opencontainers.image.title="Blackglass Server" \
 COPY --chmod=0555 blackglass-server /usr/local/bin/blackglass-server
 COPY --chown=65532:65532 state/ /var/lib/blackglass-server/
 
-ENV SELFHOST_BIND_HOST=127.0.0.1 \
+ENV SELFHOST_BIND_HOST=0.0.0.0 \
+    SELFHOST_ACKNOWLEDGE_EXTERNAL_BIND=1 \
     SELFHOST_DATABASE=/var/lib/blackglass-server/server.sqlite \
     SELFHOST_STAGING_DIR=/var/lib/blackglass-server/uploads
 
+EXPOSE 3000 3003
 VOLUME ["/var/lib/blackglass-server"]
 USER 65532:65532
 WORKDIR /var/lib/blackglass-server

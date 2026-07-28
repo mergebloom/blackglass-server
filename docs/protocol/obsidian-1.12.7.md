@@ -17,6 +17,7 @@ Observed account routes:
 - `/user/forgetpass`
 - `/user/resendconfirmation`
 - `/subscription/list`
+- `/subscription/business`
 
 Observed Sync vault routes:
 
@@ -31,10 +32,13 @@ Observed Sync vault routes:
 - `/vault/share/invite`
 - `/vault/share/remove`
 
-The first milestone implements sign-in, sign-out, user information,
-subscription information, region listing, vault list/create/access/rename/
-delete, and an empty share list. Share mutations return a clean single-user
-error; migration is outside the milestone.
+The server implements sign-in, sign-out, user information, Sync subscription
+information, region listing, vault list/create/access/migrate/rename/delete,
+and an empty share list. Registration, password recovery, business
+subscriptions, and share mutations return explicit JSON errors for the
+single-owner deployment. Account responses use `license:null`; Sync entitlement
+comes only from `/subscription/list.sync`, avoiding unrelated Catalyst/Insider
+UI.
 
 ## Data plane
 
@@ -43,9 +47,12 @@ The Sync client persists a control-plane-provided `host`. It derives:
 - `ws://host` for `localhost` or `127.0.0.1`;
 - `wss://host` otherwise.
 
-The reference client currently accepts `127.0.0.1` or a hostname ending in
-`.obsidian.md`. The compatibility adapter will replace this with an exact
-configured-origin check.
+The unadapted reference client currently accepts `127.0.0.1` or a hostname
+ending in `.obsidian.md`. The compatibility adapter replaces this with an exact
+configured-host check. Server and Bridge validation share the transport-safe
+endpoint rules: exact `127.0.0.1`/`localhost` for plaintext development or a
+canonical production host for WSS; explicit `:443`, deceptive loopback
+prefixes, IPv6 loopback, and other 127/8 addresses are rejected.
 
 Initial connection message:
 
@@ -137,6 +144,8 @@ device name, and account identity.
 | `size`, `usernames` | Implemented and official-client tested |
 | `deleted`, `history`, `restore`, `purge` | Implemented and protocol-tested; deleted view live-tested |
 | custom-password and managed-encryption vault lifecycle | Implemented and protocol-tested across restart and second-device access |
+| destructive encryption upgrade (`/vault/migrate`) | Atomic empty-v3 replacement, old-history removal, old-socket invalidation, and managed/custom recovery tested |
+| registration/recovery/business account UI | Explicit administrator-managed JSON errors; no public account lifecycle |
 | two-device convergence | Bidirectional byte-identical E2E pass |
 | multi-user sharing | Deliberately unsupported |
 
@@ -151,6 +160,17 @@ device name, and account identity.
   uses its most recent prior live content.
 - `purge` retains one current live head per live path, removes tombstoned path
   history, and preserves the monotonic vault version.
+
+### Encryption upgrade contract
+
+Obsidian 1.12.7 posts `token`, `vault_uid`, new `keyhash`/`salt` (or null managed
+credentials), `region`, and `encryption_version:3` to `/vault/migrate`. Success
+returns a full replacement vault object. The server serializes this with Sync
+commits and atomically creates an empty replacement while deleting the old
+remote data and all history. Old idle and mid-upload sockets are invalidated;
+the client then reconnects and reuploads its local vault. A failed transaction
+leaves the old vault intact. Requests against an already-v3 source are rejected
+to prevent replay or manual calls from erasing current history.
 
 ## Confirmed local development seams
 

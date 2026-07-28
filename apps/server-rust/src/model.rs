@@ -92,6 +92,18 @@ pub struct VaultDelete {
     pub vault_uid: Option<String>,
 }
 
+#[derive(Debug, Deserialize)]
+pub struct VaultMigrate {
+    #[serde(rename = "token")]
+    pub _token: Option<String>,
+    pub vault_uid: Option<String>,
+    pub keyhash: Option<String>,
+    pub salt: Option<String>,
+    #[serde(rename = "region")]
+    pub _region: Option<String>,
+    pub encryption_version: Option<i64>,
+}
+
 #[derive(Clone, Debug, Serialize)]
 pub struct PushNotice {
     pub op: &'static str,

@@ -32,8 +32,12 @@ RUN --mount=type=cache,id=blackglass-cargo-registry-$TARGETARCH,target=/usr/loca
 COPY apps/server-rust/src ./apps/server-rust/src
 COPY LICENSE /metadata/LICENSE
 COPY ops/release/INSTALL.md /metadata/INSTALL.md
+COPY ops/blackglass-server.env.example /metadata/blackglass-server.env.example
+COPY ops/blackglass-server.service /metadata/blackglass-server.service
+COPY ops/blackglass-server.sysusers.conf /metadata/blackglass-server.sysusers.conf
 
 ENV CARGO_TARGET_DIR=/target
+ENV BLACKGLASS_SOURCE_REVISION=$SOURCE_REVISION
 
 RUN --mount=type=cache,id=blackglass-cargo-registry-$TARGETARCH,target=/usr/local/cargo/registry,sharing=locked \
     --mount=type=cache,id=blackglass-cargo-git-$TARGETARCH,target=/usr/local/cargo/git,sharing=locked \
@@ -41,6 +45,8 @@ RUN --mount=type=cache,id=blackglass-cargo-registry-$TARGETARCH,target=/usr/loca
     && cargo build --locked --release --manifest-path apps/server-rust/Cargo.toml
 
 RUN test "$(/target/release/blackglass-server --version)" = "blackglass-server $VERSION"
+RUN /target/release/blackglass-server build-info \
+    | grep -Fq "\"sourceRevision\":\"$SOURCE_REVISION\""
 
 # Exercise the exact release binary, including Argon2, SQLite initialization,
 # both listeners, and readiness. The password is fixed test data in a disposable
@@ -82,6 +88,9 @@ RUN set -eu; \
     chmod 0755 "/package/$bundle/blackglass-server"; \
     cp /metadata/INSTALL.md "/package/$bundle/INSTALL.md"; \
     cp /metadata/LICENSE "/package/$bundle/LICENSE"; \
+    cp /metadata/blackglass-server.env.example "/package/$bundle/blackglass-server.env.example"; \
+    cp /metadata/blackglass-server.service "/package/$bundle/blackglass-server.service"; \
+    cp /metadata/blackglass-server.sysusers.conf "/package/$bundle/blackglass-server.sysusers.conf"; \
     binary_sha=$(sha256sum "/package/$bundle/blackglass-server" | cut -d ' ' -f 1); \
     binary_size=$(wc -c < "/package/$bundle/blackglass-server" | tr -d ' '); \
     printf '%s\n' \
@@ -105,7 +114,11 @@ RUN set -eu; \
       -C /package -cf "/out/${bundle}.tar" "$bundle"; \
     gzip -n "/out/${bundle}.tar"; \
     cd /out; \
-    sha256sum "$archive" > "$archive.sha256"
+    sha256sum "$archive" > "$archive.sha256"; \
+    cp "/package/$bundle/blackglass-server" "/out/$bundle"; \
+    chmod 0755 "/out/$bundle"; \
+    cmp "/out/$bundle" "/package/$bundle/blackglass-server"; \
+    sha256sum "$bundle" > "$bundle.sha256"
 
 FROM scratch AS release
 COPY --from=build /out/ /
@@ -124,10 +137,12 @@ LABEL org.opencontainers.image.title="Blackglass Server" \
 COPY --from=build --chmod=0555 /target/release/blackglass-server /usr/local/bin/blackglass-server
 COPY --from=build --chown=65532:65532 /runtime-state/ /var/lib/blackglass-server/
 
-ENV SELFHOST_BIND_HOST=127.0.0.1 \
+ENV SELFHOST_BIND_HOST=0.0.0.0 \
+    SELFHOST_ACKNOWLEDGE_EXTERNAL_BIND=1 \
     SELFHOST_DATABASE=/var/lib/blackglass-server/server.sqlite \
     SELFHOST_STAGING_DIR=/var/lib/blackglass-server/uploads
 
+EXPOSE 3000 3003
 VOLUME ["/var/lib/blackglass-server"]
 USER 65532:65532
 WORKDIR /var/lib/blackglass-server

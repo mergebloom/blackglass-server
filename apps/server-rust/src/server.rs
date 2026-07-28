@@ -1,13 +1,19 @@
-use crate::{auth, config::Config, db::Db, model::*};
+use crate::{
+    auth,
+    config::Config,
+    db::{Db, MAX_JS_SAFE_INTEGER},
+    model::*,
+};
 use anyhow::{Context, Result};
 use axum::{
     Json, Router,
-    body::Bytes,
+    body::{Body, Bytes, to_bytes},
     extract::{
-        DefaultBodyLimit, State, WebSocketUpgrade,
+        DefaultBodyLimit, Request, State, WebSocketUpgrade,
         ws::{CloseFrame, Message, WebSocket},
     },
     http::{HeaderMap, HeaderValue, StatusCode, Uri, header},
+    middleware::{self, Next},
     response::{IntoResponse, Response},
     routing::{get, post},
 };
@@ -15,6 +21,8 @@ use futures_util::{SinkExt, StreamExt, stream::SplitSink};
 use serde_json::{Value, json};
 use std::{
     fs,
+    future::Future,
+    io::Write,
     path::PathBuf,
     sync::{
         Arc,
@@ -34,10 +42,21 @@ use uuid::Uuid;
 const PIECE_SIZE: i64 = 2 * 1024 * 1024;
 const AES_GCM_WIRE_OVERHEAD: u64 = 12 + 16;
 const REPLAY_PAGE_SIZE: i64 = 128;
-const MAX_CONCURRENT_AUTH_CHECKS: usize = 4;
 const AUTHENTICATION_DEADLINE: Duration = Duration::from_secs(5);
+const CONTROL_BODY_DEADLINE: Duration = Duration::from_secs(5);
+const GRACEFUL_CONNECTION_DRAIN_DEADLINE: Duration = Duration::from_secs(15);
 const SESSION_REVALIDATE_INTERVAL: Duration = Duration::from_secs(5);
 const SOCKET_WRITE_TIMEOUT: Duration = Duration::from_secs(10);
+pub(crate) const MAX_CONTROL_BODY_READERS: usize = 32;
+pub(crate) const MAX_CONTROL_REQUESTS: usize = 16;
+pub(crate) const MAX_DB_WORKERS: usize = 2;
+pub(crate) const MAX_CONTROL_BODY_BYTES: usize = 64 * 1024;
+pub(crate) const EVENT_CAPACITY: usize = 32;
+pub(crate) const MAX_EVENT_BYTES: usize = 32 * 1024;
+pub(crate) const MAX_LARGE_RESPONSE_BYTES: usize = 8 * 1024 * 1024;
+const DELETED_PAGE_SIZE: i64 = 64;
+const STAGING_MARKER: &str = ".blackglass-staging-v1";
+const STAGING_MARKER_CONTENT: &str = "blackglass-server staging v1\n";
 
 #[derive(Default)]
 pub struct Metrics {
@@ -49,12 +68,15 @@ pub struct Metrics {
     upload_bytes: AtomicU64,
     downloads: AtomicU64,
     errors: AtomicU64,
+    control_rejections: AtomicU64,
 }
+
 #[derive(Clone)]
 struct Event {
     uid: i64,
     vault: String,
     text: String,
+    invalidated: bool,
 }
 #[derive(Clone)]
 pub struct AppState {
@@ -65,14 +87,31 @@ pub struct AppState {
     uploads: Arc<Semaphore>,
     connections: Arc<Semaphore>,
     auth_checks: Arc<Semaphore>,
+    control_body_readers: Arc<Semaphore>,
+    control_requests: Arc<Semaphore>,
+    db_workers: Arc<Semaphore>,
+    large_responses: Arc<Semaphore>,
     shutdown: watch::Receiver<bool>,
     metrics: Arc<Metrics>,
 }
 
 pub async fn run(config: Config) -> Result<()> {
+    let _database_lock = acquire_database_lock(&config.database_path)?;
+    let _staging_lock = acquire_path_lock(&config.staging_dir, "staging")?;
     prepare_staging(&config.staging_dir)?;
     let db = Db::open(&config.database_path)?;
-    let (events, _) = broadcast::channel(1024);
+    let configured_host = config.public_data_host.clone();
+    let mismatched_hosts = db
+        .mismatched_data_hosts(&configured_host)
+        .context("inspect persisted vault data hosts")?;
+    if !mismatched_hosts.is_empty() {
+        anyhow::bail!(
+            "persisted vault data host(s) {:?} do not match SELFHOST_DATA_HOST={configured_host}; stop the service, run `blackglass-server rebind-data-host {} {configured_host} <backup>`, then restart",
+            mismatched_hosts,
+            config.database_path.display()
+        )
+    }
+    let (events, _) = broadcast::channel(EVENT_CAPACITY);
     let max_uploads = config.max_concurrent_uploads;
     let max_connections = config.max_ws_connections;
     let (shutdown_tx, shutdown) = watch::channel(false);
@@ -83,7 +122,11 @@ pub async fn run(config: Config) -> Result<()> {
         commit_order: Arc::new(AsyncMutex::new(())),
         uploads: Arc::new(Semaphore::new(max_uploads)),
         connections: Arc::new(Semaphore::new(max_connections)),
-        auth_checks: Arc::new(Semaphore::new(MAX_CONCURRENT_AUTH_CHECKS)),
+        auth_checks: Arc::new(Semaphore::new(auth::MAX_CONCURRENT_PASSWORD_CHECKS)),
+        control_body_readers: Arc::new(Semaphore::new(MAX_CONTROL_BODY_READERS)),
+        control_requests: Arc::new(Semaphore::new(MAX_CONTROL_REQUESTS)),
+        db_workers: Arc::new(Semaphore::new(MAX_DB_WORKERS)),
+        large_responses: Arc::new(Semaphore::new(1)),
         shutdown,
         metrics: Arc::new(Metrics::default()),
     };
@@ -109,22 +152,27 @@ pub async fn run(config: Config) -> Result<()> {
             })
             .await
     });
-    shutdown_signal().await;
-    info!(event = "shutdown_requested");
-    let _ = shutdown_tx.send(true);
-    control_task.await??;
-    data_task.await??;
-    db_task(&state.db, |db| db.checkpoint()).await?;
-    cleanup_staging(&state.config.staging_dir)?;
+    let listener_result =
+        supervise_listeners(shutdown_tx, control_task, data_task, shutdown_signal()).await;
+    let drain_result = wait_for_connection_drain(&state).await;
+    let (checkpoint_result, cleanup_result) = if drain_result.is_ok() {
+        (
+            db_task(&state, |db| db.checkpoint()).await,
+            cleanup_staging(&state.config.staging_dir),
+        )
+    } else {
+        (Ok(()), Ok(()))
+    };
+    listener_result?;
+    drain_result?;
+    checkpoint_result?;
+    cleanup_result?;
     info!(event = "server_stopped");
     Ok(())
 }
 
 fn control_router(state: AppState) -> Router {
-    let mut r = Router::new()
-        .route("/health", get(health))
-        .route("/ready", get(ready))
-        .route("/metrics", get(metrics));
+    let mut r = Router::new();
     for path in [
         "/user/signin",
         "/user/signout",
@@ -134,15 +182,28 @@ fn control_router(state: AppState) -> Router {
         "/vault/list",
         "/vault/create",
         "/vault/access",
+        "/vault/migrate",
         "/vault/rename",
         "/vault/delete",
         "/vault/share/list",
         "/vault/share/invite",
         "/vault/share/remove",
+        "/user/signup",
+        "/user/forgetpass",
+        "/user/resendconfirmation",
+        "/subscription/business",
     ] {
         r = r.route(path, post(control).options(preflight));
     }
-    r.with_state(state).layer(DefaultBodyLimit::max(64 * 1024))
+    r.route_layer(middleware::from_fn_with_state(
+        state.clone(),
+        control_admission,
+    ))
+    .route("/health", get(health))
+    .route("/ready", get(ready))
+    .route("/metrics", get(metrics))
+    .with_state(state)
+    .layer(DefaultBodyLimit::max(64 * 1024))
 }
 fn data_router(state: AppState) -> Router {
     Router::new().route("/", get(upgrade)).with_state(state)
@@ -155,13 +216,75 @@ async fn health(State(s): State<AppState>) -> Response {
             "ok": true,
             "service": "blackglass-server",
             "implementation": "rust",
-            "version": env!("CARGO_PKG_VERSION")
+            "version": env!("CARGO_PKG_VERSION"),
+            "sourceRevision": crate::SOURCE_REVISION
         }),
         StatusCode::OK,
     )
 }
+async fn control_admission(State(s): State<AppState>, request: Request, next: Next) -> Response {
+    let origin = match permitted_origin(&s, request.headers()) {
+        Ok(origin) => origin.map(str::to_owned),
+        Err(()) => {
+            return api(
+                &s,
+                json!({"error":"Origin not allowed"}),
+                StatusCode::FORBIDDEN,
+            );
+        }
+    };
+    let body_permit = match s.control_body_readers.clone().try_acquire_owned() {
+        Ok(permit) => permit,
+        Err(_) => return control_busy_for_origin(&s, origin.as_deref()),
+    };
+    let (parts, body) = request.into_parts();
+    let body = match timeout(
+        CONTROL_BODY_DEADLINE,
+        to_bytes(body, MAX_CONTROL_BODY_BYTES),
+    )
+    .await
+    {
+        Ok(Ok(body)) => body,
+        Ok(Err(_)) => {
+            return api_for_origin(
+                &s,
+                json!({"error":"Request body too large"}),
+                StatusCode::PAYLOAD_TOO_LARGE,
+                origin.as_deref(),
+            );
+        }
+        Err(_) => {
+            return api_for_origin(
+                &s,
+                json!({"error":"Request body timed out"}),
+                StatusCode::REQUEST_TIMEOUT,
+                origin.as_deref(),
+            );
+        }
+    };
+    drop(body_permit);
+    let permit = match s.control_requests.clone().try_acquire_owned() {
+        Ok(permit) => permit,
+        Err(_) => return control_busy_for_origin(&s, origin.as_deref()),
+    };
+    let request = Request::from_parts(parts, Body::from(body));
+    let response = next.run(request).await;
+    drop(permit);
+    response
+}
+
+fn control_busy_for_origin(s: &AppState, origin: Option<&str>) -> Response {
+    s.metrics.control_rejections.fetch_add(1, Ordering::Relaxed);
+    api_for_origin(
+        s,
+        json!({"error":"Server busy"}),
+        StatusCode::SERVICE_UNAVAILABLE,
+        origin,
+    )
+}
+
 async fn ready(State(s): State<AppState>) -> Response {
-    let ok = db_task(&s.db, |db| Ok(db.ready())).await.unwrap_or(false);
+    let ok = try_db_task(&s, |db| Ok(db.ready())).await.unwrap_or(false);
     api(
         &s,
         json!({"ok":ok}),
@@ -175,8 +298,9 @@ async fn ready(State(s): State<AppState>) -> Response {
 async fn metrics(State(s): State<AppState>) -> Response {
     let m = &s.metrics;
     let body = format!(
-        "blackglass_control_requests_total {}\nblackglass_signins_total {}\nblackglass_auth_failures_total {}\nblackglass_ws_connections_total {}\nblackglass_uploads_total {}\nblackglass_upload_bytes_total {}\nblackglass_downloads_total {}\nblackglass_errors_total {}\nobsidian_sync_control_requests_total {}\nobsidian_sync_signins_total {}\nobsidian_sync_auth_failures_total {}\nobsidian_sync_ws_connections_total {}\nobsidian_sync_uploads_total {}\nobsidian_sync_upload_bytes_total {}\nobsidian_sync_downloads_total {}\nobsidian_sync_errors_total {}\n",
+        "blackglass_control_requests_total {}\nblackglass_control_rejections_total {}\nblackglass_signins_total {}\nblackglass_auth_failures_total {}\nblackglass_ws_connections_total {}\nblackglass_uploads_total {}\nblackglass_upload_bytes_total {}\nblackglass_downloads_total {}\nblackglass_errors_total {}\nobsidian_sync_control_requests_total {}\nobsidian_sync_signins_total {}\nobsidian_sync_auth_failures_total {}\nobsidian_sync_ws_connections_total {}\nobsidian_sync_uploads_total {}\nobsidian_sync_upload_bytes_total {}\nobsidian_sync_downloads_total {}\nobsidian_sync_errors_total {}\n",
         m.control.load(Ordering::Relaxed),
+        m.control_rejections.load(Ordering::Relaxed),
         m.signins.load(Ordering::Relaxed),
         m.auth_failures.load(Ordering::Relaxed),
         m.ws_connections.load(Ordering::Relaxed),
@@ -244,10 +368,12 @@ async fn control(State(s): State<AppState>, uri: Uri, headers: HeaderMap, body: 
             );
         }
     };
-    let result = if uri.path() == "/user/signin" {
-        signin(&s, value).await
-    } else {
-        authorized_control(&s, uri.path(), value).await
+    let result = match uri.path() {
+        "/user/signin" => signin(&s, value).await,
+        "/user/signup" | "/user/forgetpass" | "/user/resendconfirmation" => {
+            Err("Accounts are managed by the Blackglass Server administrator".into())
+        }
+        _ => authorized_control(&s, uri.path(), value).await,
     };
     match result {
         Ok(v) => api_for_origin(&s, v, StatusCode::OK, request_origin),
@@ -288,14 +414,12 @@ async fn signin(s: &AppState, v: Value) -> std::result::Result<Value, String> {
         return Err("Invalid email or password".into());
     }
     let ttl = s.config.session_ttl.as_secs() as i64;
-    let token = db_task(&s.db, move |db| db.issue_session(ttl))
+    let token = db_task(s, move |db| db.issue_session(ttl))
         .await
         .map_err(internal)?;
     s.metrics.signins.fetch_add(1, Ordering::Relaxed);
     info!(event = "signin_succeeded");
-    Ok(
-        json!({"email":s.config.email,"name":s.config.display_name,"license":"selfhosted-sync","token":token}),
-    )
+    Ok(json!({"email":s.config.email,"name":s.config.display_name,"license":null,"token":token}))
 }
 
 async fn authorized_control(
@@ -309,7 +433,7 @@ async fn authorized_control(
         .ok_or("Not logged in")?
         .to_owned();
     let validation_token = token.clone();
-    if !db_task(&s.db, move |db| Ok(db.valid_session(&validation_token)))
+    if !db_task(s, move |db| Ok(db.valid_session(&validation_token)))
         .await
         .map_err(internal)?
     {
@@ -318,25 +442,29 @@ async fn authorized_control(
     }
     match path {
         "/user/signout" => {
-            db_task(&s.db, move |db| db.revoke_session(&token))
+            db_task(s, move |db| db.revoke_session(&token))
                 .await
                 .map_err(internal)?;
             Ok(json!({}))
         }
-        "/user/info" => Ok(
-            json!({"email":s.config.email,"name":s.config.display_name,"license":"selfhosted-sync"}),
-        ),
+        "/user/info" => {
+            Ok(json!({"email":s.config.email,"name":s.config.display_name,"license":null}))
+        }
         "/subscription/list" => Ok(json!({"sync":true,"publish":false})),
+        "/subscription/business" => {
+            Err("Business subscriptions are unavailable on a self-hosted server".into())
+        }
         "/vault/regions" => {
             Ok(json!({"regions":[{"value":"selfhost","name":"Blackglass Server"}]}))
         }
         "/vault/list" => Ok(json!({
-            "vaults":db_task(&s.db, |db| db.list_vaults()).await.map_err(internal)?,
+            "vaults":db_task(s, |db| db.list_vaults()).await.map_err(internal)?,
             "shared":[],
             "limit":100
         })),
         "/vault/create" => create_vault(s, v).await,
         "/vault/access" => access_vault(s, v).await,
+        "/vault/migrate" => migrate_vault(s, v).await,
         "/vault/rename" => rename_vault(s, v).await,
         "/vault/delete" => delete_vault(s, v).await,
         "/vault/share/list" => Ok(json!({"shares":[]})),
@@ -361,21 +489,11 @@ async fn create_vault(s: &AppState, v: Value) -> std::result::Result<Value, Stri
         .encryption_version
         .filter(|v| (0..=3).contains(v))
         .ok_or("Unsupported encryption version")?;
-    let (keyhash, salt, password) = match (r.keyhash, r.salt) {
-        (None, None) => {
-            let (password, salt) = auth::new_managed_vault_credentials();
-            (None, Some(salt), Some(password))
-        }
-        (Some(keyhash), Some(salt))
-            if !keyhash.is_empty()
-                && keyhash.len() <= 4096
-                && !salt.is_empty()
-                && salt.len() <= 4096 =>
-        {
-            (Some(keyhash), Some(salt), None)
-        }
-        _ => return Err("Invalid encryption credentials".into()),
-    };
+    let VaultCredentials {
+        keyhash,
+        salt,
+        password,
+    } = vault_credentials(r.keyhash, r.salt)?;
     let vault = Vault {
         id: Uuid::new_v4().to_string(),
         name,
@@ -389,9 +507,12 @@ async fn create_vault(s: &AppState, v: Value) -> std::result::Result<Value, Stri
         password,
     };
     let stored = vault.clone();
-    db_task(&s.db, move |db| db.create_vault(&stored))
-        .await
-        .map_err(internal)?;
+    if let Err(error) = db_task(s, move |db| db.create_vault(&stored)).await {
+        if error.to_string().contains("vault limit reached") {
+            return Err("Vault limit reached".into());
+        }
+        return Err(internal(error));
+    }
     serde_json::to_value(vault).map_err(internal)
 }
 async fn access_vault(s: &AppState, v: Value) -> std::result::Result<Value, String> {
@@ -399,7 +520,7 @@ async fn access_vault(s: &AppState, v: Value) -> std::result::Result<Value, Stri
         serde_json::from_value(v).map_err(|_| "Unable to access vault".to_string())?;
     let id = r.vault_uid.ok_or("Unable to access vault")?;
     let lookup_id = id.clone();
-    let mut vault = db_task(&s.db, move |db| db.find_vault(&lookup_id))
+    let mut vault = db_task(s, move |db| db.find_vault(&lookup_id))
         .await
         .map_err(internal)?
         .ok_or("Unable to access vault")?;
@@ -416,16 +537,58 @@ async fn access_vault(s: &AppState, v: Value) -> std::result::Result<Value, Stri
             .ok_or("Unable to access vault")?;
         let bind_id = vault.id.clone();
         let requested = requested.to_owned();
-        vault.keyhash = db_task(&s.db, move |db| {
-            db.bind_managed_keyhash(&bind_id, &requested)
-        })
-        .await
-        .map_err(internal)?;
+        vault.keyhash = db_task(s, move |db| db.bind_managed_keyhash(&bind_id, &requested))
+            .await
+            .map_err(internal)?;
     }
     if r.keyhash != vault.keyhash {
         return Err("Unable to access vault".into());
     }
     Ok(json!({}))
+}
+async fn migrate_vault(s: &AppState, v: Value) -> std::result::Result<Value, String> {
+    let r: VaultMigrate =
+        serde_json::from_value(v).map_err(|_| "Unable to migrate vault".to_string())?;
+    let source_id = r.vault_uid.ok_or("Unable to migrate vault")?;
+    if r.encryption_version != Some(3) {
+        return Err("Unsupported encryption version".into());
+    }
+    let VaultCredentials {
+        keyhash,
+        salt,
+        password,
+    } = vault_credentials(r.keyhash, r.salt)?;
+    let _commit = s.commit_order.lock().await;
+    let lookup_id = source_id.clone();
+    let source = db_task(s, move |db| db.find_vault(&lookup_id))
+        .await
+        .map_err(internal)?
+        .ok_or("Unable to migrate vault")?;
+    if source.encryption_version >= 3 {
+        return Err("Vault already uses encryption version 3".into());
+    }
+    let replacement = Vault {
+        id: Uuid::new_v4().to_string(),
+        name: source.name,
+        keyhash,
+        salt,
+        host: s.config.public_data_host.clone(),
+        region: "Blackglass Server".into(),
+        encryption_version: 3,
+        size: 0,
+        created: now_ms(),
+        password,
+    };
+    let stored = replacement.clone();
+    let migrate_source_id = source_id.clone();
+    if !db_task(s, move |db| db.migrate_vault(&migrate_source_id, &stored))
+        .await
+        .map_err(internal)?
+    {
+        return Err("Unable to migrate vault".into());
+    }
+    invalidate_vault(s, source_id);
+    serde_json::to_value(replacement).map_err(internal)
 }
 async fn rename_vault(s: &AppState, v: Value) -> std::result::Result<Value, String> {
     let r: VaultRename =
@@ -438,7 +601,8 @@ async fn rename_vault(s: &AppState, v: Value) -> std::result::Result<Value, Stri
         .filter(|v| !v.is_empty() && v.len() <= 256)
         .ok_or("Unable to rename vault")?
         .to_owned();
-    if !db_task(&s.db, move |db| db.rename_vault(&id, &name))
+    let _commit = s.commit_order.lock().await;
+    if !db_task(s, move |db| db.rename_vault(&id, &name))
         .await
         .map_err(internal)?
     {
@@ -450,13 +614,60 @@ async fn delete_vault(s: &AppState, v: Value) -> std::result::Result<Value, Stri
     let r: VaultDelete =
         serde_json::from_value(v).map_err(|_| "Unable to delete vault".to_string())?;
     let id = r.vault_uid.unwrap_or_default();
-    if !db_task(&s.db, move |db| db.delete_vault(&id))
+    let _commit = s.commit_order.lock().await;
+    let delete_id = id.clone();
+    if !db_task(s, move |db| db.delete_vault(&delete_id))
         .await
         .map_err(internal)?
     {
         return Err("Unable to delete vault".into());
     }
+    invalidate_vault(s, id);
     Ok(json!({}))
+}
+
+struct VaultCredentials {
+    keyhash: Option<String>,
+    salt: Option<String>,
+    password: Option<String>,
+}
+
+fn vault_credentials(
+    keyhash: Option<String>,
+    salt: Option<String>,
+) -> std::result::Result<VaultCredentials, String> {
+    match (keyhash, salt) {
+        (None, None) => {
+            let (password, salt) = auth::new_managed_vault_credentials();
+            Ok(VaultCredentials {
+                keyhash: None,
+                salt: Some(salt),
+                password: Some(password),
+            })
+        }
+        (Some(keyhash), Some(salt))
+            if !keyhash.is_empty()
+                && keyhash.len() <= 4096
+                && !salt.is_empty()
+                && salt.len() <= 4096 =>
+        {
+            Ok(VaultCredentials {
+                keyhash: Some(keyhash),
+                salt: Some(salt),
+                password: None,
+            })
+        }
+        _ => Err("Invalid encryption credentials".into()),
+    }
+}
+
+fn invalidate_vault(s: &AppState, vault: String) {
+    let _ = s.events.send(Event {
+        uid: 0,
+        vault,
+        text: String::new(),
+        invalidated: true,
+    });
 }
 
 async fn upgrade(State(s): State<AppState>, headers: HeaderMap, ws: WebSocketUpgrade) -> Response {
@@ -556,6 +767,13 @@ async fn socket_loop(
                 _ => break,
             },
             event = events.recv() => match event {
+                Ok(event) if session.vault.as_deref() == Some(&event.vault) && event.invalidated => {
+                    let _ = socket_send(&mut tx, Message::Close(Some(CloseFrame {
+                        code: 1008,
+                        reason: "Vault deleted or replaced".into(),
+                    }))).await;
+                    break
+                },
                 Ok(event) if session.vault.as_deref() == Some(&event.vault) => {
                     if !session_active(&s, &session).await {
                         let _ = socket_send(&mut tx, Message::Close(Some(CloseFrame {
@@ -622,31 +840,21 @@ async fn handle_message(
                 "ping" => send(tx, json!({"op":"pong"})).await?,
                 "size" => {
                     let vault = session.vault.clone().unwrap();
-                    let (size, vault_size) = db_task(&s.db, move |db| {
-                        Ok((db.total_size()?, db.vault_size(&vault)?))
-                    })
-                    .await?;
+                    let (size, vault_size) =
+                        db_task(s, move |db| Ok((db.total_size()?, db.vault_size(&vault)?)))
+                            .await?;
                     send(tx,json!({"res":"ok","size":size,"limit":1099511627776i64,"vault_size":vault_size})).await?
                 }
                 "usernames" => send(tx, json!({"1":s.config.display_name})).await?,
                 "push" => begin_push(s, session, events, tx, v).await?,
                 "pull" => pull(s, session, tx, v).await?,
-                "deleted" => {
-                    let vault = session.vault.clone().unwrap();
-                    let suppress = v.get("suppressrenames").and_then(Value::as_bool) == Some(true);
-                    let items = db_task(&s.db, move |db| db.list_deleted(&vault, suppress))
-                        .await?
-                        .into_iter()
-                        .map(notice_item)
-                        .collect::<Vec<_>>();
-                    send(tx, json!({"items":items})).await?
-                }
+                "deleted" => deleted(s, session, tx, v).await?,
                 "history" => history(s, session, tx, v).await?,
                 "restore" => restore(s, session, events, tx, v).await?,
                 "purge" => {
                     let vault = session.vault.clone().unwrap();
                     let _commit = s.commit_order.lock().await;
-                    db_task(&s.db, move |db| db.purge(&vault)).await?;
+                    db_task(s, move |db| db.purge(&vault)).await?;
                     drop(_commit);
                     send(tx, json!({"res":"ok"})).await?
                 }
@@ -695,7 +903,7 @@ async fn init(
     let token_hash = auth::token_hash(&token);
     let lookup_id = id.clone();
     let validation_hash = token_hash.clone();
-    let (vault, valid_session) = db_task(&s.db, move |db| {
+    let (vault, valid_session) = db_task(s, move |db| {
         Ok((
             db.find_vault(&lookup_id)?,
             token.len() == 64 && db.valid_session_hash(&validation_hash),
@@ -703,6 +911,10 @@ async fn init(
     })
     .await?;
     let Some(vault) = vault else {
+        if valid_session {
+            send(tx, json!({"res":"err","msg":"Vault not found"})).await?;
+            return close(tx, 1008, "Vault not found").await;
+        }
         send(tx, json!({"res":"err","msg":"Unable to authenticate"})).await?;
         return Ok(());
     };
@@ -716,6 +928,16 @@ async fn init(
         send(tx, json!({"res":"err","msg":"Unable to authenticate"})).await?;
         return Ok(());
     }
+    let version = match v.get("version") {
+        None => 0,
+        Some(value) => match value.as_i64() {
+            Some(version) if (0..=MAX_JS_SAFE_INTEGER).contains(&version) => version,
+            _ => {
+                send(tx, json!({"res":"err","msg":"Invalid Sync version"})).await?;
+                return close(tx, 1008, "Invalid Sync version").await;
+            }
+        },
+    };
     session.authenticated = true;
     session.token_hash = Some(token_hash);
     session.vault = Some(vault.id.clone());
@@ -727,12 +949,6 @@ async fn init(
     )
     .unwrap_or("Unknown device")
     .into();
-    send(
-        tx,
-        json!({"res":"ok","userId":1,"perFileMax":s.config.per_file_max}),
-    )
-    .await?;
-    let version = v.get("version").and_then(Value::as_i64).unwrap_or(0).max(0);
     let initial = v.get("initial").and_then(Value::as_bool).unwrap_or(false);
     let ready_version = {
         // Establish the replay/live boundary while commits are serialized. Replacing
@@ -740,10 +956,23 @@ async fn init(
         // then queued exactly once even when sending the replay is slow.
         let _commit = s.commit_order.lock().await;
         let vault_id = vault.id.clone();
-        let ready_version = db_task(&s.db, move |db| db.current_version(&vault_id)).await?;
+        let ready_version = db_task(s, move |db| db.current_version(&vault_id)).await?;
         *events = s.events.subscribe();
         ready_version
     };
+    if !initial && version > ready_version {
+        send(
+            tx,
+            json!({"res":"err","msg":"Client Sync version is ahead of the server; reconnect this vault as a fresh client after restore"}),
+        )
+        .await?;
+        return close(tx, 1008, "Client Sync version is ahead of the server").await;
+    }
+    send(
+        tx,
+        json!({"res":"ok","userId":1,"perFileMax":s.config.per_file_max}),
+    )
+    .await?;
     let mut cursor = if initial { 0 } else { version };
     loop {
         if shutting_down(s) {
@@ -753,7 +982,7 @@ async fn init(
             return close(tx, 1008, "Session expired or revoked").await;
         }
         let vault_id = vault.id.clone();
-        let page = db_task(&s.db, move |db| {
+        let page = db_task(s, move |db| {
             if initial {
                 db.initial_snapshot_page(&vault_id, cursor, ready_version, REPLAY_PAGE_SIZE)
             } else {
@@ -794,14 +1023,23 @@ async fn begin_push(
     let size = v.get("size").and_then(Value::as_i64).unwrap_or(0);
     let pieces = v.get("pieces").and_then(Value::as_i64).unwrap_or(0);
     let valid = bounded(v.get("path").and_then(Value::as_str).unwrap_or(""), 16384).is_some()
+        && match v.get("relatedpath") {
+            None | Some(Value::Null) => true,
+            Some(Value::String(value)) => value.len() <= 16384,
+            _ => false,
+        }
         && v.get("extension")
             .and_then(Value::as_str)
             .is_some_and(|x| x.len() <= 256)
         && v.get("hash")
             .and_then(Value::as_str)
             .is_some_and(|x| x.len() <= 4096)
-        && v.get("ctime").and_then(Value::as_i64).is_some()
-        && v.get("mtime").and_then(Value::as_i64).is_some()
+        && v.get("ctime")
+            .and_then(Value::as_i64)
+            .is_some_and(js_safe_nonnegative)
+        && v.get("mtime")
+            .and_then(Value::as_i64)
+            .is_some_and(js_safe_nonnegative)
         && v.get("folder").and_then(Value::as_bool).is_some()
         && v.get("deleted").and_then(Value::as_bool).is_some()
         && size >= 0
@@ -818,7 +1056,6 @@ async fn begin_push(
         relatedpath: v
             .get("relatedpath")
             .and_then(Value::as_str)
-            .filter(|x| x.len() <= 16384)
             .map(str::to_string),
         extension: v["extension"].as_str().unwrap().into(),
         hash: v["hash"].as_str().unwrap().into(),
@@ -831,10 +1068,14 @@ async fn begin_push(
         device: session.device.clone(),
         user_id: 1,
     };
+    if serialized_notice_size(&revision)? > MAX_EVENT_BYTES {
+        send(tx, json!({"err":"Push metadata is too large"})).await?;
+        return Ok(());
+    }
     if revision.folder || revision.deleted || pieces == 0 {
         let notice = {
             let _commit = s.commit_order.lock().await;
-            let stored = db_task(&s.db, move |db| db.add_empty_revision(&revision)).await?;
+            let stored = db_task(s, move |db| db.add_empty_revision(&revision)).await?;
             publish_committed(s, stored)?
         };
         acknowledge_commit(s, session, events, tx, notice).await?;
@@ -898,17 +1139,24 @@ async fn upload_chunk(
     p.file.sync_all().await?;
     let pending = session.pending.take().unwrap();
     drop(pending.file);
-    let db = s.db.clone();
     let revision = pending.revision.clone();
     let path = pending.path.clone();
-    let (notice, stored_size) = {
+    let commit_result = {
         let _commit = s.commit_order.lock().await;
-        let stored =
-            tokio::task::spawn_blocking(move || db.add_file_revision(&revision, &path)).await??;
-        let stored_size = stored.size;
-        (publish_committed(s, stored)?, stored_size)
+        db_task(s, move |db| db.add_file_revision(&revision, &path))
+            .await
+            .and_then(|stored| {
+                let stored_size = stored.size;
+                Ok((publish_committed(s, stored)?, stored_size))
+            })
     };
-    let _ = tokio::fs::remove_file(&pending.path).await;
+    if let Err(error) = tokio::fs::remove_file(&pending.path).await {
+        warn!(event = "staged_upload_cleanup_failed", error = %error);
+        if commit_result.is_ok() {
+            return Err(error.into());
+        }
+    }
+    let (notice, stored_size) = commit_result?;
     s.metrics.uploads.fetch_add(1, Ordering::Relaxed);
     s.metrics
         .upload_bytes
@@ -926,7 +1174,7 @@ async fn pull(
         send(tx, json!({"err":"Revision not found"})).await?;
         return Ok(());
     };
-    let Some(info) = db_task(&s.db, move |db| db.pull_info(uid)).await? else {
+    let Some(info) = db_task(s, move |db| db.pull_info(uid)).await? else {
         send(tx, json!({"err":"Revision not found"})).await?;
         return Ok(());
     };
@@ -956,7 +1204,7 @@ async fn pull(
             return close(tx, 1008, "Session expired or revoked").await;
         }
         let len = (info.size - offset).min(PIECE_SIZE);
-        let chunk = db_task(&s.db, move |db| db.content_chunk(uid, offset, len)).await?;
+        let chunk = db_task(s, move |db| db.content_chunk(uid, offset, len)).await?;
         socket_send(tx, Message::Binary(chunk.into())).await?;
         offset += len
     }
@@ -969,6 +1217,11 @@ async fn history(
     tx: &mut SplitSink<WebSocket, Message>,
     v: Value,
 ) -> Result<()> {
+    let _response_permit = s
+        .large_responses
+        .acquire()
+        .await
+        .context("large-response pool stopped")?;
     let Some(path) = v
         .get("path")
         .and_then(Value::as_str)
@@ -980,14 +1233,87 @@ async fn history(
     let vault = session.vault.clone().unwrap();
     let path = path.to_owned();
     let last = v.get("last").and_then(Value::as_i64);
-    let all = db_task(&s.db, move |db| db.history(&vault, &path, last, 101)).await?;
+    let all = db_task(s, move |db| db.history(&vault, &path, last, 101)).await?;
     let more = all.len() > 100;
     let items = all
         .into_iter()
         .take(100)
         .map(notice_item)
         .collect::<Vec<_>>();
-    send(tx, json!({"items":items,"more":more})).await?;
+    if !send_with_limit(
+        tx,
+        json!({"items":items,"more":more}),
+        MAX_LARGE_RESPONSE_BYTES,
+    )
+    .await?
+    {
+        send(
+            tx,
+            json!({"err":"History response exceeds the safe wire limit"}),
+        )
+        .await?;
+    }
+    Ok(())
+}
+async fn deleted(
+    s: &AppState,
+    session: &Session,
+    tx: &mut SplitSink<WebSocket, Message>,
+    v: Value,
+) -> Result<()> {
+    let _response_permit = s
+        .large_responses
+        .acquire()
+        .await
+        .context("large-response pool stopped")?;
+    let vault = session.vault.clone().unwrap();
+    let suppress = v.get("suppressrenames").and_then(Value::as_bool) == Some(true);
+    let _commit = s.commit_order.lock().await;
+    let mut response = Vec::with_capacity(64 * 1024);
+    response.extend_from_slice(b"{\"items\":[");
+    let mut after = 0;
+    let mut first = true;
+    loop {
+        let page_vault = vault.clone();
+        let page = db_task(s, move |db| {
+            db.list_deleted_page(&page_vault, suppress, after, DELETED_PAGE_SIZE)
+        })
+        .await?;
+        let page_len = page.len();
+        for revision in page {
+            after = revision.uid;
+            let encoded = serde_json::to_vec(&notice_item(revision))?;
+            let separator = usize::from(!first);
+            if response
+                .len()
+                .saturating_add(separator)
+                .saturating_add(encoded.len())
+                .saturating_add(2)
+                > MAX_LARGE_RESPONSE_BYTES
+            {
+                drop(_commit);
+                drop(response);
+                send(
+                    tx,
+                    json!({"err":"Deleted response exceeds the safe wire limit; purge deleted history and retry"}),
+                )
+                .await?;
+                return Ok(());
+            }
+            if !first {
+                response.push(b',');
+            }
+            first = false;
+            response.extend_from_slice(&encoded);
+        }
+        if page_len < DELETED_PAGE_SIZE as usize {
+            break;
+        }
+    }
+    response.extend_from_slice(b"]}");
+    drop(_commit);
+    let response = String::from_utf8(response).context("serialize deleted response")?;
+    socket_send(tx, Message::Text(response.into())).await?;
     Ok(())
 }
 async fn restore(
@@ -1005,10 +1331,21 @@ async fn restore(
         let _commit = s.commit_order.lock().await;
         let vault = session.vault.clone().unwrap();
         let device = session.device.clone();
-        db_task(&s.db, move |db| db.restore(&vault, uid, &device))
-            .await?
-            .map(|revision| publish_committed(s, revision))
-            .transpose()?
+        match db_task(s, move |db| db.restore(&vault, uid, &device)).await {
+            Ok(revision) => revision
+                .map(|revision| publish_committed(s, revision))
+                .transpose()?,
+            Err(error)
+                if error
+                    .to_string()
+                    .contains("restored revision metadata exceeds the bounded event size") =>
+            {
+                drop(_commit);
+                send(tx, json!({"err":"Restore metadata is too large"})).await?;
+                return Ok(());
+            }
+            Err(error) => return Err(error),
+        }
     };
     match notice {
         Some(notice) => acknowledge_commit(s, session, events, tx, notice).await?,
@@ -1021,9 +1358,37 @@ fn publish_committed(s: &AppState, r: Revision) -> Result<Event> {
     let vault = r.vault_id.clone();
     let notice = serde_json::to_value(PushNotice::from(r))?;
     let text = serde_json::to_string(&notice)?;
-    let event = Event { uid, vault, text };
+    if text.len() > MAX_EVENT_BYTES {
+        anyhow::bail!("committed notice exceeds the bounded event size")
+    }
+    let event = Event {
+        uid,
+        vault,
+        text,
+        invalidated: false,
+    };
     let _ = s.events.send(event.clone());
     Ok(event)
+}
+
+fn serialized_notice_size(revision: &NewRevision) -> Result<usize> {
+    Ok(serde_json::to_vec(&json!({
+        "op": "push",
+        "path": revision.path,
+        "relatedpath": revision.relatedpath,
+        "extension": revision.extension,
+        "hash": revision.hash,
+        "ctime": revision.ctime,
+        "mtime": revision.mtime,
+        "folder": revision.folder,
+        "deleted": revision.deleted,
+        "size": revision.size,
+        "uid": i64::MAX,
+        "device": revision.device,
+        "user": revision.user_id,
+        "ts": i64::MAX,
+    }))?
+    .len())
 }
 async fn acknowledge_commit(
     s: &AppState,
@@ -1037,6 +1402,9 @@ async fn acknowledge_commit(
     }
     loop {
         match events.recv().await {
+            Ok(event) if event.vault == committed.vault && event.invalidated => {
+                return close(tx, 1008, "Vault deleted or replaced").await;
+            }
             Ok(event) if event.vault == committed.vault => {
                 if shutting_down(s) {
                     return Ok(());
@@ -1077,7 +1445,23 @@ fn notice_item(r: Revision) -> Value {
 }
 
 async fn send(tx: &mut SplitSink<WebSocket, Message>, v: Value) -> Result<()> {
-    socket_send(tx, Message::Text(serde_json::to_string(&v)?.into())).await
+    if !send_with_limit(tx, v, MAX_LARGE_RESPONSE_BYTES).await? {
+        anyhow::bail!("outbound JSON exceeds the safe wire limit")
+    }
+    Ok(())
+}
+async fn send_with_limit(
+    tx: &mut SplitSink<WebSocket, Message>,
+    v: Value,
+    limit: usize,
+) -> Result<bool> {
+    let text = serde_json::to_string(&v)?;
+    drop(v);
+    if text.len() > limit {
+        return Ok(false);
+    }
+    socket_send(tx, Message::Text(text.into())).await?;
+    Ok(true)
 }
 async fn socket_send(tx: &mut SplitSink<WebSocket, Message>, message: Message) -> Result<()> {
     timeout(SOCKET_WRITE_TIMEOUT, tx.send(message))
@@ -1106,6 +1490,9 @@ fn bounded(v: &str, max: usize) -> Option<&str> {
     } else {
         None
     }
+}
+fn js_safe_nonnegative(value: i64) -> bool {
+    (0..=MAX_JS_SAFE_INTEGER).contains(&value)
 }
 fn max_ciphertext_size(config: &Config) -> i64 {
     config.per_file_max.saturating_add(AES_GCM_WIRE_OVERHEAD) as i64
@@ -1153,24 +1540,63 @@ fn permitted_origin<'a>(
     }
 }
 
-async fn db_task<T, F>(database: &Db, operation: F) -> Result<T>
+async fn db_task<T, F>(state: &AppState, operation: F) -> Result<T>
 where
     T: Send + 'static,
     F: FnOnce(Db) -> Result<T> + Send + 'static,
 {
-    let database = database.clone();
-    tokio::task::spawn_blocking(move || operation(database))
+    let permit = state
+        .db_workers
+        .clone()
+        .acquire_owned()
         .await
-        .context("database worker stopped")?
+        .context("database worker pool stopped")?;
+    spawn_db_task(state, permit, operation).await
+}
+
+async fn try_db_task<T, F>(state: &AppState, operation: F) -> Result<T>
+where
+    T: Send + 'static,
+    F: FnOnce(Db) -> Result<T> + Send + 'static,
+{
+    let permit = state
+        .db_workers
+        .clone()
+        .try_acquire_owned()
+        .map_err(|_| anyhow::anyhow!("database worker capacity reached"))?;
+    spawn_db_task(state, permit, operation).await
+}
+
+async fn spawn_db_task<T, F>(
+    state: &AppState,
+    permit: tokio::sync::OwnedSemaphorePermit,
+    operation: F,
+) -> Result<T>
+where
+    T: Send + 'static,
+    F: FnOnce(Db) -> Result<T> + Send + 'static,
+{
+    let database = state.db.clone();
+    tokio::task::spawn_blocking(move || {
+        let _permit = permit;
+        operation(database)
+    })
+    .await
+    .context("database worker stopped")?
 }
 
 async fn session_active(s: &AppState, session: &Session) -> bool {
     let Some(token_hash) = session.token_hash.clone() else {
         return false;
     };
-    db_task(&s.db, move |db| Ok(db.valid_session_hash(&token_hash)))
-        .await
-        .unwrap_or(false)
+    let Some(vault) = session.vault.clone() else {
+        return false;
+    };
+    db_task(s, move |db| {
+        Ok(db.valid_session_for_vault(&token_hash, &vault))
+    })
+    .await
+    .unwrap_or(false)
 }
 fn shutting_down(s: &AppState) -> bool {
     *s.shutdown.borrow()
@@ -1191,23 +1617,167 @@ fn now_ms() -> i64 {
         .unwrap_or_default()
         .as_millis() as i64
 }
-fn prepare_staging(path: &std::path::Path) -> Result<()> {
-    fs::create_dir_all(path)?;
+
+pub(crate) struct StateLock {
+    _file: fs::File,
+}
+
+pub(crate) fn acquire_database_lock(database_path: &std::path::Path) -> Result<StateLock> {
+    acquire_path_lock(database_path, "database")
+}
+
+fn acquire_path_lock(path: &std::path::Path, label: &str) -> Result<StateLock> {
+    let parent = path
+        .parent()
+        .filter(|parent| !parent.as_os_str().is_empty())
+        .unwrap_or_else(|| std::path::Path::new("."));
+    fs::create_dir_all(parent)?;
+    let canonical_parent = fs::canonicalize(parent)
+        .with_context(|| format!("canonicalize {label} parent {}", parent.display()))?;
+    let name = path
+        .file_name()
+        .context("state path must have a final component")?;
+    let canonical_path = canonical_parent.join(name);
+    let mut lock_name = canonical_path.as_os_str().to_os_string();
+    lock_name.push(".lock");
+    let lock_path = PathBuf::from(lock_name);
+    let mut options = fs::OpenOptions::new();
+    options.read(true).write(true).create(true);
     #[cfg(unix)]
     {
-        use std::os::unix::fs::PermissionsExt;
-        fs::set_permissions(path, fs::Permissions::from_mode(0o700))?;
+        use std::os::unix::fs::OpenOptionsExt;
+        options
+            .mode(0o600)
+            .custom_flags(libc::O_NOFOLLOW | libc::O_CLOEXEC);
+    }
+    let file = options
+        .open(&lock_path)
+        .with_context(|| format!("open state lock {}", lock_path.display()))?;
+    if !file.metadata()?.file_type().is_file() {
+        anyhow::bail!("state lock must be a regular file: {}", lock_path.display())
+    }
+    #[cfg(unix)]
+    {
+        use std::os::fd::AsRawFd;
+        // SAFETY: flock only observes the valid, open descriptor retained by StateLock.
+        let result = unsafe { libc::flock(file.as_raw_fd(), libc::LOCK_EX | libc::LOCK_NB) };
+        if result != 0 {
+            let error = std::io::Error::last_os_error();
+            if error.kind() == std::io::ErrorKind::WouldBlock {
+                anyhow::bail!(
+                    "{label} state is already locked by another Blackglass Server process: {}",
+                    lock_path.display()
+                )
+            }
+            return Err(error)
+                .with_context(|| format!("lock server state {}", lock_path.display()));
+        }
+    }
+    #[cfg(not(unix))]
+    {
+        anyhow::bail!("exclusive state locking is unavailable on this operating system")
+    }
+    Ok(StateLock { _file: file })
+}
+
+fn prepare_staging(path: &std::path::Path) -> Result<()> {
+    let mut created = false;
+    match fs::symlink_metadata(path) {
+        Ok(metadata) => validate_staging_directory(path, &metadata)?,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+            if let Some(parent) = path.parent() {
+                fs::create_dir_all(parent)?;
+            }
+            let mut builder = fs::DirBuilder::new();
+            #[cfg(unix)]
+            {
+                use std::os::unix::fs::DirBuilderExt;
+                builder.mode(0o700);
+            }
+            builder.create(path)?;
+            let metadata = fs::symlink_metadata(path)?;
+            validate_staging_directory(path, &metadata)?;
+            created = true;
+        }
+        Err(error) => return Err(error.into()),
+    }
+
+    let marker = path.join(STAGING_MARKER);
+    match fs::symlink_metadata(&marker) {
+        Ok(metadata) => {
+            if !metadata.file_type().is_file()
+                || fs::read_to_string(&marker)? != STAGING_MARKER_CONTENT
+            {
+                anyhow::bail!("invalid Blackglass staging marker: {}", marker.display())
+            }
+        }
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+            if !created {
+                validate_unmarked_staging_contents(path)?;
+            }
+            let mut options = fs::OpenOptions::new();
+            options.write(true).create_new(true);
+            #[cfg(unix)]
+            {
+                use std::os::unix::fs::OpenOptionsExt;
+                options.mode(0o600);
+            }
+            let mut file = options.open(&marker)?;
+            file.write_all(STAGING_MARKER_CONTENT.as_bytes())?;
+            file.sync_all()?;
+        }
+        Err(error) => return Err(error.into()),
     }
     cleanup_staging(path)
 }
-fn cleanup_staging(path: &std::path::Path) -> Result<()> {
-    for e in fs::read_dir(path)? {
-        let p = e?.path();
-        if p.extension().and_then(|x| x.to_str()) == Some("part") {
-            fs::remove_file(p)?
+
+fn validate_staging_directory(path: &std::path::Path, metadata: &fs::Metadata) -> Result<()> {
+    if !metadata.file_type().is_dir() {
+        anyhow::bail!("staging path must be a real directory: {}", path.display())
+    }
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        if metadata.permissions().mode() & 0o077 != 0 {
+            anyhow::bail!(
+                "staging directory must not grant group or other permissions: {}",
+                path.display()
+            )
         }
     }
     Ok(())
+}
+
+fn validate_unmarked_staging_contents(path: &std::path::Path) -> Result<()> {
+    for entry in fs::read_dir(path)? {
+        let entry = entry?;
+        if !staging_part_name(&entry.file_name()) || !entry.file_type()?.is_file() {
+            anyhow::bail!(
+                "refusing unrecognized pre-existing staging directory contents: {}",
+                path.display()
+            )
+        }
+    }
+    Ok(())
+}
+
+fn cleanup_staging(path: &std::path::Path) -> Result<()> {
+    for entry in fs::read_dir(path)? {
+        let entry = entry?;
+        if staging_part_name(&entry.file_name()) && entry.file_type()?.is_file() {
+            fs::remove_file(entry.path())?
+        }
+    }
+    Ok(())
+}
+
+fn staging_part_name(name: &std::ffi::OsStr) -> bool {
+    let Some(name) = name.to_str() else {
+        return false;
+    };
+    name.strip_suffix(".part")
+        .and_then(|value| Uuid::parse_str(value).ok())
+        .is_some()
 }
 async fn secure_create(path: &std::path::Path) -> Result<tokio::fs::File> {
     let mut o = tokio::fs::OpenOptions::new();
@@ -1228,5 +1798,136 @@ async fn shutdown_signal() {
     #[cfg(not(unix))]
     {
         let _ = tokio::signal::ctrl_c().await;
+    }
+}
+
+async fn wait_for_connection_drain(state: &AppState) -> Result<()> {
+    timeout(GRACEFUL_CONNECTION_DRAIN_DEADLINE, async {
+        while state.connections.available_permits() != state.config.max_ws_connections {
+            tokio::time::sleep(Duration::from_millis(25)).await;
+        }
+    })
+    .await
+    .context("WebSocket connections did not drain before the shutdown deadline")
+}
+
+type ListenerJoinResult = std::result::Result<std::io::Result<()>, tokio::task::JoinError>;
+
+enum ListenerTrigger {
+    Shutdown,
+    Control(ListenerJoinResult),
+    Data(ListenerJoinResult),
+}
+
+async fn supervise_listeners<S>(
+    shutdown_tx: watch::Sender<bool>,
+    mut control_task: tokio::task::JoinHandle<std::io::Result<()>>,
+    mut data_task: tokio::task::JoinHandle<std::io::Result<()>>,
+    shutdown_requested: S,
+) -> Result<()>
+where
+    S: Future<Output = ()>,
+{
+    tokio::pin!(shutdown_requested);
+    let trigger = tokio::select! {
+        _ = &mut shutdown_requested => ListenerTrigger::Shutdown,
+        result = &mut control_task => ListenerTrigger::Control(result),
+        result = &mut data_task => ListenerTrigger::Data(result),
+    };
+    let expected_shutdown = matches!(trigger, ListenerTrigger::Shutdown);
+    info!(event = "shutdown_requested", expected = expected_shutdown);
+    let _ = shutdown_tx.send(true);
+
+    match trigger {
+        ListenerTrigger::Shutdown => {
+            let control = listener_result("control", control_task.await);
+            let data = listener_result("data", data_task.await);
+            control.and(data)
+        }
+        ListenerTrigger::Control(result) => {
+            let control = unexpected_listener_result("control", result);
+            let data = listener_result("data", data_task.await);
+            control.and(data)
+        }
+        ListenerTrigger::Data(result) => {
+            let data = unexpected_listener_result("data", result);
+            let control = listener_result("control", control_task.await);
+            data.and(control)
+        }
+    }
+}
+
+fn listener_result(name: &str, result: ListenerJoinResult) -> Result<()> {
+    match result {
+        Ok(Ok(())) => Ok(()),
+        Ok(Err(error)) => Err(error).with_context(|| format!("{name} listener failed")),
+        Err(error) => Err(anyhow::anyhow!("{name} listener task stopped: {error}")),
+    }
+}
+
+fn unexpected_listener_result(name: &str, result: ListenerJoinResult) -> Result<()> {
+    listener_result(name, result)?;
+    anyhow::bail!("{name} listener exited unexpectedly")
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[tokio::test]
+    async fn listener_supervisor_propagates_an_unexpected_exit_and_stops_its_sibling() {
+        let (shutdown_tx, mut shutdown_rx) = watch::channel(false);
+        let control = tokio::spawn(async { Ok(()) });
+        let data = tokio::spawn(async move {
+            wait_for_shutdown(&mut shutdown_rx).await;
+            Ok(())
+        });
+        let error = timeout(
+            Duration::from_secs(1),
+            supervise_listeners(shutdown_tx, control, data, std::future::pending()),
+        )
+        .await
+        .expect("supervisor stalled")
+        .expect_err("unexpected listener exit was accepted");
+        assert!(
+            error
+                .to_string()
+                .contains("control listener exited unexpectedly")
+        );
+    }
+
+    #[test]
+    fn staging_cleanup_only_removes_owned_part_names() {
+        let directory = tempfile::tempdir().unwrap();
+        let staging = directory.path().join("staging");
+        prepare_staging(&staging).unwrap();
+        let owned = staging.join(format!("{}.part", Uuid::new_v4()));
+        let foreign = staging.join("notes.part");
+        fs::write(&owned, b"partial").unwrap();
+        fs::write(&foreign, b"keep").unwrap();
+        cleanup_staging(&staging).unwrap();
+        assert!(!owned.exists());
+        assert_eq!(fs::read(&foreign).unwrap(), b"keep");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn staging_rejects_symlinks_and_unmarked_foreign_directories_without_mutation() {
+        use std::os::unix::fs::{PermissionsExt, symlink};
+
+        let directory = tempfile::tempdir().unwrap();
+        let target = directory.path().join("target");
+        fs::create_dir(&target).unwrap();
+        fs::set_permissions(&target, fs::Permissions::from_mode(0o700)).unwrap();
+        let foreign = target.join("foreign.part");
+        fs::write(&foreign, b"preserve").unwrap();
+        let link = directory.path().join("staging-link");
+        symlink(&target, &link).unwrap();
+        assert!(prepare_staging(&link).is_err());
+        assert_eq!(fs::read(&foreign).unwrap(), b"preserve");
+
+        assert!(prepare_staging(&target).is_err());
+        assert_eq!(fs::read(&foreign).unwrap(), b"preserve");
+        assert!(!target.join(STAGING_MARKER).exists());
     }
 }

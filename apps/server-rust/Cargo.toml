@@ -1,8 +1,9 @@
 [package]
 name = "blackglass-server"
-version = "0.2.1"
+version = "0.2.2"
 edition = "2024"
 license = "MIT"
+rust-version = "1.92"
 
 [dependencies]
 anyhow = "1"
@@ -10,6 +11,7 @@ argon2 = "0.5"
 axum = { version = "0.8", features = ["ws"] }
 futures-util = "0.3"
 hex = "0.4"
+libc = "0.2"
 password-hash = { version = "0.5", features = ["getrandom"] }
 rand = "0.8"
 rusqlite = { version = "0.37", features = ["backup", "blob", "bundled"] }
