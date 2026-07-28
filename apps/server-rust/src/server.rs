@@ -1305,7 +1305,7 @@ async fn upload_chunk(
     if p.pieces > p.revision.pieces || p.bytes > p.revision.size {
         return close(tx, 1009, "Upload exceeds declared size").await;
     }
-    p.file.write_all(bytes).await?;
+    write_staged_piece(&mut p.file, bytes).await?;
     if p.pieces < p.revision.pieces {
         send(tx, json!({"res":"next"})).await?;
         return Ok(());
@@ -1313,7 +1313,6 @@ async fn upload_chunk(
     if p.bytes != p.revision.size {
         return close(tx, 1008, "Upload size does not match metadata").await;
     }
-    p.file.flush().await?;
     p.file.sync_all().await?;
     let pending = session.pending.take().unwrap();
     drop(pending.file);
@@ -1340,6 +1339,17 @@ async fn upload_chunk(
         .upload_bytes
         .fetch_add(stored_size as u64, Ordering::Relaxed);
     acknowledge_commit(s, session, events, tx, notice).await
+}
+
+async fn write_staged_piece<W>(file: &mut W, bytes: &[u8]) -> std::io::Result<()>
+where
+    W: tokio::io::AsyncWrite + Unpin,
+{
+    file.write_all(bytes).await?;
+    // Tokio may acknowledge an async file write after copying the piece into
+    // its blocking buffer. Finish that write before requesting another piece
+    // so each `next` response preserves the bounded on-disk staging contract.
+    file.flush().await
 }
 
 async fn pull(
@@ -2070,6 +2080,54 @@ fn unexpected_listener_result(name: &str, result: ListenerJoinResult) -> Result<
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[derive(Default)]
+    struct FlushBoundaryWriter {
+        pending: Vec<u8>,
+        visible: Vec<u8>,
+        flushes: usize,
+    }
+
+    impl tokio::io::AsyncWrite for FlushBoundaryWriter {
+        fn poll_write(
+            mut self: std::pin::Pin<&mut Self>,
+            _cx: &mut std::task::Context<'_>,
+            bytes: &[u8],
+        ) -> std::task::Poll<std::io::Result<usize>> {
+            self.pending.extend_from_slice(bytes);
+            std::task::Poll::Ready(Ok(bytes.len()))
+        }
+
+        fn poll_flush(
+            mut self: std::pin::Pin<&mut Self>,
+            _cx: &mut std::task::Context<'_>,
+        ) -> std::task::Poll<std::io::Result<()>> {
+            let pending = std::mem::take(&mut self.pending);
+            self.visible.extend_from_slice(&pending);
+            self.flushes += 1;
+            std::task::Poll::Ready(Ok(()))
+        }
+
+        fn poll_shutdown(
+            self: std::pin::Pin<&mut Self>,
+            _cx: &mut std::task::Context<'_>,
+        ) -> std::task::Poll<std::io::Result<()>> {
+            std::task::Poll::Ready(Ok(()))
+        }
+    }
+
+    #[tokio::test]
+    async fn staged_piece_is_flushed_before_the_piece_boundary_returns() {
+        let mut writer = FlushBoundaryWriter::default();
+
+        write_staged_piece(&mut writer, b"opaque ciphertext")
+            .await
+            .unwrap();
+
+        assert_eq!(writer.visible, b"opaque ciphertext");
+        assert!(writer.pending.is_empty());
+        assert_eq!(writer.flushes, 1);
+    }
 
     #[test]
     fn forwarded_source_is_used_only_for_one_explicit_trusted_proxy() {

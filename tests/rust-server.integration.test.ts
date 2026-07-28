@@ -889,8 +889,8 @@ describe("production Rust server", () => {
     interrupted.socket.send(new Uint8Array(2 * 1024 * 1024));
     expect(await interrupted.nextJson()).toEqual({ res: "next" });
     interrupted.socket.close();
-    await Bun.sleep(150);
-    expect(await stagedParts(join(directory, "uploads"))).toEqual([]);
+    await waitForClose(interrupted, 2_000);
+    await waitForDirectoryEmpty(join(directory, "uploads"), 2_000);
   });
 
   test("purge retains a compact tombstone for offline-client convergence", async () => {
