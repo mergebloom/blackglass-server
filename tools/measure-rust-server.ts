@@ -28,6 +28,11 @@ import {
   resourceReportSchemaVersion,
   subtractCgroupEvents,
 } from "./resource-gate.ts";
+import {
+  collectFailureDiagnostics,
+  observeWorkWithSamples,
+  rethrowWithDiagnostics,
+} from "./resource-harness.ts";
 
 const pieceBytes = 2 * 1024 * 1024;
 const uploadBytes = 64 * 1024 * 1024;
@@ -287,22 +292,22 @@ try {
       { "x-forwarded-for": `198.51.100.${index + 1}` },
     ),
   );
-  let workSettled = false;
   const work = Promise.all([
     Promise.all(uploadWork),
     Promise.all(pullWork),
     historyWork,
     Promise.all(argonWork),
-  ]).finally(() => {
-    workSettled = true;
-  });
-  while (!workSettled) {
-    const sample = await rss();
-    rssSamplesKiB.push(sample);
-    peakRssKiB = Math.max(peakRssKiB, sample);
-    await Bun.sleep(25);
-  }
-  const [uploadResults, downloadSizes, historyResponse, signinResponses] = await work;
+  ]);
+  const [uploadResults, downloadSizes, historyResponse, signinResponses] =
+    await observeWorkWithSamples(
+      work,
+      rss,
+      (sample) => {
+        rssSamplesKiB.push(sample);
+        peakRssKiB = Math.max(peakRssKiB, sample);
+      },
+      () => Bun.sleep(25),
+    );
 
   if (uploadResults.length !== concurrentUploads) {
     throw new Error("not every concurrent upload committed");
@@ -330,23 +335,21 @@ try {
   // while the permit deliberately reserved for authenticated Sync is active.
   // Admission rejections in the larger overlap are valid, but cannot make a
   // release pass without this deterministic 1+1 phase.
-  let reservedLaneWorkSettled = false;
   const standaloneArgonWork = post(
     "/user/signin",
     { email: "resource@example.test", password: "standalone-wrong-password" },
     { "x-forwarded-for": "198.51.100.250" },
   );
   const reservedSyncPullWork = download(sourceProbes[1]!, uploaded.uid);
-  const reservedLaneWork = Promise.all([standaloneArgonWork, reservedSyncPullWork]).finally(() => {
-    reservedLaneWorkSettled = true;
-  });
-  while (!reservedLaneWorkSettled) {
-    const sample = await rss();
-    rssSamplesKiB.push(sample);
-    peakRssKiB = Math.max(peakRssKiB, sample);
-    await Bun.sleep(25);
-  }
-  const [standaloneArgonResponse, reservedSyncPullBytes] = await reservedLaneWork;
+  const [standaloneArgonResponse, reservedSyncPullBytes] = await observeWorkWithSamples(
+    Promise.all([standaloneArgonWork, reservedSyncPullWork]),
+    rss,
+    (sample) => {
+      rssSamplesKiB.push(sample);
+      peakRssKiB = Math.max(peakRssKiB, sample);
+    },
+    () => Bun.sleep(25),
+  );
   const standaloneArgon2CompletedCheck =
     standaloneArgonResponse.error === "Invalid email or password";
   const reservedSyncPullCompleted = reservedSyncPullBytes === uploadBytes;
@@ -659,6 +662,23 @@ try {
     };
     await emitReport(report);
   }
+} catch (error) {
+  if (cgroup) {
+    await rethrowWithDiagnostics(
+      error,
+      () => captureCgroupFailureDiagnostics(cgroup!),
+      (diagnostics) => {
+        console.error(
+          JSON.stringify(
+            { event: "blackglass_resource_workload_failed", ...diagnostics },
+            null,
+            2,
+          ),
+        );
+      },
+    );
+  }
+  throw error;
 } finally {
   for (const probe of probes) probe.socket.close();
   if (child) {
@@ -869,11 +889,176 @@ function dockerInspect(container: string): any {
   if (result.exitCode !== 0) {
     throw new Error(`could not inspect cgroup container: ${result.stderr.toString()}`);
   }
-  const inspections = JSON.parse(result.stdout.toString());
+  return parseDockerInspection(result.stdout.toString());
+}
+
+function parseDockerInspection(output: string): any {
+  const inspections = JSON.parse(output);
   if (!Array.isArray(inspections) || inspections.length !== 1) {
     throw new Error("Docker returned an invalid cgroup container inspection");
   }
   return inspections[0];
+}
+
+async function dockerInspectForDiagnostics(container: string, signal: AbortSignal): Promise<any> {
+  const result = await runDiagnosticDocker(["inspect", container], signal);
+  if (result.exitCode !== 0) {
+    throw new Error(`could not inspect cgroup container: ${result.stderr}`);
+  }
+  return parseDockerInspection(result.stdout);
+}
+
+async function captureCgroupFailureDiagnostics(
+  context: CgroupContext,
+): Promise<Record<string, unknown>> {
+  const cgroupDirectory = resolve("/sys/fs/cgroup", `.${context.path}`);
+  return collectFailureDiagnostics([
+    {
+      name: "cgroupIdentity",
+      read: () => ({
+        container: context.container,
+        imageId: context.imageId,
+        nativeTarget: context.nativeTarget,
+        hostArchitecture: context.hostArchitecture,
+        path: context.path,
+        eventsSource: basename(context.eventsPath),
+        eventsBefore: context.eventsBefore,
+        expectedPid: context.hostPid,
+      }),
+    },
+    {
+      name: "cgroupMemory",
+      read: async () => {
+        const [current, peak, maximum, swapCurrent, swapMaximum] = await Promise.all([
+          readFile(join(cgroupDirectory, "memory.current"), "utf8"),
+          readFile(join(cgroupDirectory, "memory.peak"), "utf8"),
+          readFile(join(cgroupDirectory, "memory.max"), "utf8"),
+          readFile(join(cgroupDirectory, "memory.swap.current"), "utf8"),
+          readFile(join(cgroupDirectory, "memory.swap.max"), "utf8"),
+        ]);
+        return {
+          currentBytes: parseCgroupScalar(current, "memory.current"),
+          peakBytes: parseCgroupScalar(peak, "memory.peak"),
+          maxBytes: parseCgroupScalar(maximum, "memory.max"),
+          swapCurrentBytes: parseCgroupScalar(swapCurrent, "memory.swap.current"),
+          swapMaxBytes: parseCgroupScalar(swapMaximum, "memory.swap.max"),
+        };
+      },
+    },
+    {
+      name: "cgroupEvents",
+      read: async () => {
+        const events = parseCgroupEvents(await readFile(context.eventsPath, "utf8"));
+        return {
+          events,
+          delta: subtractCgroupEvents(events, context.eventsBefore),
+        };
+      },
+    },
+    {
+      name: "cgroupProcesses",
+      read: async () => {
+        const raw = await readFile(join(cgroupDirectory, "cgroup.procs"), "utf8");
+        return raw.trim() === "" ? [] : parseCgroupPidList(raw);
+      },
+    },
+    {
+      name: "processStatus",
+      read: async () => summarizeProcessStatus(
+        await readFile(`/proc/${context.hostPid}/status`, "utf8"),
+      ),
+    },
+    {
+      name: "containerState",
+      read: async (signal) => summarizeContainerInspection(
+        await dockerInspectForDiagnostics(context.container, signal),
+      ),
+    },
+    {
+      name: "containerStateAfter100ms",
+      read: async (signal) => {
+        await Bun.sleep(100);
+        if (signal.aborted) throw new Error("container state diagnostic was aborted");
+        return summarizeContainerInspection(
+          await dockerInspectForDiagnostics(context.container, signal),
+        );
+      },
+    },
+    {
+      name: "containerLogs",
+      read: (signal) => readContainerLogs(context.container, signal),
+    },
+  ]);
+}
+
+function summarizeProcessStatus(status: string): Record<string, string> {
+  const selected: Record<string, string> = {};
+  for (const line of status.split("\n")) {
+    const match = /^(Name|State|Pid|PPid|Threads|VmRSS|VmHWM):\s*(.*)$/.exec(line);
+    if (match?.[1] && match[2] !== undefined) selected[match[1]] = match[2];
+  }
+  return selected;
+}
+
+function summarizeContainerInspection(inspection: any) {
+  return {
+    image: String(inspection.Image ?? ""),
+    restartCount: Number(inspection.RestartCount ?? 0),
+    state: {
+      status: String(inspection.State?.Status ?? ""),
+      running: inspection.State?.Running === true,
+      paused: inspection.State?.Paused === true,
+      restarting: inspection.State?.Restarting === true,
+      oomKilled: inspection.State?.OOMKilled === true,
+      dead: inspection.State?.Dead === true,
+      pid: Number(inspection.State?.Pid ?? 0),
+      exitCode: Number(inspection.State?.ExitCode ?? 0),
+      error: String(inspection.State?.Error ?? ""),
+      startedAt: String(inspection.State?.StartedAt ?? ""),
+      finishedAt: String(inspection.State?.FinishedAt ?? ""),
+    },
+  };
+}
+
+async function readContainerLogs(container: string, signal: AbortSignal) {
+  const result = await runDiagnosticDocker(["logs", "--tail", "200", container], signal);
+  if (result.exitCode !== 0) {
+    throw new Error(`docker logs failed: ${result.stderr}`);
+  }
+  const limit = 32 * 1024;
+  return {
+    stdout: result.stdout.slice(-limit),
+    stderr: result.stderr.slice(-limit),
+  };
+}
+
+async function runDiagnosticDocker(
+  args: string[],
+  signal: AbortSignal,
+): Promise<{ exitCode: number; stdout: string; stderr: string }> {
+  const process = Bun.spawn(["docker", ...args], {
+    stdout: "pipe",
+    stderr: "pipe",
+  });
+  const terminate = () => {
+    try {
+      process.kill("SIGKILL");
+    } catch {
+      // The command may have exited between the abort signal and this callback.
+    }
+  };
+  if (signal.aborted) terminate();
+  else signal.addEventListener("abort", terminate, { once: true });
+  try {
+    const [exitCode, stdout, stderr] = await Promise.all([
+      process.exited,
+      new Response(process.stdout).text(),
+      new Response(process.stderr).text(),
+    ]);
+    return { exitCode, stdout, stderr };
+  } finally {
+    signal.removeEventListener("abort", terminate);
+  }
 }
 
 async function readCgroupSnapshot(
