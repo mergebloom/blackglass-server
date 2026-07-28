@@ -65,6 +65,8 @@ pub(crate) const MAX_LARGE_RESPONSE_BYTES: usize = 8 * 1024 * 1024;
 const DELETED_PAGE_SIZE: i64 = 64;
 const STAGING_MARKER: &str = ".blackglass-staging-v1";
 const STAGING_MARKER_CONTENT: &str = "blackglass-server staging v1\n";
+const ADMIN_MANAGED_ACCOUNT_ERROR: &str =
+    "Accounts are managed by the Blackglass Server administrator";
 
 #[derive(Default)]
 pub struct Metrics {
@@ -310,7 +312,16 @@ fn control_router(state: AppState) -> Router {
         "/user/signup",
         "/user/forgetpass",
         "/user/resendconfirmation",
+        "/user/authtoken",
         "/subscription/business",
+        "/subscription/sync/signup-mobile",
+        "/publish/create",
+        "/publish/delete",
+        "/publish/list",
+        "/publish/share/accept",
+        "/publish/share/invite",
+        "/publish/share/list",
+        "/publish/share/remove",
     ] {
         r = r.route(path, post(control).options(preflight));
     }
@@ -497,7 +508,7 @@ async fn control(
     let result = match uri.path() {
         "/user/signin" => signin(&s, source, value).await,
         "/user/signup" | "/user/forgetpass" | "/user/resendconfirmation" => {
-            Err("Accounts are managed by the Blackglass Server administrator".into())
+            Err(ADMIN_MANAGED_ACCOUNT_ERROR.into())
         }
         _ => authorized_control(&s, uri.path(), value).await,
     };
@@ -602,6 +613,17 @@ async fn authorized_control(
         "/subscription/business" => {
             Err("Business subscriptions are unavailable on a self-hosted server".into())
         }
+        "/subscription/sync/signup-mobile" => {
+            Err("Mobile Sync signup is unavailable on a self-hosted server".into())
+        }
+        "/user/authtoken" => Err(ADMIN_MANAGED_ACCOUNT_ERROR.into()),
+        "/publish/create"
+        | "/publish/delete"
+        | "/publish/list"
+        | "/publish/share/accept"
+        | "/publish/share/invite"
+        | "/publish/share/list"
+        | "/publish/share/remove" => Err("Publish is unavailable on a self-hosted server".into()),
         "/vault/regions" => {
             Ok(json!({"regions":[{"value":"selfhost","name":"Blackglass Server"}]}))
         }

@@ -38,6 +38,12 @@ single-owner deployment. Account responses use `license:null`; Sync entitlement
 comes only from `/subscription/list.sync`, avoiding unrelated Catalyst/Insider
 UI.
 
+The renderer's seven `/publish/*` calls, `/subscription/sync/signup-mobile`,
+and `/user/authtoken` are also recognized POST routes. They return explicit
+JSON unavailable or administrator-managed errors with the same exact-origin
+CORS behavior; no Publish, mobile-signup, or token-exchange functionality is
+implemented. Unrecognized paths remain HTTP 404.
+
 ## Data plane
 
 The Sync client persists a control-plane-provided `host`. It derives:

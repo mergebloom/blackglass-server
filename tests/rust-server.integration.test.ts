@@ -162,6 +162,55 @@ describe("production Rust server", () => {
     ).rejects.toThrow("websocket failed");
   });
 
+  test("returns explicit CORS JSON errors for recognized unsupported client routes", async () => {
+    const routes = [
+      ["/publish/create", "Publish is unavailable on a self-hosted server"],
+      ["/publish/delete", "Publish is unavailable on a self-hosted server"],
+      ["/publish/list", "Publish is unavailable on a self-hosted server"],
+      ["/publish/share/accept", "Publish is unavailable on a self-hosted server"],
+      ["/publish/share/invite", "Publish is unavailable on a self-hosted server"],
+      ["/publish/share/list", "Publish is unavailable on a self-hosted server"],
+      ["/publish/share/remove", "Publish is unavailable on a self-hosted server"],
+      [
+        "/subscription/sync/signup-mobile",
+        "Mobile Sync signup is unavailable on a self-hosted server",
+      ],
+      ["/user/authtoken", "Accounts are managed by the Blackglass Server administrator"],
+    ] as const;
+
+    for (const [path, error] of routes) {
+      const response = await fetch(`http://127.0.0.1:${controlPort}${path}`, {
+        method: "POST",
+        headers: { "content-type": "application/json", origin: "http://localhost" },
+        body: JSON.stringify({ token }),
+      });
+      expect(response.status).toBe(200);
+      expect(response.headers.get("access-control-allow-origin")).toBe("http://localhost");
+      expect(response.headers.get("vary")).toBe("Origin");
+      expect(response.headers.get("cache-control")).toBe("no-store");
+      expect(response.headers.get("content-type")).toContain("application/json");
+      expect(await response.json()).toEqual({ error });
+
+      const preflight = await fetch(`http://127.0.0.1:${controlPort}${path}`, {
+        method: "OPTIONS",
+        headers: { origin: "http://localhost" },
+      });
+      expect(preflight.status).toBe(204);
+      expect(preflight.headers.get("access-control-allow-origin")).toBe("http://localhost");
+      expect(preflight.headers.get("access-control-allow-methods")).toBe("POST, GET, OPTIONS");
+      expect(preflight.headers.get("access-control-allow-headers")).toBe("content-type");
+    }
+
+    for (const method of ["POST", "OPTIONS"]) {
+      const unknown = await fetch(`http://127.0.0.1:${controlPort}/publish/unknown`, {
+        method,
+        headers: { "content-type": "application/json", origin: "http://localhost" },
+        ...(method === "POST" ? { body: JSON.stringify({ token }) } : {}),
+      });
+      expect(unknown.status).toBe(404);
+    }
+  });
+
   test("persists managed-encryption credentials and first-device binding across restart", async () => {
     const managedDirectory = await mkdtemp(join(tmpdir(), "blackglass-managed-restart-"));
     const [managedControlPort, managedDataPort] = await Promise.all([freePort(), freePort()]);
