@@ -109,11 +109,10 @@ impl Db {
     }
 
     pub fn ready(&self) -> bool {
-        self.with(|c| {
-            c.query_row("SELECT 1", [], |_| Ok(()))?;
-            Ok(())
-        })
-        .is_ok()
+        let Ok(connection) = self.0.try_lock() else {
+            return false;
+        };
+        connection.query_row("SELECT 1", [], |_| Ok(())).is_ok()
     }
 
     pub fn issue_session(&self, ttl_secs: i64) -> Result<String> {
@@ -2229,6 +2228,18 @@ mod tests {
                 0o600
             );
         }
+    }
+
+    #[test]
+    fn readiness_fails_fast_while_the_database_connection_is_busy() {
+        let dir = tempfile::tempdir().unwrap();
+        let database = Db::open(&dir.path().join("ready.sqlite")).unwrap();
+        let connection = database.0.lock().unwrap();
+
+        assert!(!database.ready());
+
+        drop(connection);
+        assert!(database.ready());
     }
 
     #[test]
