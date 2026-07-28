@@ -33,6 +33,12 @@ jobs:
       - name: Verify systemd hardening unit
         run: |
           sudo systemd-sysusers "$PWD/ops/blackglass-server.sysusers.conf"
+          sudo install -D -m 0755 \
+            "$PWD/apps/server-rust/target/release/blackglass-server" \
+            /opt/blackglass-server/blackglass-server
+          sudo install -D -m 0600 \
+            "$PWD/ops/blackglass-server.env.example" \
+            /etc/blackglass-server/server.env
           systemd-analyze verify "$PWD/ops/blackglass-server.service"
       - name: Validate example Caddy ingress
         run: >-
