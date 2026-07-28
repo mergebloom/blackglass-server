@@ -11,6 +11,8 @@ pub struct Vault {
     pub encryption_version: i64,
     pub size: i64,
     pub created: i64,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub password: Option<String>,
 }
 
 #[derive(Clone, Debug)]

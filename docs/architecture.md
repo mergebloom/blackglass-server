@@ -18,14 +18,21 @@ state live in SQLite.
 ## Data plane
 
 The WebSocket service implements the observed request/response protocol and
-stores encrypted Sync payloads as opaque data. Plaintext vault content and
-encryption keys are not server concerns. File pushes use private staging files
-and SQLite incremental BLOB writes; pulls are read in 2 MiB pieces. Memory is
-therefore bounded by configured concurrency rather than attachment size.
+stores encrypted Sync payloads as opaque data. Custom-password vault keys never
+reach the server. Managed-encryption vaults instead retain the server-generated
+recovery password required by the stock client, placing the operator inside
+that mode's confidentiality trust boundary. File pushes use private staging
+files and SQLite incremental BLOB writes; pulls are read in 2 MiB pieces.
+Memory is therefore bounded by configured concurrency rather than attachment
+size.
 
 ## Persistence
 
 SQLite is the supported database for the single-node, single-owner deployment.
+WAL commits use FULL synchronous durability. Startup, backup, restore, and
+offline session revocation fail closed on unexpected schema objects or logical
+state inconsistencies instead of silently repairing an unknown database.
+SQLite connections use defensive mode with trusted schemas disabled.
 Current revisions store encrypted paths, encrypted hashes, and encrypted file
 bodies. A separate server timestamp supports history even when a deletion has
 zero file timestamps. The service is content-blind but not metadata-blind:
@@ -50,8 +57,11 @@ renaming a binary creates a new artifact that must earn a new client E2E record.
 - The application process binds only to loopback.
 - Endpoint authorization uses exact origins.
 - Account tokens and vault key material are never logged.
-- Server-held vault encryption is rejected; production vaults are E2EE.
+- Custom-password vault secrets never reach the server; managed mode stores its
+  server-generated recovery password and requires a stronger operator trust
+  boundary.
 - Sign-in is rate limited and password verification runs off the async reactor.
 - Session tokens expire and can be revoked; only token digests are persisted.
 - Upload frames, files, concurrent staging, and metadata fields are bounded.
-- Backups use SQLite's online backup API and are integrity checked.
+- Backups use SQLite's online backup API and verify the exact schema, migration
+  history, logical invariants, integrity, and foreign-key consistency.

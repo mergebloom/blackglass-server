@@ -1,7 +1,10 @@
 use anyhow::{Context, Result, bail};
-#[cfg(test)]
-use std::net::Ipv4Addr;
-use std::{env, net::IpAddr, path::PathBuf, time::Duration};
+use std::{
+    env,
+    net::{IpAddr, Ipv4Addr, Ipv6Addr},
+    path::PathBuf,
+    time::Duration,
+};
 
 #[derive(Clone, Debug)]
 pub struct Config {
@@ -18,6 +21,7 @@ pub struct Config {
     pub session_ttl: Duration,
     pub allowed_origins: Vec<String>,
     pub max_concurrent_uploads: usize,
+    pub max_ws_connections: usize,
     pub json_logs: bool,
 }
 
@@ -56,7 +60,7 @@ impl Config {
         };
         if !crate::auth::password_hash_is_production_grade(&password_hash) {
             bail!(
-                "SELFHOST_PASSWORD_HASH must be an Argon2id PHC string with at least m=19456,t=2,p=1"
+                "SELFHOST_PASSWORD_HASH must be an Argon2id v=19 PHC string with m=19456..65536,t=2..5,p=1..4"
             );
         }
         if control_port == 0 || data_port == 0 || control_port == data_port {
@@ -74,6 +78,10 @@ impl Config {
         if !(1..=64).contains(&max_concurrent_uploads) {
             bail!("SELFHOST_MAX_CONCURRENT_UPLOADS must be between 1 and 64");
         }
+        let max_ws_connections = number("SELFHOST_MAX_WS_CONNECTIONS", 256usize)?;
+        if !(1..=4096).contains(&max_ws_connections) {
+            bail!("SELFHOST_MAX_WS_CONNECTIONS must be between 1 and 4096");
+        }
         let allowed_origins = match (
             value("SELFHOST_ALLOWED_ORIGINS"),
             value("SELFHOST_ALLOWED_ORIGIN"),
@@ -87,12 +95,8 @@ impl Config {
         };
         let public_data_host =
             value("SELFHOST_DATA_HOST").unwrap_or_else(|| format!("127.0.0.1:{data_port}"));
-        if public_data_host.len() > 255
-            || public_data_host.contains("://")
-            || public_data_host.contains('/')
-            || public_data_host.chars().any(char::is_whitespace)
-        {
-            bail!("SELFHOST_DATA_HOST must be a hostname[:port] without a scheme or path");
+        if !is_canonical_data_host(&public_data_host) {
+            bail!("SELFHOST_DATA_HOST must be a canonical hostname[:port]");
         }
         Ok(Self {
             bind_host,
@@ -108,6 +112,7 @@ impl Config {
             session_ttl: Duration::from_secs(session_ttl_seconds),
             allowed_origins,
             max_concurrent_uploads,
+            max_ws_connections,
             json_logs: value("SELFHOST_LOG_FORMAT").as_deref() != Some("pretty"),
         })
     }
@@ -128,6 +133,7 @@ impl Config {
             session_ttl: Duration::from_secs(3600),
             allowed_origins: vec!["app://obsidian.md".into()],
             max_concurrent_uploads: 2,
+            max_ws_connections: 16,
             json_logs: false,
         })
     }
@@ -186,6 +192,72 @@ where
     }
 }
 
+fn is_canonical_data_host(value: &str) -> bool {
+    if value.is_empty()
+        || value.len() > 255
+        || value.trim() != value
+        || !value.is_ascii()
+        || value.contains(['/', '\\', '?', '#', '@'])
+    {
+        return false;
+    }
+
+    if let Some(rest) = value.strip_prefix('[') {
+        let Some((address, suffix)) = rest.split_once(']') else {
+            return false;
+        };
+        let Ok(parsed) = address.parse::<Ipv6Addr>() else {
+            return false;
+        };
+        if parsed.to_string() != address {
+            return false;
+        }
+        return suffix.is_empty() || valid_port_suffix(suffix);
+    }
+
+    if value.contains('[') || value.contains(']') || value.matches(':').count() > 1 {
+        return false;
+    }
+    let (host, port) = match value.rsplit_once(':') {
+        Some((host, port)) => (host, Some(port)),
+        None => (value, None),
+    };
+    if port.is_some_and(|port| !valid_port(port)) || host.is_empty() {
+        return false;
+    }
+    if let Ok(address) = host.parse::<Ipv4Addr>() {
+        return address.to_string() == host;
+    }
+    if host
+        .bytes()
+        .all(|byte| byte.is_ascii_digit() || byte == b'.')
+    {
+        return false;
+    }
+    if host.bytes().any(|byte| byte.is_ascii_uppercase()) || host.len() > 253 {
+        return false;
+    }
+    host.split('.').all(|label| {
+        !label.is_empty()
+            && label.len() <= 63
+            && label
+                .bytes()
+                .all(|byte| byte.is_ascii_lowercase() || byte.is_ascii_digit() || byte == b'-')
+            && !label.starts_with('-')
+            && !label.ends_with('-')
+    })
+}
+
+fn valid_port_suffix(value: &str) -> bool {
+    value.strip_prefix(':').is_some_and(valid_port)
+}
+
+fn valid_port(value: &str) -> bool {
+    value
+        .parse::<u16>()
+        .is_ok_and(|port| port != 0 && port.to_string() == value)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -217,6 +289,45 @@ mod tests {
             assert!(
                 parse_allowed_origins(invalid).is_err(),
                 "accepted {invalid}"
+            );
+        }
+    }
+
+    #[test]
+    fn public_data_hosts_must_be_canonical() {
+        for accepted in [
+            "blackglass.example",
+            "blackglass.example:443",
+            "127.0.0.1:3003",
+            "[::1]:3003",
+            "xn--bcher-kva.example",
+        ] {
+            assert!(
+                is_canonical_data_host(accepted),
+                "expected valid: {accepted}"
+            );
+        }
+        for rejected in [
+            " blackglass.example",
+            "blackglass.example ",
+            "BLACKGLASS.example",
+            "blackglass.example/route",
+            "blackglass.example?query",
+            "blackglass.example#fragment",
+            "user@blackglass.example",
+            "blackglass.example\\path",
+            "blackglass.example:0",
+            "blackglass.example:0443",
+            "blackglass.example:65536",
+            "blackglass..example",
+            "-blackglass.example",
+            "127.000.000.001:3003",
+            "::1",
+            "[0:0:0:0:0:0:0:1]:3003",
+        ] {
+            assert!(
+                !is_canonical_data_host(rejected),
+                "expected invalid: {rejected}"
             );
         }
     }

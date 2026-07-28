@@ -21,7 +21,16 @@ jobs:
       - run: npm ci
       - run: bun run check
       - run: ./ops/build-release.sh
+      - run: bun run server:measure
       - run: shellcheck ops/*.sh
+      - name: Verify systemd hardening unit
+        run: systemd-analyze verify ops/blackglass-server.service
+      - name: Validate example Caddy ingress
+        run: >-
+          docker run --rm
+          -v "$PWD/ops/Caddyfile.example:/etc/caddy/Caddyfile:ro"
+          caddy@sha256:c3d7ee5d2b11f9dc54f947f68a734c84e9c9666c92c88a7f30b9cba5da182adb
+          caddy validate --config /etc/caddy/Caddyfile --adapter caddyfile
       - name: Lint GitHub Actions workflows
         run: >-
           docker run --rm

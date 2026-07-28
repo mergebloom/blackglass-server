@@ -4,8 +4,11 @@
 
 The production target is deliberately narrow: one owner, end-to-end-encrypted
 vaults, one Rust process, one SQLite database, and one static node. Publish,
-public registration, sharing, managed encryption, high availability, and
-mobile clients are not supported in this phase.
+public registration, sharing, high availability, and mobile clients are not
+supported in this phase. Both custom-password and managed-encryption vaults are
+compatible. Prefer a custom vault password when the server operator must not be
+able to derive the vault key; managed mode stores its generated recovery
+password in SQLite and backups.
 
 The server has two loopback listeners. A TLS reverse proxy is the only public
 listener:
@@ -15,7 +18,10 @@ Obsidian -> HTTPS control hostname -> Caddy -> 127.0.0.1:3000
 Obsidian -> WSS data hostname      -> Caddy -> 127.0.0.1:3003
 ```
 
-The process refuses non-loopback binding. SQLite runs in WAL mode. Encrypted
+The process refuses non-loopback binding. SQLite runs in WAL mode with
+`synchronous=FULL`, so an acknowledged commit is durable across operating-system
+crashes and power loss within SQLite's documented filesystem assumptions.
+Connections enable SQLite defensive mode and disable trusted schemas. Encrypted
 file bodies are staged in a mode-0600 file and committed with SQLite's
 incremental BLOB API. Ciphertext is in `revision_content`, whose BLOB is the
 last physical column; this preserves SQLite's zero-BLOB optimization and avoids
@@ -53,6 +59,10 @@ Copy `ops/blackglass-server.env.example` to
 the sample values, and set its owner to root and mode to 0600. The service will
 not accept a plaintext production password. Sessions are random 256-bit bearer
 tokens; only SHA-256 token digests, expiry, and revocation state are stored.
+Imported password hashes must use Argon2id v=19 with bounded work parameters:
+`m=19456..65536`, `t=2..5`, and `p=1..4`. Hashes outside those limits are
+rejected before password verification to prevent an unsafe operator value from
+causing unbounded CPU or memory use.
 
 Install `ops/blackglass-server.service`, run `systemd-analyze security` against it,
 then enable it. The supplied unit uses a dynamic unprivileged user, a private
@@ -101,16 +111,17 @@ SQLite and in-progress staging files share the state volume by default.
 ## Backup and recovery
 
 Never copy a live `.sqlite`, `-wal`, and `-shm` set independently. The server's
-`backup` command uses SQLite's online backup API and runs an integrity check on
-the result:
+`backup` command uses SQLite's online backup API and verifies the exact
+Blackglass tables, columns, indexes, foreign keys, and migration history plus
+SQLite integrity and logical row invariants on both its source and result:
 
 ```sh
 SELFHOST_BACKUP_DIRECTORY=/var/backups/blackglass-server ./ops/backup.sh
 ```
 
 Copy verified backups to a different failure domain. Encrypt that destination:
-the database holds ciphertext, but it still reveals sizes, timestamps,
-extensions, device labels, and session-token digests.
+the database holds ciphertext and metadata, and managed-encryption deployments
+also store their vault recovery passwords.
 
 Run a scheduled restore drill against a disposable path:
 
@@ -151,8 +162,10 @@ The branding change moved the default database from
 empty database and assume that the old vaults were deleted.
 
 Stop both units, retain an off-host backup, and use the online SQLite
-backup/restore path to create a verified copy without deleting the legacy
-database:
+legacy migration path to create a verified, migrated copy without changing or
+deleting the legacy database. Normal `verify`, `backup`, and `restore` commands
+require current Blackglass migration metadata; `migrate-legacy` is the only
+command that accepts the exact known pre-Rust schema:
 
 ```sh
 sudo systemctl stop obsidian-sync.service blackglass-server.service

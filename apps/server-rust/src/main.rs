@@ -66,6 +66,17 @@ async fn main() -> Result<()> {
             println!("restore verified: {}", destination.display());
             Ok(())
         }
+        [command, source, destination] if command == "migrate-legacy" => {
+            let source = PathBuf::from(source);
+            let destination = PathBuf::from(destination);
+            db::migrate_legacy_database(&source, &destination)?;
+            println!(
+                "legacy migration verified: {} -> {}",
+                source.display(),
+                destination.display()
+            );
+            Ok(())
+        }
         [command, path] if command == "revoke-all-sessions" => {
             let path = PathBuf::from(path);
             println!("revoked sessions: {}", db::revoke_all_sessions(&path)?);
@@ -80,6 +91,7 @@ fn print_help() {
         "{NAME} {VERSION}\n\n\
 Usage:\n  {NAME} serve\n  {NAME} hash-password\n  {NAME} backup <database> <output>\n  \
 {NAME} verify <database>\n  {NAME} restore <backup> <new-database>\n  \
+{NAME} migrate-legacy <legacy-database> <new-database>\n  \
 {NAME} revoke-all-sessions <database>\n  {NAME} --version\n  {NAME} --help"
     );
 }

@@ -34,10 +34,14 @@ SystemCallArchitectures=native
 SystemCallFilter=@system-service
 SystemCallErrorNumber=EPERM
 RestrictAddressFamilies=AF_UNIX AF_INET AF_INET6
+IPAddressDeny=any
+IPAddressAllow=localhost
 CapabilityBoundingSet=
 AmbientCapabilities=
 LimitNOFILE=4096
 TasksMax=64
+MemoryHigh=192M
+MemoryMax=256M
 
 [Install]
 WantedBy=multi-user.target

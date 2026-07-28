@@ -136,6 +136,7 @@ device name, and account identity.
 | `pull` | Implemented and opaque-byte round-trip/E2E tested |
 | `size`, `usernames` | Implemented and official-client tested |
 | `deleted`, `history`, `restore`, `purge` | Implemented and protocol-tested; deleted view live-tested |
+| custom-password and managed-encryption vault lifecycle | Implemented and protocol-tested across restart and second-device access |
 | two-device convergence | Bidirectional byte-identical E2E pass |
 | multi-user sharing | Deliberately unsupported |
 

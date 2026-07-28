@@ -32,11 +32,11 @@ same tests, artifact hashes, and release gates as any other contribution.
 | --- | --- |
 | Deployment | One owner, one server node, local SQLite storage |
 | Sync | Account, vault, history, upload, download, and recovery |
-| Encryption | End-to-end-encrypted vaults only |
+| Encryption | Client-managed and server-managed encrypted vaults |
 | Client target | macOS desktop on Apple Silicon; Obsidian renderer 1.12.7 first |
 | Server hosts | 64-bit Linux on amd64 or arm64; native binary or OCI image |
 
-Publish, public registration, sharing, managed encryption, high availability,
+Publish, public registration, sharing, high availability,
 mobile clients, Windows servers, and 32-bit hosts are not supported yet.
 
 ## Architecture
@@ -86,11 +86,14 @@ blackglass-server --help
 
 ## Security model
 
-Clients encrypt content, paths, and hashes before transmission. The server
-cannot read vault contents, but it can observe metadata and is trusted for
-availability and revision ordering. Passwords use Argon2id; sessions are
-expiring, revocable bearer tokens whose digests are stored. Production binds
-only to loopback behind HTTPS/WSS, and memory use is bounded by frame and
+Clients encrypt content, paths, and hashes before transmission. With a custom
+vault password, the server never receives that password and cannot decrypt the
+vault; it can still observe metadata and is trusted for availability and
+revision ordering. In the built-in managed-encryption mode, the server securely
+generates and stores the recovery password, so the operator is additionally in
+the confidentiality trust boundary. Account passwords use Argon2id; sessions
+are expiring, revocable bearer tokens whose digests are stored. Production
+binds only to loopback behind HTTPS/WSS, and memory use is bounded by frame and
 concurrency limits.
 
 Read the full [security model](docs/security.md). Report vulnerabilities using

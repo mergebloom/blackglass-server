@@ -42,9 +42,22 @@ test -n "$version" || {
 }
 
 source_revision=${SOURCE_REVISION:-unknown}
-if test "$source_revision" = unknown && command -v git >/dev/null 2>&1; then
-    source_revision=$(git -C "$project_root" rev-parse --verify HEAD 2>/dev/null || printf '%s' unknown)
+if command -v git >/dev/null 2>&1 && git -C "$project_root" rev-parse --verify HEAD >/dev/null 2>&1; then
+    if test -n "$(git -C "$project_root" status --porcelain --untracked-files=all 2>/dev/null)"; then
+        echo "refusing a release archive from a dirty worktree; commit the exact source first" >&2
+        exit 1
+    fi
+    git_revision=$(git -C "$project_root" rev-parse --verify HEAD)
+    if test "$source_revision" != unknown && test "$source_revision" != "$git_revision"; then
+        echo "SOURCE_REVISION does not match the clean checkout HEAD" >&2
+        exit 1
+    fi
+    source_revision=$git_revision
 fi
+test "$source_revision" != unknown || {
+    echo "a verified source revision is required" >&2
+    exit 1
+}
 case "$source_revision" in
     *[!A-Za-z0-9._-]*)
         echo "SOURCE_REVISION contains unsupported characters" >&2

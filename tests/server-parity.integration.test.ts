@@ -103,7 +103,7 @@ async function freePort(): Promise<number> { return new Promise((resolve, reject
 class Probe {
   private queue: unknown[]=[];private waiters:Array<(v:unknown)=>void>=[];
   private constructor(readonly socket:WebSocket){socket.binaryType="arraybuffer";socket.addEventListener("message",e=>{const v=typeof e.data==="string"?JSON.parse(e.data):e.data;const waiter=this.waiters.shift();waiter?waiter(v):this.queue.push(v);});}
-  static connect(url:string):Promise<Probe>{return new Promise((resolve,reject)=>{const ws=new WebSocket(url);sockets.push(ws);const probe=new Probe(ws);ws.addEventListener("open",()=>resolve(probe),{once:true});ws.addEventListener("error",()=>reject(new Error("websocket failed")),{once:true});});}
+  static connect(url:string):Promise<Probe>{return new Promise((resolve,reject)=>{const ws=new WebSocket(url,{headers:{Origin:"app://obsidian.md"}} as unknown as string[]);sockets.push(ws);const probe=new Probe(ws);ws.addEventListener("open",()=>resolve(probe),{once:true});ws.addEventListener("error",()=>reject(new Error("websocket failed")),{once:true});});}
   json(v:Record<string,unknown>){this.socket.send(JSON.stringify(v));}
   async nextJson():Promise<any>{const value=await this.next();if(value instanceof ArrayBuffer)throw new Error("expected JSON");return value;}
   async nextBinary():Promise<ArrayBuffer>{const value=await this.next();if(!(value instanceof ArrayBuffer))throw new Error("expected binary");return value;}

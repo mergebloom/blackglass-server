@@ -25,8 +25,7 @@ fi
 
 umask 077
 mkdir -p "$(dirname -- "$new_database")"
-"$server_binary" verify "$legacy_database"
-"$server_binary" restore "$legacy_database" "$new_database"
+"$server_binary" migrate-legacy "$legacy_database" "$new_database"
 "$server_binary" verify "$new_database"
 
 printf 'legacy state copied and verified: %s -> %s\n' "$legacy_database" "$new_database"

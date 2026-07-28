@@ -10,8 +10,34 @@ permissions:
   contents: read
 
 jobs:
+  gate:
+    name: Full release gate
+    runs-on: ubuntu-24.04
+    timeout-minutes: 25
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - uses: oven-sh/setup-bun@0c5077e51419868618aeaa5fe8019c62421857d6 # v2.2.0
+        with:
+          bun-version: 1.3.8
+      - run: rustup toolchain install 1.92.0 --profile minimal --component rustfmt,clippy
+      - run: rustup default 1.92.0
+      - run: npm ci
+      - run: bun run check
+      - run: ./ops/build-release.sh
+      - run: bun run server:measure
+      - run: shellcheck ops/*.sh
+      - name: Verify systemd hardening unit
+        run: systemd-analyze verify ops/blackglass-server.service
+      - name: Validate example Caddy ingress
+        run: >-
+          docker run --rm
+          -v "$PWD/ops/Caddyfile.example:/etc/caddy/Caddyfile:ro"
+          caddy@sha256:c3d7ee5d2b11f9dc54f947f68a734c84e9c9666c92c88a7f30b9cba5da182adb
+          caddy validate --config /etc/caddy/Caddyfile --adapter caddyfile
+
   package:
     name: Package ${{ matrix.target }}
+    needs: gate
     strategy:
       fail-fast: false
       matrix:
@@ -79,9 +105,12 @@ jobs:
           test "$GITHUB_REF_NAME" = "v$version"
           mkdir release-assets
           find incoming -type f -name '*.tar.gz' -exec cp '{}' release-assets/ \;
+          find incoming -type f -name '*.tar.gz.sha256' -exec cp '{}' release-assets/ \;
           test "$(find release-assets -type f -name '*.tar.gz' | wc -l)" -eq 2
+          test "$(find release-assets -type f -name '*.tar.gz.sha256' | wc -l)" -eq 2
           cd release-assets
           sha256sum ./*.tar.gz > SHA256SUMS
+          sha256sum -c ./*.tar.gz.sha256
           printf 'VERSION=%s\n' "$version" >> "$GITHUB_ENV"
           printf 'IMAGE=ghcr.io/%s\n' "${GITHUB_REPOSITORY,,}" >> "$GITHUB_ENV"
       - uses: actions/attest@f7c74d28b9d84cb8768d0b8ca14a4bac6ef463e6 # v4.2.0
@@ -97,21 +126,45 @@ jobs:
         shell: bash
         run: |
           set -euo pipefail
+          if docker buildx imagetools inspect "$IMAGE:$VERSION" >/dev/null 2>&1; then
+            echo "refusing to replace existing immutable image tag $IMAGE:$VERSION" >&2
+            exit 1
+          fi
           image_tags=(--tag "$IMAGE:$VERSION")
           if [[ "$VERSION" != *-* ]]; then
             image_tags+=(--tag "$IMAGE:latest")
           fi
-          docker buildx build \
-            --platform linux/amd64,linux/arm64 \
-            --file ops/Dockerfile.release \
-            --target runtime \
-            --build-arg "VERSION=$VERSION" \
-            --build-arg "SOURCE_REVISION=$GITHUB_SHA" \
-            "${image_tags[@]}" \
-            --metadata-file image-metadata.json \
-            --push \
-            .
-          digest=$(jq -r '."containerimage.digest"' image-metadata.json)
+          image_sources=()
+          for architecture in amd64 arm64; do
+            archive="release-assets/blackglass-server-v${VERSION}-linux-${architecture}.tar.gz"
+            ./ops/verify-linux-release.sh "linux-${architecture}" "$archive"
+            context="image-context/${architecture}"
+            extracted="${context}/extracted"
+            mkdir -p "$extracted" "${context}/state"
+            tar -xzf "$archive" -C "$extracted"
+            binary=$(find "$extracted" -type f -name blackglass-server -print)
+            test "$(printf '%s\n' "$binary" | sed '/^$/d' | wc -l)" -eq 1
+            cp "$binary" "${context}/blackglass-server"
+            chmod 0555 "${context}/blackglass-server"
+            touch "${context}/state/.blackglass-state"
+            metadata="image-metadata-${architecture}.json"
+            docker buildx build \
+              --platform "linux/${architecture}" \
+              --file ops/Dockerfile.prebuilt \
+              --build-arg "TARGETARCH=${architecture}" \
+              --build-arg "VERSION=$VERSION" \
+              --build-arg "SOURCE_REVISION=$GITHUB_SHA" \
+              --metadata-file "$metadata" \
+              --output "type=image,name=${IMAGE},push-by-digest=true,name-canonical=true,push=true" \
+              "$context"
+            architecture_digest=$(jq -r '."containerimage.digest"' "$metadata")
+            test "$architecture_digest" != null
+            image_sources+=("${IMAGE}@${architecture_digest}")
+          done
+          docker buildx imagetools create "${image_tags[@]}" "${image_sources[@]}"
+          docker buildx imagetools inspect "$IMAGE:$VERSION" --format '{{json .Manifest}}' > image-manifest.json
+          jq -e '([.manifests[].platform | select(.os == "linux") | .architecture] | sort) == ["amd64", "arm64"]' image-manifest.json
+          digest=$(jq -r '.digest' image-manifest.json)
           test "$digest" != null
           printf 'IMAGE_DIGEST=%s\n' "$digest" >> "$GITHUB_ENV"
       - uses: actions/attest@f7c74d28b9d84cb8768d0b8ca14a4bac6ef463e6 # v4.2.0
@@ -119,17 +172,17 @@ jobs:
           subject-name: ${{ env.IMAGE }}
           subject-digest: ${{ env.IMAGE_DIGEST }}
           push-to-registry: true
-      - name: Create or update GitHub release
+      - name: Create immutable GitHub release
         shell: bash
         env:
           GH_TOKEN: ${{ github.token }}
         run: |
           set -euo pipefail
           if gh release view "$GITHUB_REF_NAME" >/dev/null 2>&1; then
-            gh release upload "$GITHUB_REF_NAME" release-assets/* --clobber
-          else
-            gh release create "$GITHUB_REF_NAME" release-assets/* \
-              --verify-tag \
-              --generate-notes \
-              --title "Blackglass Server $VERSION"
+            echo "refusing to mutate existing release $GITHUB_REF_NAME" >&2
+            exit 1
           fi
+          gh release create "$GITHUB_REF_NAME" release-assets/* \
+            --verify-tag \
+            --generate-notes \
+            --title "Blackglass Server $VERSION"

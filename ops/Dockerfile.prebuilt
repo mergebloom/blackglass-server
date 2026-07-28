@@ -1,0 +1,30 @@
+# syntax=docker/dockerfile:1.7
+
+# Assemble the published OCI image from a native, already-tested release binary.
+# The release workflow supplies a minimal per-architecture build context containing
+# only `blackglass-server` and an empty persistent-state directory.
+FROM scratch
+
+ARG SOURCE_REVISION
+ARG TARGETARCH
+ARG VERSION
+
+LABEL org.opencontainers.image.title="Blackglass Server" \
+      org.opencontainers.image.description="Lean self-hosted encrypted-vault synchronization service" \
+      org.opencontainers.image.licenses="MIT" \
+      org.opencontainers.image.revision="$SOURCE_REVISION" \
+      org.opencontainers.image.version="$VERSION" \
+      org.opencontainers.image.architecture="$TARGETARCH"
+
+COPY --chmod=0555 blackglass-server /usr/local/bin/blackglass-server
+COPY --chown=65532:65532 state/ /var/lib/blackglass-server/
+
+ENV SELFHOST_BIND_HOST=127.0.0.1 \
+    SELFHOST_DATABASE=/var/lib/blackglass-server/server.sqlite \
+    SELFHOST_STAGING_DIR=/var/lib/blackglass-server/uploads
+
+VOLUME ["/var/lib/blackglass-server"]
+USER 65532:65532
+WORKDIR /var/lib/blackglass-server
+ENTRYPOINT ["/usr/local/bin/blackglass-server"]
+CMD ["serve"]
