@@ -1,6 +1,13 @@
 #!/bin/sh
 set -eu
 
+project_root=$(
+    unset CDPATH
+    cd -- "$(dirname -- "$0")/.." && pwd
+)
+# shellcheck source=ops/release-version.sh
+. "$project_root/ops/release-version.sh"
+
 usage() {
     echo "usage: $0 <linux-amd64|linux-arm64> <archive> [raw-binary]" >&2
     exit 2
@@ -38,6 +45,13 @@ case "$archive_name" in
         exit 1
         ;;
 esac
+version=${archive_name#blackglass-server-v}
+archive_suffix="-$target.tar.gz"
+version=${version%"$archive_suffix"}
+blackglass_is_supported_release_version "$version" || {
+    echo "archive name contains an unsupported release version: $version" >&2
+    exit 1
+}
 
 if command -v sha256sum >/dev/null 2>&1; then
     (cd "$archive_dir" && sha256sum -c "$archive_name.sha256")

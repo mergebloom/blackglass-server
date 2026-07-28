@@ -11,14 +11,19 @@ image=$2
 source_revision=$3
 release_assets=$4
 
+script_dir=$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)
+# shellcheck source=ops/release-version.sh
+. "$script_dir/release-version.sh"
+
+blackglass_is_supported_release_version "$version" || {
+  echo "error: invalid image version: $version" >&2
+  exit 1
+}
+
 : "${GITHUB_REPOSITORY:?GITHUB_REPOSITORY is required}"
 : "${GITHUB_ENV:?GITHUB_ENV is required}"
 : "${GH_TOKEN:?GH_TOKEN is required}"
 
-[[ "$version" =~ ^[0-9]+\.[0-9]+\.[0-9]+(-[0-9A-Za-z.-]+)?$ ]] || {
-  echo "error: invalid image version: $version" >&2
-  exit 1
-}
 [[ "$image" == ghcr.io/* ]] || {
   echo "error: image must be in ghcr.io" >&2
   exit 1

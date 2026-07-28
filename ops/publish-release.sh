@@ -11,7 +11,11 @@ title=$2
 shift 2
 assets=("$@")
 
-[[ "$tag" =~ ^v[0-9]+\.[0-9]+\.[0-9]+(-[0-9A-Za-z.-]+)?$ ]] || {
+script_dir=$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)
+# shellcheck source=ops/release-version.sh
+. "$script_dir/release-version.sh"
+
+blackglass_is_supported_release_tag "$tag" || {
   echo "error: release tag is not a supported semantic version: $tag" >&2
   exit 1
 }

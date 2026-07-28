@@ -7,6 +7,8 @@ project_root=$(
 )
 cargo_toml="$project_root/apps/server-rust/Cargo.toml"
 dist_dir=${BLACKGLASS_DIST_DIR:-"$project_root/artifacts/releases"}
+# shellcheck source=ops/release-version.sh
+. "$project_root/ops/release-version.sh"
 
 usage() {
     echo "usage: $0 <linux-amd64|linux-arm64>" >&2
@@ -42,6 +44,10 @@ version=$(awk '
 ' "$cargo_toml")
 test -n "$version" || {
     echo "could not determine blackglass-server version" >&2
+    exit 1
+}
+blackglass_is_supported_release_version "$version" || {
+    echo "blackglass-server version is not a supported release version: $version" >&2
     exit 1
 }
 

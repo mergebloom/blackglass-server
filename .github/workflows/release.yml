@@ -161,6 +161,8 @@ jobs:
             }
           ' apps/server-rust/Cargo.toml)
           test -n "$version"
+          . ops/release-version.sh
+          blackglass_is_supported_release_version "$version"
           test "$GITHUB_REF_NAME" = "v$version"
           mkdir release-assets
           for architecture in amd64 arm64; do

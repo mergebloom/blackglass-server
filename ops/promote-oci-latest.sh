@@ -10,13 +10,18 @@ version=$1
 image=$2
 expected_digest=$3
 
-: "${GITHUB_REPOSITORY:?GITHUB_REPOSITORY is required}"
-: "${GH_TOKEN:?GH_TOKEN is required}"
+script_dir=$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)
+# shellcheck source=ops/release-version.sh
+. "$script_dir/release-version.sh"
 
-[[ "$version" =~ ^[0-9]+\.[0-9]+\.[0-9]+(-[0-9A-Za-z.-]+)?$ ]] || {
+blackglass_is_supported_release_version "$version" || {
   echo "error: invalid image version: $version" >&2
   exit 1
 }
+
+: "${GITHUB_REPOSITORY:?GITHUB_REPOSITORY is required}"
+: "${GH_TOKEN:?GH_TOKEN is required}"
+
 [[ "$expected_digest" =~ ^sha256:[a-f0-9]{64}$ ]] || {
   echo "error: invalid expected image digest" >&2
   exit 1
@@ -107,7 +112,7 @@ if [[ "$version_count" -ne 1 ]] ||
   exit 1
 fi
 
-highest_stable=$(jq -r '[.[].metadata.container.tags[] | select(test("^[0-9]+\\.[0-9]+\\.[0-9]+$"))] | unique[]' "$versions_json" | sort -V | tail -n 1)
+highest_stable=$(jq -r '[.[].metadata.container.tags[] | select(test("^(0|[1-9][0-9]*)\\.(0|[1-9][0-9]*)\\.(0|[1-9][0-9]*)$"))] | unique[]' "$versions_json" | sort -V | tail -n 1)
 if [[ "$highest_stable" != "$version" ]]; then
   highest_count=$(jq --arg tag "$highest_stable" '[.[] | select(.metadata.container.tags | index($tag))] | length' "$versions_json")
   latest_count=$(jq '[.[] | select(.metadata.container.tags | index("latest"))] | length' "$versions_json")
