@@ -9,7 +9,7 @@ OCI image:
 | --- | --- | --- | --- |
 | `linux-amd64` | x86-64 | static musl | Intel/AMD cloud VMs, servers, and NAS hosts |
 | `linux-arm64` | AArch64 | static musl | Graviton, Ampere, ARM cloud VMs, and 64-bit ARM hosts |
-| OCI image | amd64 + arm64 | scratch | Private Docker bridge or Kubernetes Pod networks |
+| OCI image | amd64 + arm64 | scratch | Linux Docker with host networking and host Caddy |
 
 The static binaries have no glibc, OpenSSL, or external SQLite dependency.
 They are therefore the preferred distribution for Ubuntu, Debian, Fedora,
@@ -43,11 +43,14 @@ manifest. The separately emitted raw executable is checksum-verified and must
 be byte-identical to the archive's executable. The final scratch image is then
 executed read-only, without Linux capabilities and with `no-new-privileges`, to
 verify its CLI entry point. A second smoke starts it as its non-root runtime
-identity on a standard bridge, publishes both ports to host loopback, and
-proves the control health endpoint and data listener are reachable.
+identity with Linux host networking, loopback binding, the exact loopback
+trusted proxy, read-only rootfs, 256 MiB memory and 64-PID limits, and proves
+the control health endpoint and data listener are reachable.
 
 The builder image is pinned by multi-platform manifest digest in
-`ops/Dockerfile.release`. Cargo uses the locked dependency graph. Release
+`ops/Dockerfile.release`; the Dockerfile frontend, Buildx version, BuildKit
+driver image, and GitHub Actions are pinned as well. Cargo uses the locked
+dependency graph. Release
 archives have sorted entries, normalized ownership and timestamps, and
 timestamp-free gzip output. `sourceRevision` is the current Git commit when one
 is available or the explicitly supplied `SOURCE_REVISION` value.
@@ -89,37 +92,48 @@ and an owned state directory, runs as numeric uid/gid 65532, and has no shell
 or package manager. Its writable state belongs at
 `/var/lib/blackglass-server`.
 
-Native installs retain the safe loopback default. The OCI image alone sets
-`SELFHOST_BIND_HOST=0.0.0.0` together with the required
-`SELFHOST_ACKNOWLEDGE_EXTERNAL_BIND=1`, because bridge and Pod networking must
-reach the process. Both plaintext ports must remain private; only the TLS proxy
-or ingress may face clients. A Docker deployment can publish them to host
-loopback for a host TLS proxy:
+The native binary and OCI image retain the safe loopback default. The qualified
+Linux Docker topology uses host networking so a host Caddy process reaches the
+same loopback listeners and is the server's one exact trusted proxy. There are
+no published plaintext ports:
 
 ```sh
 docker volume create blackglass-server-state
 docker run -d \
   --name blackglass-server \
   --restart unless-stopped \
+  --network host \
+  --stop-timeout 30 \
   --read-only \
+  --memory 256m \
+  --pids-limit 64 \
+  --ulimit nofile=4096:4096 \
+  --tmpfs /tmp:rw,noexec,nosuid,nodev,size=32m,mode=1777 \
   --cap-drop ALL \
   --security-opt no-new-privileges \
   --env-file /etc/blackglass-server/server.env \
-  --env SELFHOST_BIND_HOST=0.0.0.0 \
-  --env SELFHOST_ACKNOWLEDGE_EXTERNAL_BIND=1 \
-  --publish 127.0.0.1:3000:3000 \
-  --publish 127.0.0.1:3003:3003 \
+  --env SELFHOST_BIND_HOST=127.0.0.1 \
+  --env SELFHOST_TRUSTED_PROXY=127.0.0.1 \
   --mount type=volume,src=blackglass-server-state,dst=/var/lib/blackglass-server \
   ghcr.io/OWNER/REPOSITORY:VERSION
 ```
 
-The explicit environment overrides are needed when the host-oriented env file
-contains `SELFHOST_BIND_HOST=127.0.0.1`. Use the same Caddy configuration and
-two hostnames documented in [production operations](production.md). In
-Kubernetes, use a ClusterIP Service, WebSocket-capable TLS Ingress, and a
-NetworkPolicy that permits these ports only from the ingress controller. Do
-not expose either port through a public NodePort, LoadBalancer, or direct
-host-wide bind.
+This mode is for a native Linux Docker host; Docker Desktop host networking is
+not a qualified production target. Use the Caddy configuration and two
+hostnames documented in [production operations](production.md). Caddy must
+overwrite `X-Forwarded-For`; never append an untrusted incoming value.
+
+Kubernetes is not release-qualified by this topology. An orchestrated
+deployment must leave `SELFHOST_TRUSTED_PROXY` unset unless the ingress has one
+stable, exclusive peer IP; an ingress fleet cannot be represented by this
+exact-IP option. Apply ingress per-source sign-in limits and a NetworkPolicy,
+and use `runAsUser`/`runAsGroup`/`fsGroup` 65532,
+`fsGroupChangePolicy: OnRootMismatch`, `readOnlyRootFilesystem: true`, a 32 MiB
+memory-backed `/tmp`, `terminationGracePeriodSeconds` of at least 30, a 256 MiB
+memory limit, a 64-PID limit where supported, and a locally backed PVC with
+verified ownership. Never expose the server through a public NodePort,
+LoadBalancer, or direct host-wide bind. Qualify that exact ingress topology
+before production use.
 
 Pin production deployments to a version tag or, preferably, the published OCI
 digest. `latest` is a convenience tag, not an upgrade policy. Back up and verify
@@ -132,11 +146,12 @@ The release workflow runs natively on GitHub-hosted Ubuntu amd64 and arm64
 runners. A manual dispatch produces retained workflow artifacts. A tag that
 exactly equals `v` plus the Cargo package version additionally:
 
-1. creates an immutable GitHub release with both archives, both raw binaries,
-   their adjacent checksums, and `SHA256SUMS`;
+1. creates a verified GitHub release with both archives, both raw binaries,
+   their adjacent checksums, per-architecture resource reports, and
+   `SHA256SUMS`;
 2. publishes a multi-architecture image to GitHub Container Registry;
 3. attaches signed build-provenance attestations to archives, raw binaries,
-   and the OCI digest.
+   resource reports, and the OCI digest.
 
 All third-party workflow actions are pinned to reviewed commit hashes. The
 workflow grants package/release write permissions only to the tag publishing

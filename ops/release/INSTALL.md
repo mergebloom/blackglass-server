@@ -45,7 +45,7 @@ configuration, systemd hardening, TLS proxy, backup, restore, upgrade, and
 rollback instructions are maintained in `docs/production.md` in the source
 repository.
 
-Native service configuration defaults to loopback. OCI images opt in to an
-unspecified address only inside a private container network. Never expose the
-plaintext control or data listeners directly; place the documented TLS reverse
-proxy or ingress in front.
+Native service configuration and OCI images default to loopback. The supported
+Linux Docker deployment uses host networking so host Caddy reaches loopback
+without published plaintext ports. Never expose the control or data listeners
+directly; follow the exact topology in `docs/distribution.md`.

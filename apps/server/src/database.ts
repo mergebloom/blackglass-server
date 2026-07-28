@@ -287,8 +287,15 @@ export class SyncDatabase {
                FROM revisions
               WHERE vault_id = ?
               GROUP BY path
-           ) heads ON heads.uid = r.uid
+          ) heads ON heads.uid = r.uid
           WHERE r.deleted = 1
+            AND EXISTS (
+              SELECT 1 FROM revisions prior
+               WHERE prior.vault_id = r.vault_id
+                 AND prior.path = r.path
+                 AND prior.uid < r.uid
+                 AND prior.deleted = 0
+            )
             AND (
               ? = 0 OR NOT EXISTS (
                 SELECT 1
@@ -367,15 +374,10 @@ export class SyncDatabase {
           `DELETE FROM revisions
             WHERE vault_id = ?
               AND uid NOT IN (
-                SELECT r.uid
-                  FROM revisions r
-                  JOIN (
-                    SELECT path, MAX(uid) AS uid
-                      FROM revisions
-                     WHERE vault_id = ?
-                     GROUP BY path
-                  ) heads ON heads.uid = r.uid
-                 WHERE r.deleted = 0
+                SELECT MAX(uid)
+                  FROM revisions
+                 WHERE vault_id = ?
+                 GROUP BY path
               )`,
         )
         .run(vaultId, vaultId);

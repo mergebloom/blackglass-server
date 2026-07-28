@@ -58,15 +58,15 @@ renaming a binary creates a new artifact that must earn a new client E2E record.
 ## Security posture
 
 - Production origins use HTTPS and WSS through a reverse proxy.
-- Native installs default to loopback; OCI external binding is explicitly
-  acknowledged and confined to a private network behind TLS ingress.
+- Native installs and OCI images default to loopback; qualified Linux Docker
+  uses host networking behind host Caddy without published plaintext ports.
 - Endpoint authorization uses exact origins.
 - Account tokens and vault key material are never logged.
 - Custom-password vault secrets never reach the server; managed mode stores its
   server-generated recovery password and requires a stronger operator trust
   boundary.
-- Password verification has a two-check memory bound and runs off the async
-  reactor; the ingress rate-limits per real client address.
+- Password verification has a one-check memory bound and runs off the async
+  reactor; a bounded fair queue and per-source limiter protect admission.
 - Session tokens expire and can be revoked; only token digests are persisted.
 - Upload frames, files, concurrent staging, and metadata fields are bounded.
 - Backups use SQLite's online backup API and verify the exact schema, migration

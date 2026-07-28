@@ -18,9 +18,10 @@ Obsidian -> HTTPS control hostname -> Caddy -> 127.0.0.1:3000
 Obsidian -> WSS data hostname      -> Caddy -> 127.0.0.1:3003
 ```
 
-The native default refuses non-loopback binding. The OCI image makes the
-narrowly scoped `0.0.0.0` plus acknowledgement opt-in required for private
-bridge/Pod networking; a TLS ingress remains the only client-facing boundary.
+The native binary and OCI image both default to loopback. The qualified Linux
+Docker topology uses host networking so the same host Caddy process can reach
+those loopback listeners without exposing plaintext ports. A TLS ingress
+remains the only client-facing boundary.
 SQLite runs in WAL mode with
 `synchronous=FULL`, so an acknowledged commit is durable across operating-system
 crashes and power loss within SQLite's documented filesystem assumptions.
@@ -68,7 +69,8 @@ rejected before password verification to prevent an unsafe operator value from
 causing unbounded CPU or memory use.
 
 Install `ops/blackglass-server.service`, run `systemd-analyze security` against it,
-then enable it. The supplied unit uses a dynamic unprivileged user, a private
+then enable it. The supplied sysusers file and unit use a static unprivileged
+`blackglass-server` user, a private
 state directory, a read-only host filesystem, an empty capability set, and a
 restricted syscall/address-family surface.
 
@@ -89,14 +91,15 @@ The legacy singular
 `SELFHOST_ALLOWED_ORIGIN` remains accepted for one origin, but must not be set at
 the same time as the plural variable. Never use wildcard CORS.
 
-At most two Argon2 password checks run concurrently, capping their worst-case
-working memory at 128 MiB under the supplied 256 MiB systemd limit. The process
-does not apply a global hard login bucket, because one attacker could keep the
-owner locked out. The TLS ingress or firewall must instead rate-limit sign-in
-per real source address and cap connections; do not trust forwarded client-IP
-headers unless the ingress overwrites them and untrusted peers cannot reach the
-service. `SELFHOST_MAX_WS_CONNECTIONS` defaults to 16 and is constrained to
-1..32 by the same memory envelope.
+One Argon2 password check runs at a time, with at most eight fair queued
+waiters. The server also admits six sign-in attempts per real source in a
+60-second window and at most four unauthenticated WebSockets per source;
+successful owner sign-in refunds its attempt. `SELFHOST_TRUSTED_PROXY` accepts
+one exact private or loopback IP, never a CIDR. Only set it when that peer is the
+exclusive ingress and overwrites `X-Forwarded-For`; the supplied Caddy example
+does both with `127.0.0.1`. Otherwise leave it unset and add equivalent
+per-source limits at ingress. `SELFHOST_MAX_WS_CONNECTIONS` defaults to 16 and
+is constrained to 1..16 by the qualified memory envelope.
 
 ## Health, metrics, and logs
 
@@ -142,10 +145,26 @@ SELFHOST_SERVER_BINARY=/opt/blackglass-server/blackglass-server \
   ./ops/restore-drill.sh /var/backups/blackglass-server/server-TIMESTAMP.sqlite
 ```
 
-For a real restore, stop the service, preserve the failed database files for
-forensics, use `restore <backup> <new-database>` to create a new verified file,
-point `SELFHOST_DATABASE` at that new file, start the service, and require both
-`/ready` and a fresh-client recovery test before discarding the old files.
+For a real restore, stop the service and preserve the failed database files for
+forensics. `restore` accepts only the current schema. First run `migrate` into a
+new file when the backup came from an older recognized schema, then restore that
+current-schema file into another new path:
+
+```sh
+blackglass-server migrate old-backup.sqlite migrated-backup.sqlite
+blackglass-server restore migrated-backup.sqlite recovered.sqlite
+```
+
+Restore always establishes a new recovery epoch: every remote vault ID rotates
+and every session is cleared. Point `SELFHOST_DATABASE` at the recovered file,
+start the service, and require `/ready`. Every desktop must then sign in again,
+reselect the replacement remote vault, and recover into a fresh empty local
+vault. Do not let a pre-restore local profile resume against its retired remote
+identity. Complete a fresh-client recovery test before discarding old files.
+The recovery response is deliberately narrow: a recorded retired vault ID plus
+any 64-character lowercase-hex token receives `Vault not found`, even when a
+post-backup token is absent from the restored session table. Other token shapes
+and arbitrary missing vault IDs retain the generic authentication error.
 
 If a signed-in device or bearer token may be compromised, stop the service and
 revoke every session before restarting it:
@@ -172,9 +191,19 @@ blackglass-server migrate server-vOLD.sqlite server-vNEW.sqlite
 
 Only after `verify server-vNEW.sqlite` succeeds should configuration point at
 the new file. The source stays unchanged. Each migration step validates its
-input/output inside the transaction and rolls back on failure. Rollback means
-restoring the pre-upgrade database together with the previous binary, not
-running an older binary against a migrated database.
+input/output inside the transaction and rolls back on failure. Migration from
+the shipped schema v3 to v4 preserves vault IDs and sessions; migrations from
+schemas older than v3 establish a new recovery epoch and require the same
+fresh-client procedure as restore.
+
+A pre-v4/pre-0.2.2 rollback is safe only before activation, while the untouched
+old database has received no client writes. After the new database has served
+clients, do not start an older binary or restore the old database under existing
+client profiles: revision cursors can be ahead of that history. Roll forward to
+a fixed build on the same or newer schema. If data recovery is necessary, use a
+current binary to migrate and restore into a new file; vault IDs rotate,
+sessions clear, and every client must sign in, reselect, and start from an empty
+local vault.
 
 ### Changing the public data host
 
@@ -216,14 +245,16 @@ sudo env SELFHOST_SERVER_BINARY=/opt/blackglass-server/blackglass-server \
   ./ops/migrate-legacy-state.sh \
   /var/lib/obsidian-sync/server.sqlite \
   /var/lib/blackglass-server/server.sqlite
+sudo chown blackglass-server:blackglass-server \
+  /var/lib/blackglass-server/server.sqlite
 sudo systemctl start blackglass-server.service
 curl --fail http://127.0.0.1:3000/ready
 ```
 
-Systemd assigns the new state directory to the dynamic service identity on
-start. Require a fresh-client recovery test before disabling the old unit or
-removing its state. Roll back by stopping Blackglass Server and restarting the
-old unit against the untouched legacy database.
+The explicit ownership step is mandatory because copy-first migration creates a
+mode-0600 file. Require a fresh-client recovery test before disabling the old
+unit or removing its state. Roll back only before the migrated database accepts
+client writes; afterward use the roll-forward recovery rule above.
 
 Client releases remain independently versioned. Keep the old client build
 disabled from automatic updates, qualify each new Obsidian renderer with the
@@ -234,17 +265,45 @@ the newly generated local build. The server URL does not need to change.
 
 Each active upload holds at most one WebSocket frame (2 MiB) plus small
 metadata in memory and one ciphertext staging file on disk. Upload concurrency
-defaults to four and is configurable. WebSocket admission defaults to 16 and
-cannot exceed 32; two 64 MiB Argon2 checks, 32 worst-case 2 MiB frames, and 32
-MiB of base headroom fit the supplied 256 MiB service cap. Pulls read SQLite in
-2 MiB pieces. This keeps memory bounded by concurrency, not vault or attachment
-size. SQLite is
+defaults to four and can be reduced, but cannot exceed the qualified limit of
+four. WebSocket admission defaults to 16 and cannot exceed 16. One bounded
+Argon2 check, an eight-request wait queue, 2 MiB
+frames, a single large JSON response, and bounded database workers fit the
+supplied 256 MiB service cap. Pulls read SQLite in 2 MiB pieces. This keeps
+memory bounded by concurrency, not vault or attachment size. SQLite is
 the correct database while the deployment remains a single writer node; do
 not place its files on a network filesystem.
 
-The release resource gate uploads 64 MiB in 32 pieces and records process RSS
-in `.data/validation/rust-resource-report.json`. Treat the report as valid only
-for the exact `binarySha256` it records; rebuilds require a new gate.
+Each Linux package job measures its exact exported binary while holding 16
+authenticated WebSockets and overlapping four 64 MiB uploads, eight pulls, a
+large history response, and ten queued sign-in attempts using the maximum
+accepted Argon2id work parameters (`m=65536,t=5,p=4`). Peak RSS must stay below
+224 MiB, leaving at least 32 MiB below the service's 256 MiB hard cap; the
+192 MiB `MemoryHigh` threshold remains an intentional pressure signal rather
+than a kill boundary. The per-target resource report is a release asset and
+embeds the binary SHA-256, target, and source revision; any rebuild requires a
+new report.
+
+## Deletion and retention
+
+Sync deletion is logical: the current head becomes a tombstone and historical
+encrypted revisions remain available until purged. This is required for the
+built-in Deleted and version-history experiences, so it is not secure erasure.
+If the Deleted response reaches its bounded wire limit, stop the service and
+run the backup-first targeted command shown in the client error:
+
+```sh
+blackglass-server purge-deleted \
+  /var/lib/blackglass-server/server.sqlite \
+  VAULT-ID \
+  /var/backups/blackglass-server/pre-purge.sqlite
+```
+
+That command removes history only for paths whose current head is a tombstone;
+it preserves live-file version history and the tombstone heads. For privacy
+retention, separately expire old backups. Use encrypted storage and destroy its
+keys when cryptographic erasure is required; SQLite row deletion alone cannot
+promise physical erasure from filesystem snapshots or discarded blocks.
 
 Sanitized release summaries suitable for source control are retained under
 [`docs/validation`](validation/README.md).

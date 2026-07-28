@@ -42,9 +42,10 @@ mobile clients, Windows servers, and 32-bit hosts are not supported yet.
 ## Architecture
 
 The server runs one Rust process with separate HTTP control and WebSocket Sync
-listeners. Native installs default to loopback; the OCI image uses an explicit
-container-only external-bind acknowledgement so a private bridge or Pod network
-can reach it. A TLS reverse proxy or ingress is the only public listener. SQLite
+listeners. Native installs and the OCI image default to loopback. The supported
+Linux Docker deployment uses host networking so host Caddy can reach those
+listeners without publishing plaintext ports. Caddy is the only public
+listener. SQLite
 stores opaque ciphertext and protocol state. Blackglass Bridge owns the small,
 release-specific client endpoint adapter.
 
@@ -97,17 +98,18 @@ generates and stores the recovery password, so the operator is additionally in
 the confidentiality trust boundary. Account passwords use Argon2id; sessions
 are expiring, revocable bearer tokens whose digests are stored. Production
 defaults to loopback behind HTTPS/WSS, and memory use is bounded by frame and
-concurrency limits. Container binding is allowed only through the image's
-explicit opt-in and must remain on a private network behind TLS ingress.
+concurrency limits. The qualified container topology keeps loopback binding and
+uses Linux host networking behind host Caddy.
 
 Read the full [security model](docs/security.md). Report vulnerabilities using
 [SECURITY.md](SECURITY.md), not a public issue.
 
 ## Validation
 
-Sanitized, artifact-bound release results live in
-[docs/validation](docs/validation/README.md). Rebuilding a binary changes its
-hash and requires the artifact-level qualification gates to run again.
+Artifact-bound resource reports ship with each tagged release;
+[docs/validation](docs/validation/README.md) documents the evidence model.
+Rebuilding a binary changes its hash and requires the artifact-level
+qualification gates to run again.
 
 ## Documentation
 

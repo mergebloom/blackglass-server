@@ -1,6 +1,7 @@
 import { afterAll, beforeAll, describe, expect, test } from "bun:test";
 import { createConnection, createServer } from "node:net";
 import { createHash, randomBytes } from "node:crypto";
+import { readFileSync } from "node:fs";
 import { mkdtemp, readFile, readdir, stat } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join, resolve } from "node:path";
@@ -8,10 +9,14 @@ import { Database } from "bun:sqlite";
 
 const root = resolve(import.meta.dir, "..");
 const manifest = join(root, "apps/server-rust/Cargo.toml");
+const packageVersion = readFileSync(manifest, "utf8").match(/\[package\][\s\S]*?^version = "([^"]+)"/m)?.[1];
+if (!packageVersion) throw new Error("unable to read Rust package version");
 const configuredBinary = process.env.BLACKGLASS_RUST_BINARY;
 const binary = configuredBinary ?? join(root, "apps/server-rust/target/debug/blackglass-server");
 const perFileMax = 8 * 1024 * 1024;
 const aesGcmWireOverhead = 12 + 16;
+const maximumWorkPasswordHash =
+  "$argon2id$v=19$m=65536,t=5,p=4$YmxhY2tnbGFzcy1yZXNvdXJjZS1lbnZlbG9wZS12MQ$qF1GQ0hLTNgx8hhl7Qo3R7r1pSYB+eYXdX4KtmWP5VI";
 let directory = "";
 let controlPort = 0;
 let dataPort = 0;
@@ -32,12 +37,12 @@ describe("production Rust server", () => {
     }
     const version = Bun.spawnSync([binary, "--version"], { stdout: "pipe", stderr: "pipe" });
     expect(version.exitCode, version.stderr.toString()).toBe(0);
-    expect(version.stdout.toString().trim()).toBe("blackglass-server 0.2.2");
+    expect(version.stdout.toString().trim()).toBe(`blackglass-server ${packageVersion}`);
     const buildInfo = Bun.spawnSync([binary, "build-info"], { stdout: "pipe", stderr: "pipe" });
     expect(buildInfo.exitCode, buildInfo.stderr.toString()).toBe(0);
     expect(JSON.parse(buildInfo.stdout.toString())).toMatchObject({
       name: "blackglass-server",
-      version: "0.2.2",
+      version: packageVersion,
       sourceRevision: process.env.BLACKGLASS_EXPECTED_SOURCE_REVISION ?? "unknown",
     });
     const help = Bun.spawnSync([binary, "--help"], { stdout: "pipe", stderr: "pipe" });
@@ -506,11 +511,29 @@ describe("production Rust server", () => {
       "SELFHOST_ACKNOWLEDGE_EXTERNAL_BIND=1",
     );
 
+    const plaintextDirectory = await mkdtemp(join(tmpdir(), "blackglass-external-plaintext-"));
+    const [plaintextControlPort, plaintextDataPort] = await Promise.all([freePort(), freePort()]);
+    const plaintext = spawnRustServer(plaintextDirectory, plaintextControlPort, plaintextDataPort, {
+      SELFHOST_BIND_HOST: "0.0.0.0",
+      SELFHOST_ACKNOWLEDGE_EXTERNAL_BIND: "1",
+      SELFHOST_DATA_HOST: "sync-data.example.test",
+    });
+    expect(
+      await promiseWithTimeout(plaintext.exited, 3_000, "external plaintext password did not fail"),
+    ).not.toBe(0);
+    expect(await new Response(plaintext.stderr as ReadableStream<Uint8Array>).text()).toContain(
+      "permitted only with a loopback SELFHOST_BIND_HOST",
+    );
+
     const allowedDirectory = await mkdtemp(join(tmpdir(), "blackglass-external-bind-allowed-"));
     const [allowedControlPort, allowedDataPort] = await Promise.all([freePort(), freePort()]);
     const allowed = spawnRustServer(allowedDirectory, allowedControlPort, allowedDataPort, {
       SELFHOST_BIND_HOST: "0.0.0.0",
       SELFHOST_ACKNOWLEDGE_EXTERNAL_BIND: "1",
+      SELFHOST_DATA_HOST: "sync-data.example.test",
+      SELFHOST_PASSWORD: "",
+      SELFHOST_ALLOW_PLAINTEXT_PASSWORD: "",
+      SELFHOST_PASSWORD_HASH: maximumWorkPasswordHash,
     });
     try {
       await waitForHealthAt(allowedControlPort, allowed);
@@ -527,6 +550,9 @@ describe("production Rust server", () => {
         SELFHOST_BIND_HOST: bind,
         SELFHOST_ACKNOWLEDGE_EXTERNAL_BIND: bind === "::1" ? "" : "1",
         SELFHOST_DATA_HOST: "",
+        SELFHOST_PASSWORD: "",
+        SELFHOST_ALLOW_PLAINTEXT_PASSWORD: "",
+        SELFHOST_PASSWORD_HASH: maximumWorkPasswordHash,
       });
       expect(await promiseWithTimeout(missing.exited, 3_000, `missing data host passed for ${bind}`)).not.toBe(0);
       expect(await new Response(missing.stderr as ReadableStream<Uint8Array>).text()).toContain(
@@ -967,13 +993,22 @@ describe("production Rust server", () => {
         join(lockedDirectory, ".", "alias", ".."),
         duplicateControlPort,
         duplicateDataPort,
-        { SELFHOST_DATA_HOST: `127.0.0.1:${lockedDataPort}` },
+        { SELFHOST_DATA_HOST: `127.0.0.1:${duplicateDataPort}` },
       );
       expect(await promiseWithTimeout(duplicate.exited, 3_000, "duplicate database owner did not fail")).not.toBe(0);
       expect(await new Response(duplicate.stderr as ReadableStream<Uint8Array>).text()).toContain(
         "database state is already locked",
       );
       expect(await stagedParts(join(lockedDirectory, "uploads"))).toHaveLength(1);
+
+      const blockedMigrationDestination = join(lockedDirectory, "must-not-migrate.sqlite");
+      const blockedMigration = Bun.spawnSync(
+        [binary, "migrate", join(lockedDirectory, "server.sqlite"), blockedMigrationDestination],
+        { cwd: root, stdout: "pipe", stderr: "pipe" },
+      );
+      expect(blockedMigration.exitCode).not.toBe(0);
+      expect(blockedMigration.stderr.toString()).toContain("database state is already locked");
+      expect(await Bun.file(blockedMigrationDestination).exists()).toBe(false);
 
       const separateDirectory = await mkdtemp(join(tmpdir(), "blackglass-shared-staging-"));
       const [sharedControlPort, sharedDataPort] = await Promise.all([freePort(), freePort()]);
@@ -1045,11 +1080,107 @@ describe("production Rust server", () => {
     }
   }, 20_000);
 
+  test("restore rotates vault identity and gives stale clients an exact recovery signal", async () => {
+    const sourceDirectory = await mkdtemp(join(tmpdir(), "blackglass-restore-source-"));
+    const recoveredDirectory = await mkdtemp(join(tmpdir(), "blackglass-restore-recovered-"));
+    const backup = join(sourceDirectory, "server.backup.sqlite");
+    const recoveredDatabase = join(recoveredDirectory, "server.sqlite");
+    const [sourceControlPort, sourceDataPort] = await Promise.all([freePort(), freePort()]);
+    let child = spawnRustServer(sourceDirectory, sourceControlPort, sourceDataPort);
+    try {
+      await waitForHealthAt(sourceControlPort, child);
+      const originalSignin = await postAt(sourceControlPort, "/user/signin", {
+        email: "owner@example.test",
+        password: "test-password",
+      });
+      const originalVault = await postAt(sourceControlPort, "/vault/create", {
+        token: originalSignin.token,
+        name: "Restore vault",
+        keyhash: "restore-keyhash",
+        salt: "restore-salt",
+        region: "selfhost",
+        encryption_version: 3,
+      });
+      const writer = await Probe.connect(`ws://127.0.0.1:${sourceDataPort}`);
+      await initializeFor(writer, originalSignin.token, originalVault, "Restore writer", 0, true);
+      await metadata(writer, "restore-proof", "restore-proof-hash");
+      writer.socket.close();
+
+      const backupCommand = Bun.spawnSync(
+        [binary, "backup", join(sourceDirectory, "server.sqlite"), backup],
+        { cwd: root, stdout: "pipe", stderr: "pipe" },
+      );
+      expect(backupCommand.exitCode, backupCommand.stderr.toString()).toBe(0);
+      const postBackupSignin = await postAt(sourceControlPort, "/user/signin", {
+        email: "owner@example.test",
+        password: "test-password",
+      });
+      expect(postBackupSignin.token).toMatch(/^[0-9a-f]{64}$/);
+
+      child.kill("SIGTERM");
+      expect(await child.exited).toBe(0);
+      const restoreCommand = Bun.spawnSync([binary, "restore", backup, recoveredDatabase], {
+        cwd: root,
+        stdout: "pipe",
+        stderr: "pipe",
+      });
+      expect(restoreCommand.exitCode, restoreCommand.stderr.toString()).toBe(0);
+
+      const recoveredControlPort = sourceControlPort;
+      const recoveredDataPort = sourceDataPort;
+      child = spawnRustServer(recoveredDirectory, recoveredControlPort, recoveredDataPort);
+      await waitForHealthAt(recoveredControlPort, child);
+
+      const stale = await Probe.connect(`ws://127.0.0.1:${recoveredDataPort}`);
+      // This token was issued after the backup and is therefore not a valid
+      // session in the restored database. The exact recovery signal is
+      // intentionally keyed by its 64-lowercase-hex session shape plus the
+      // recorded retired vault ID, not by a valid session lookup.
+      stale.json(initFor(postBackupSignin.token, originalVault, "Post-backup stale client", 1, false));
+      expect(await stale.nextJson()).toEqual({ res: "err", msg: "Vault not found" });
+      expect((await waitForClose(stale, 2_000)).code).toBe(1008);
+
+      const malformedToken = await Probe.connect(`ws://127.0.0.1:${recoveredDataPort}`);
+      malformedToken.json(
+        initFor("not-a-session-token", originalVault, "Malformed stale client", 1, false),
+      );
+      expect(await malformedToken.nextJson()).toEqual({
+        res: "err",
+        msg: "Unable to authenticate",
+      });
+      malformedToken.socket.close();
+
+      const arbitrary = await Probe.connect(`ws://127.0.0.1:${recoveredDataPort}`);
+      arbitrary.json(initFor(postBackupSignin.token, {
+        ...originalVault,
+        id: "00000000-0000-4000-8000-000000000000",
+      }, "Arbitrary missing vault", 0, true));
+      expect(await arbitrary.nextJson()).toEqual({ res: "err", msg: "Unable to authenticate" });
+      arbitrary.socket.close();
+
+      const freshSignin = await postAt(recoveredControlPort, "/user/signin", {
+        email: "owner@example.test",
+        password: "test-password",
+      });
+      const listed = await postAt(recoveredControlPort, "/vault/list", {
+        token: freshSignin.token,
+      });
+      expect(listed.vaults).toHaveLength(1);
+      expect(listed.vaults[0].id).not.toBe(originalVault.id);
+      const reader = await Probe.connect(`ws://127.0.0.1:${recoveredDataPort}`);
+      await initializeFor(reader, freshSignin.token, listed.vaults[0], "Fresh restore reader", 0, true);
+      reader.socket.close();
+    } finally {
+      if (child.exitCode === null) child.kill("SIGTERM");
+      await child.exited;
+    }
+  }, 30_000);
+
   test("exposes safe health/metrics and produces verified live backups", async () => {
     expect(await (await fetch(`http://127.0.0.1:${controlPort}/health`)).json()).toMatchObject({
       implementation: "rust",
       service: "blackglass-server",
-      version: "0.2.2",
+      version: packageVersion,
     });
     expect((await fetch(`http://127.0.0.1:${controlPort}/ready`)).status).toBe(200);
     const errorsBeforeClose = metricValue(
@@ -1065,14 +1196,15 @@ describe("production Rust server", () => {
     expect(metrics).toContain("obsidian_sync_upload_bytes_total");
     expect(metricValue(metrics, "blackglass_errors_total")).toBe(errorsBeforeClose);
     const backup = join(directory, "backup.sqlite");
-    const command = Bun.spawnSync([join(root, "apps/server-rust/target/debug/blackglass-server"), "backup", join(directory, "server.sqlite"), backup], { cwd: root, stdout: "pipe", stderr: "pipe" });
+    const command = Bun.spawnSync([binary, "backup", join(directory, "server.sqlite"), backup], { cwd: root, stdout: "pipe", stderr: "pipe" });
     expect(command.exitCode, command.stderr.toString()).toBe(0);
     expect((await stat(backup)).size).toBeGreaterThan(0);
-    const verify = Bun.spawnSync([join(root, "apps/server-rust/target/debug/blackglass-server"), "verify", backup], { cwd: root, stdout: "pipe", stderr: "pipe" });
+    const verify = Bun.spawnSync([binary, "verify", backup], { cwd: root, stdout: "pipe", stderr: "pipe" });
     expect(verify.exitCode, verify.stderr.toString()).toBe(0);
   });
 
   test("rejects malformed and oversized protocol input without committing it", async () => {
+    const versionBefore = databaseVersion(join(directory, "server.sqlite"), vault.id);
     const probe = await Probe.connect(`ws://127.0.0.1:${dataPort}`);
     await initialize(probe, "Input validator", 0, false);
     probe.socket.send("{");
@@ -1081,6 +1213,21 @@ describe("production Rust server", () => {
     expect(await probe.nextJson()).toEqual({ err: "Invalid push metadata" });
     probe.json({ op: "history", path: "" });
     expect(await probe.nextJson()).toEqual({ err: "Invalid history path" });
+    probe.json(push("bounded-path", "oversized-related", 0, 0, {
+      relatedpath: "r".repeat(16_385),
+    }));
+    expect(await probe.nextJson()).toEqual({ err: "Invalid push metadata" });
+    probe.json(push("unsafe-time", "unsafe-time", 0, 0, {
+      ctime: Number.MAX_SAFE_INTEGER + 1,
+    }));
+    expect(await probe.nextJson()).toEqual({ err: "Invalid push metadata" });
+    expect(databaseVersion(join(directory, "server.sqlite"), vault.id)).toBe(versionBefore);
+    probe.socket.close();
+
+    const unsafeVersion = await Probe.connect(`ws://127.0.0.1:${dataPort}`);
+    unsafeVersion.json(init("Unsafe version", Number.MAX_SAFE_INTEGER + 1, false));
+    expect(await unsafeVersion.nextJson()).toEqual({ res: "err", msg: "Invalid Sync version" });
+    expect((await waitForClose(unsafeVersion, 2_000)).code).toBe(1008);
   });
 
   test("revalidates active WebSockets after signout, expiration, and events", async () => {
@@ -1131,19 +1278,22 @@ describe("production Rust server", () => {
       password: "test-password",
     });
     const head = databaseVersion(join(directory, "server.sqlite"), vault.id);
-    const observers = await Promise.all(
-      Array.from({ length: 6 }, () => Probe.connect(`ws://127.0.0.1:${dataPort}`)),
-    );
-    const writer = await Probe.connect(`ws://127.0.0.1:${dataPort}`);
+    const observers: Probe[] = [];
+    let writer: Probe | undefined;
     try {
-      await Promise.all(observers.map((observer, index) => initializeFor(
-        observer,
-        burstSignin.token,
-        vault,
-        `Burst observer ${index}`,
-        head,
-        false,
-      )));
+      for (let index = 0; index < 6; index++) {
+        const observer = await Probe.connect(`ws://127.0.0.1:${dataPort}`);
+        observers.push(observer);
+        await initializeFor(
+          observer,
+          burstSignin.token,
+          vault,
+          `Burst observer ${index}`,
+          head,
+          false,
+        );
+      }
+      writer = await Probe.connect(`ws://127.0.0.1:${dataPort}`);
       await initializeFor(writer, burstSignin.token, vault, "Burst writer", head, false);
       writer.json(push("bounded-db-broadcast", "bounded-db-broadcast-hash", 0, 0));
       expect(await writer.nextJson()).toMatchObject({ op: "push", path: "bounded-db-broadcast" });
@@ -1163,7 +1313,7 @@ describe("production Rust server", () => {
       );
       expect(pongs).toEqual(observers.map(() => ({ op: "pong" })));
     } finally {
-      writer.socket.close();
+      writer?.socket.close();
       for (const observer of observers) observer.socket.close();
     }
   }, 15_000);
@@ -1188,6 +1338,17 @@ describe("production Rust server", () => {
       });
       const probe = await Probe.connect(`ws://127.0.0.1:${isolatedDataPort}`);
       await initializeFor(probe, signin.token, isolatedVault, "Reactor probe", 0, true);
+
+      const rejectedSlow = await openWrongOriginSlowControlRequest(isolatedControlPort);
+      try {
+        expect(await promiseWithTimeout(
+          rejectedSlow.response,
+          750,
+          "wrong-origin request was not rejected before its body arrived",
+        )).toContain(" 403 ");
+      } finally {
+        rejectedSlow.socket.destroy();
+      }
 
       const slowRequests = await Promise.all(
         Array.from({ length: 16 }, () => openSlowControlRequest(isolatedControlPort)),
@@ -1338,31 +1499,59 @@ describe("production Rust server", () => {
   test("bounds password-check concurrency without a globally exhaustible owner lockout", async () => {
     const limitedDirectory = await mkdtemp(join(tmpdir(), "blackglass-login-rate-"));
     const [limitedControlPort, limitedDataPort] = await Promise.all([freePort(), freePort()]);
-    const child = spawnRustServer(limitedDirectory, limitedControlPort, limitedDataPort);
+    const child = spawnRustServer(limitedDirectory, limitedControlPort, limitedDataPort, {
+      SELFHOST_TRUSTED_PROXY: "127.0.0.1",
+    });
     try {
       await waitForHealthAt(limitedControlPort, child);
       const burst = await Promise.all(Array.from({ length: 8 }, () =>
         postAt(limitedControlPort, "/user/signin", {
           email: "owner@example.test",
           password: "wrong",
-        })));
-      expect(burst.some((result) => result.error === "Try again later")).toBe(true);
+        }, { "x-forwarded-for": "198.51.100.10" })));
+      expect(burst.some((result) => result.error === "Too many sign-in attempts; try again later")).toBe(true);
       expect(burst.every((result) =>
-        result.error === "Try again later" || result.error === "Invalid email or password",
+        result.error === "Too many sign-in attempts; try again later" ||
+        result.error === "Try again later" ||
+        result.error === "Invalid email or password",
       )).toBe(true);
-      for (let attempt = 0; attempt < 12; attempt++) {
-        expect(await postAt(limitedControlPort, "/user/signin", {
-          email: "owner@example.test",
-          password: "wrong",
-        })).toEqual({ error: "Invalid email or password" });
-      }
       expect(await postAt(limitedControlPort, "/user/signin", {
         email: "owner@example.test",
         password: "test-password",
-      })).toMatchObject({
+      }, { "x-forwarded-for": "198.51.100.11" })).toMatchObject({
         email: "owner@example.test",
         license: null,
       });
+      expect(await postAt(limitedControlPort, "/user/signin", {
+        email: "owner@example.test",
+        password: "test-password",
+      }, { "x-forwarded-for": "198.51.100.11" })).toMatchObject({
+        email: "owner@example.test",
+      });
+
+      const unauthenticated: Probe[] = [];
+      try {
+        for (let index = 0; index < 4; index++) {
+          unauthenticated.push(await Probe.connect(
+            `ws://127.0.0.1:${limitedDataPort}`,
+            "app://obsidian.md",
+            { "X-Forwarded-For": "198.51.100.20" },
+          ));
+        }
+        await expectWebSocketRejected(
+          `ws://127.0.0.1:${limitedDataPort}`,
+          "app://obsidian.md",
+          { "X-Forwarded-For": "198.51.100.20" },
+        );
+        const otherSource = await Probe.connect(
+          `ws://127.0.0.1:${limitedDataPort}`,
+          "app://obsidian.md",
+          { "X-Forwarded-For": "198.51.100.21" },
+        );
+        otherSource.socket.close();
+      } finally {
+        for (const probe of unauthenticated) probe.socket.close();
+      }
     } finally {
       if (child.exitCode === null) child.kill("SIGTERM");
       await child.exited;
@@ -1427,7 +1616,7 @@ function spawnRustServer(serviceDirectory: string, serviceControlPort: number, s
   });
 }
 async function post(path: string, body: Record<string, unknown>) { return postAt(controlPort, path, body); }
-async function postAt(port: number, path: string, body: Record<string, unknown>) { const response = await fetch(`http://127.0.0.1:${port}${path}`, { method: "POST", headers: { "content-type": "application/json", origin: "app://obsidian.md" }, body: JSON.stringify(body) }); return response.json(); }
+async function postAt(port: number, path: string, body: Record<string, unknown>, extraHeaders: Record<string, string> = {}) { const response = await fetch(`http://127.0.0.1:${port}${path}`, { method: "POST", headers: { "content-type": "application/json", origin: "app://obsidian.md", ...extraHeaders }, body: JSON.stringify(body) }); return response.json(); }
 function metricValue(metrics: string, name: string): number { const line = metrics.split("\n").find((entry) => entry.startsWith(`${name} `)); if (!line) throw new Error(`missing metric: ${name}`); return Number(line.slice(name.length + 1)); }
 async function waitForHealthAt(port: number, child: ReturnType<typeof Bun.spawn>) { const deadline = Date.now() + 30_000; while (Date.now() < deadline) { if (child.exitCode !== null) throw new Error(`server exited early: ${await new Response(child.stderr as ReadableStream<Uint8Array>).text()}`); try { if ((await fetch(`http://127.0.0.1:${port}/health`)).ok) return; } catch {} await Bun.sleep(50); } throw new Error("Rust server did not become healthy"); }
 async function stagedParts(path: string) { return (await readdir(path)).filter((name) => name.endsWith(".part")); }
@@ -1462,18 +1651,47 @@ async function openSlowControlRequest(port: number) {
   return { socket, response };
 }
 
+async function openWrongOriginSlowControlRequest(port: number) {
+  const socket = createConnection({ host: "127.0.0.1", port });
+  let received = "";
+  let resolveResponse!: (value: string) => void;
+  let rejectResponse!: (error: Error) => void;
+  const response = new Promise<string>((resolve, reject) => {
+    resolveResponse = resolve;
+    rejectResponse = reject;
+  });
+  socket.on("data", (chunk) => {
+    received += chunk.toString();
+    if (received.includes("\r\n\r\n")) resolveResponse(received);
+  });
+  socket.on("error", rejectResponse);
+  await new Promise<void>((resolveConnected, rejectConnected) => {
+    socket.once("connect", resolveConnected);
+    socket.once("error", rejectConnected);
+  });
+  socket.write(
+    "POST /user/info HTTP/1.1\r\n" +
+      `Host: 127.0.0.1:${port}\r\n` +
+      "Content-Type: application/json\r\n" +
+      "Origin: https://evil.example\r\n" +
+      "Content-Length: 65536\r\n" +
+      "Connection: keep-alive\r\n\r\n{",
+  );
+  return { socket, response };
+}
+
 function databaseVersion(path: string, vaultId: string): number { const database = new Database(path, { readonly: true }); try { return (database.query("SELECT version FROM vaults WHERE id=?").get(vaultId) as { version: number }).version; } finally { database.close(); } }
 function expireSession(path: string, sessionToken: string) { const database = new Database(path); try { const hash = createHash("sha256").update(sessionToken).digest("hex"); expect(database.query("UPDATE sessions SET expires_at=0 WHERE token_hash=?").run(hash).changes).toBe(1); } finally { database.close(); } }
 async function promiseWithTimeout<T>(promise: Promise<T>, milliseconds: number, message: string): Promise<T> { return Promise.race([promise, new Promise<T>((_, reject) => setTimeout(() => reject(new Error(message)), milliseconds))]); }
 async function waitForClose(probe: Probe, milliseconds: number) { return promiseWithTimeout(probe.closed, milliseconds, "websocket did not close"); }
-function webSocketWithOrigin(url: string, origin: string) { return new WebSocket(url, { headers: { Origin: origin } } as unknown as string[]); }
-async function expectWebSocketRejected(url: string, origin: string | null) { await new Promise<void>((resolveRejected, reject) => { const socket = origin === null ? new WebSocket(url) : webSocketWithOrigin(url, origin); const timer = setTimeout(() => { socket.close(); reject(new Error("websocket rejection timed out")); }, 2_000); let opened = false; socket.addEventListener("open", () => { opened = true; clearTimeout(timer); socket.close(); reject(new Error("websocket unexpectedly opened")); }, { once: true }); socket.addEventListener("error", () => { if (!opened) { clearTimeout(timer); resolveRejected(); } }, { once: true }); socket.addEventListener("close", () => { if (!opened) { clearTimeout(timer); resolveRejected(); } }, { once: true }); }); }
+function webSocketWithOrigin(url: string, origin: string, extraHeaders: Record<string, string> = {}) { return new WebSocket(url, { headers: { Origin: origin, ...extraHeaders } } as unknown as string[]); }
+async function expectWebSocketRejected(url: string, origin: string | null, extraHeaders: Record<string, string> = {}) { await new Promise<void>((resolveRejected, reject) => { const socket = origin === null ? new WebSocket(url, { headers: extraHeaders } as unknown as string[]) : webSocketWithOrigin(url, origin, extraHeaders); const timer = setTimeout(() => { socket.close(); reject(new Error("websocket rejection timed out")); }, 2_000); let opened = false; socket.addEventListener("open", () => { opened = true; clearTimeout(timer); socket.close(); reject(new Error("websocket unexpectedly opened")); }, { once: true }); socket.addEventListener("error", () => { if (!opened) { clearTimeout(timer); resolveRejected(); } }, { once: true }); socket.addEventListener("close", () => { if (!opened) { clearTimeout(timer); resolveRejected(); } }, { once: true }); }); }
 
 class Probe {
   private queue: unknown[] = []; private waiters: Array<(v: unknown) => void> = [];
   readonly closed: Promise<{ code: number; reason: string }>;
   private constructor(readonly socket: WebSocket) { this.closed = new Promise((resolveClosed) => socket.addEventListener("close", (event) => resolveClosed({ code: event.code, reason: event.reason }), { once: true })); socket.binaryType = "arraybuffer"; socket.addEventListener("message", (e) => { const v = typeof e.data === "string" ? JSON.parse(e.data) : e.data; const waiter = this.waiters.shift(); waiter ? waiter(v) : this.queue.push(v); }); }
-  static connect(url: string, origin = "app://obsidian.md"): Promise<Probe> { return new Promise((resolve, reject) => { const ws = webSocketWithOrigin(url, origin); sockets.push(ws); const probe = new Probe(ws); ws.addEventListener("open", () => resolve(probe), { once: true }); ws.addEventListener("error", () => reject(new Error("websocket failed")), { once: true }); }); }
+  static connect(url: string, origin = "app://obsidian.md", extraHeaders: Record<string, string> = {}): Promise<Probe> { return new Promise((resolve, reject) => { const ws = webSocketWithOrigin(url, origin, extraHeaders); sockets.push(ws); const probe = new Probe(ws); ws.addEventListener("open", () => resolve(probe), { once: true }); ws.addEventListener("error", () => reject(new Error("websocket failed")), { once: true }); }); }
   json(v: Record<string, unknown>) { this.socket.send(JSON.stringify(v)); }
   async nextJson(): Promise<any> { const value = await this.next(); if (value instanceof ArrayBuffer) throw new Error("expected JSON"); return value; }
   async nextBinary(): Promise<ArrayBuffer> { const value = await this.next(); if (!(value instanceof ArrayBuffer)) throw new Error(`expected binary: ${JSON.stringify(value)}`); return value; }

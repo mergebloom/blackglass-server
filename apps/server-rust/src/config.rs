@@ -8,6 +8,7 @@ use std::{
 
 pub(crate) const MAX_WS_CONNECTIONS_LIMIT: usize = 16;
 pub(crate) const DEFAULT_MAX_WS_CONNECTIONS: usize = 16;
+pub(crate) const MAX_CONCURRENT_UPLOADS_LIMIT: usize = 4;
 
 #[derive(Clone, Debug)]
 pub struct Config {
@@ -25,6 +26,7 @@ pub struct Config {
     pub allowed_origins: Vec<String>,
     pub max_concurrent_uploads: usize,
     pub max_ws_connections: usize,
+    pub trusted_proxy: Option<IpAddr>,
     pub json_logs: bool,
 }
 
@@ -40,6 +42,10 @@ impl Config {
             Some(_) => bail!("SELFHOST_ACKNOWLEDGE_EXTERNAL_BIND must be exactly 1 when set"),
         };
         validate_bind_host(bind_host, external_bind_acknowledged)?;
+        let allow_plaintext_password = plaintext_password_allowed(
+            bind_host,
+            value("SELFHOST_ALLOW_PLAINTEXT_PASSWORD").as_deref(),
+        )?;
         let control_port = number("SELFHOST_CONTROL_PORT", 3000u16)?;
         let data_port = number("SELFHOST_DATA_PORT", 3003u16)?;
         let database_path = PathBuf::from(
@@ -54,12 +60,12 @@ impl Config {
             });
         let password_hash = match value("SELFHOST_PASSWORD_HASH") {
             Some(hash) => hash,
-            None if value("SELFHOST_ALLOW_PLAINTEXT_PASSWORD").as_deref() == Some("1") => {
+            None if allow_plaintext_password => {
                 let password = required("SELFHOST_PASSWORD")?;
                 crate::auth::hash_password(&password)?
             }
             None => bail!(
-                "SELFHOST_PASSWORD_HASH is required (use `hash-password`; plaintext is allowed only with SELFHOST_ALLOW_PLAINTEXT_PASSWORD=1)"
+                "SELFHOST_PASSWORD_HASH is required (use `hash-password`; the plaintext override is loopback-only test convenience)"
             ),
         };
         if !crate::auth::password_hash_is_production_grade(&password_hash) {
@@ -79,9 +85,7 @@ impl Config {
             bail!("SELFHOST_SESSION_TTL_SECONDS must be between 300 seconds and 365 days");
         }
         let max_concurrent_uploads = number("SELFHOST_MAX_CONCURRENT_UPLOADS", 4usize)?;
-        if !(1..=64).contains(&max_concurrent_uploads) {
-            bail!("SELFHOST_MAX_CONCURRENT_UPLOADS must be between 1 and 64");
-        }
+        validate_concurrent_uploads(max_concurrent_uploads)?;
         let max_ws_connections = number("SELFHOST_MAX_WS_CONNECTIONS", DEFAULT_MAX_WS_CONNECTIONS)?;
         if !(1..=MAX_WS_CONNECTIONS_LIMIT).contains(&max_ws_connections) {
             bail!("SELFHOST_MAX_WS_CONNECTIONS must be between 1 and {MAX_WS_CONNECTIONS_LIMIT}");
@@ -99,6 +103,17 @@ impl Config {
         };
         let public_data_host =
             resolve_public_data_host(bind_host, data_port, value("SELFHOST_DATA_HOST"))?;
+        let trusted_proxy = value("SELFHOST_TRUSTED_PROXY")
+            .map(|value| {
+                let address = value
+                    .parse::<IpAddr>()
+                    .context("SELFHOST_TRUSTED_PROXY must be one exact IP address")?;
+                if !private_or_loopback(address) {
+                    bail!("SELFHOST_TRUSTED_PROXY must be a loopback or private IP address")
+                }
+                Ok(address)
+            })
+            .transpose()?;
         Ok(Self {
             bind_host,
             control_port,
@@ -114,6 +129,7 @@ impl Config {
             allowed_origins,
             max_concurrent_uploads,
             max_ws_connections,
+            trusted_proxy,
             json_logs: value("SELFHOST_LOG_FORMAT").as_deref() != Some("pretty"),
         })
     }
@@ -135,8 +151,16 @@ impl Config {
             allowed_origins: vec!["app://obsidian.md".into()],
             max_concurrent_uploads: 2,
             max_ws_connections: DEFAULT_MAX_WS_CONNECTIONS,
+            trusted_proxy: None,
             json_logs: false,
         })
+    }
+}
+
+fn private_or_loopback(address: IpAddr) -> bool {
+    match address {
+        IpAddr::V4(address) => address.is_loopback() || address.is_private(),
+        IpAddr::V6(address) => address.is_loopback() || (address.segments()[0] & 0xfe00) == 0xfc00,
     }
 }
 
@@ -154,6 +178,26 @@ fn validate_bind_host(bind_host: IpAddr, external_bind_acknowledged: bool) -> Re
     if !external_bind_acknowledged {
         bail!(
             "binding outside loopback requires SELFHOST_ACKNOWLEDGE_EXTERNAL_BIND=1 and a private container network with a TLS ingress boundary"
+        )
+    }
+    Ok(())
+}
+
+fn plaintext_password_allowed(bind_host: IpAddr, configured: Option<&str>) -> Result<bool> {
+    match configured {
+        None => Ok(false),
+        Some("1") if bind_host.is_loopback() => Ok(true),
+        Some("1") => bail!(
+            "SELFHOST_ALLOW_PLAINTEXT_PASSWORD=1 is permitted only with a loopback SELFHOST_BIND_HOST"
+        ),
+        Some(_) => bail!("SELFHOST_ALLOW_PLAINTEXT_PASSWORD must be exactly 1 when set"),
+    }
+}
+
+fn validate_concurrent_uploads(value: usize) -> Result<()> {
+    if !(1..=MAX_CONCURRENT_UPLOADS_LIMIT).contains(&value) {
+        bail!(
+            "SELFHOST_MAX_CONCURRENT_UPLOADS must be between 1 and {MAX_CONCURRENT_UPLOADS_LIMIT}"
         )
     }
     Ok(())
@@ -336,6 +380,26 @@ fn valid_port(value: &str) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn trusted_proxy_addresses_are_private_or_loopback_only() {
+        for accepted in [
+            "127.0.0.1",
+            "10.0.0.1",
+            "172.16.0.1",
+            "192.168.1.1",
+            "::1",
+            "fd00::1",
+        ] {
+            assert!(private_or_loopback(accepted.parse().unwrap()), "{accepted}");
+        }
+        for rejected in ["8.8.8.8", "1.1.1.1", "2001:4860:4860::8888"] {
+            assert!(
+                !private_or_loopback(rejected.parse().unwrap()),
+                "{rejected}"
+            );
+        }
+    }
     #[test]
     fn test_configuration_is_loopback_and_isolated() {
         let dir = tempfile::tempdir().unwrap();
@@ -354,6 +418,37 @@ mod tests {
         assert!(validate_bind_host("0.0.0.0".parse().unwrap(), true).is_ok());
         assert!(validate_bind_host("::".parse().unwrap(), true).is_ok());
         assert!(validate_bind_host("192.0.2.10".parse().unwrap(), true).is_err());
+    }
+
+    #[test]
+    fn plaintext_password_override_is_loopback_only() {
+        for bind in ["127.0.0.1", "::1"] {
+            assert!(
+                plaintext_password_allowed(bind.parse().unwrap(), Some("1")).unwrap(),
+                "loopback override rejected for {bind}"
+            );
+        }
+        for bind in ["0.0.0.0", "::", "192.0.2.10"] {
+            assert!(
+                plaintext_password_allowed(bind.parse().unwrap(), Some("1")).is_err(),
+                "external plaintext override passed for {bind}"
+            );
+        }
+        assert!(!plaintext_password_allowed("127.0.0.1".parse().unwrap(), None).unwrap());
+        assert!(plaintext_password_allowed("127.0.0.1".parse().unwrap(), Some("true")).is_err());
+    }
+
+    #[test]
+    fn upload_concurrency_cannot_exceed_the_qualified_envelope() {
+        for value in 1..=MAX_CONCURRENT_UPLOADS_LIMIT {
+            validate_concurrent_uploads(value).unwrap();
+        }
+        for value in [0, MAX_CONCURRENT_UPLOADS_LIMIT + 1, 64] {
+            assert!(
+                validate_concurrent_uploads(value).is_err(),
+                "passed: {value}"
+            );
+        }
     }
 
     #[test]

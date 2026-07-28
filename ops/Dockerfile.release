@@ -1,8 +1,8 @@
-# syntax=docker/dockerfile:1.7
+# syntax=docker/dockerfile:1.24.0@sha256:87999aa3d42bdc6bea60565083ee17e86d1f3339802f543c0d03998580f9cb89
 
 ARG RUST_BUILDER="rust:1.92.0-alpine3.22@sha256:0fe89ba9d67dc20a4ff50206d25c88606919cb611b41dd0285dfe3cbb02d69de"
 
-FROM --platform=$TARGETPLATFORM ${RUST_BUILDER} AS build
+FROM ${RUST_BUILDER} AS build
 
 ARG RUST_BUILDER
 ARG SOURCE_REVISION=unknown
@@ -30,6 +30,7 @@ RUN --mount=type=cache,id=blackglass-cargo-registry-$TARGETARCH,target=/usr/loca
     cargo fetch --locked --manifest-path apps/server-rust/Cargo.toml
 
 COPY apps/server-rust/src ./apps/server-rust/src
+COPY ops/blackglass-server.service ./ops/blackglass-server.service
 COPY LICENSE /metadata/LICENSE
 COPY ops/release/INSTALL.md /metadata/INSTALL.md
 COPY ops/blackglass-server.env.example /metadata/blackglass-server.env.example
@@ -137,8 +138,8 @@ LABEL org.opencontainers.image.title="Blackglass Server" \
 COPY --from=build --chmod=0555 /target/release/blackglass-server /usr/local/bin/blackglass-server
 COPY --from=build --chown=65532:65532 /runtime-state/ /var/lib/blackglass-server/
 
-ENV SELFHOST_BIND_HOST=0.0.0.0 \
-    SELFHOST_ACKNOWLEDGE_EXTERNAL_BIND=1 \
+ENV PATH=/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin \
+    SELFHOST_BIND_HOST=127.0.0.1 \
     SELFHOST_DATABASE=/var/lib/blackglass-server/server.sqlite \
     SELFHOST_STAGING_DIR=/var/lib/blackglass-server/uploads
 

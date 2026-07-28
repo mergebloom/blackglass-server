@@ -73,11 +73,15 @@ mkdir -p "$dist_dir"
 temporary=$(mktemp -d "${TMPDIR:-/tmp}/blackglass-release.XXXXXX")
 image="blackglass-server-smoke:${version}-${target}-$$"
 container=
+publish_staging=
 cleanup() {
     if test -n "$container"; then
         docker rm -f "$container" >/dev/null 2>&1 || true
     fi
     docker image rm -f "$image" >/dev/null 2>&1 || true
+    if test -n "$publish_staging"; then
+        rm -rf "$publish_staging"
+    fi
     rm -rf "$temporary"
 }
 trap cleanup EXIT HUP INT TERM
@@ -97,14 +101,15 @@ checksum="$archive.sha256"
 raw_binary_name="blackglass-server-v${version}-${target}"
 raw_binary="$dist_dir/$raw_binary_name"
 raw_checksum="$raw_binary.sha256"
-test -f "$temporary/out/$archive_name"
-test -f "$temporary/out/$archive_name.sha256"
-test -f "$temporary/out/$raw_binary_name"
-test -f "$temporary/out/$raw_binary_name.sha256"
-cp "$temporary/out/$archive_name" "$archive"
-cp "$temporary/out/$archive_name.sha256" "$checksum"
-cp "$temporary/out/$raw_binary_name" "$raw_binary"
-cp "$temporary/out/$raw_binary_name.sha256" "$raw_checksum"
+staged_archive="$temporary/out/$archive_name"
+staged_checksum="$staged_archive.sha256"
+staged_raw_binary="$temporary/out/$raw_binary_name"
+staged_raw_checksum="$staged_raw_binary.sha256"
+test -f "$staged_archive"
+test -f "$staged_checksum"
+test -f "$staged_raw_binary"
+test -f "$staged_raw_checksum"
+"$project_root/ops/verify-linux-release.sh" "$target" "$staged_archive" "$staged_raw_binary"
 
 docker buildx build \
     --platform "$platform" \
@@ -132,23 +137,24 @@ password_hash=$(printf '%s\n' release-runtime-password | docker run --rm -i \
     "$image" hash-password)
 container=$(docker run --detach --rm \
     --platform "$platform" \
+    --network host \
     --stop-timeout 30 \
-    --publish 127.0.0.1::3000 \
-    --publish 127.0.0.1::3003 \
     --read-only \
     --memory 256m \
     --pids-limit 64 \
+    --ulimit nofile=4096:4096 \
     --tmpfs /tmp:rw,noexec,nosuid,nodev,size=32m,mode=1777 \
     --cap-drop ALL \
     --security-opt no-new-privileges \
     --env SELFHOST_EMAIL=release-runtime@example.test \
+    --env SELFHOST_BIND_HOST=127.0.0.1 \
+    --env SELFHOST_ACKNOWLEDGE_EXTERNAL_BIND= \
+    --env SELFHOST_TRUSTED_PROXY=127.0.0.1 \
     --env SELFHOST_DATA_HOST=sync-data.example.test \
     --env "SELFHOST_PASSWORD_HASH=$password_hash" \
     "$image" serve)
-control_address=$(docker port "$container" 3000/tcp)
-data_address=$(docker port "$container" 3003/tcp)
-test -n "$control_address"
-test -n "$data_address"
+control_address=127.0.0.1:3000
+data_address=127.0.0.1:3003
 started=0
 for _attempt in 1 2 3 4 5 6 7 8 9 10; do
     if curl --fail --silent "http://$control_address/health" > "$temporary/container-health.json" \
@@ -161,8 +167,36 @@ for _attempt in 1 2 3 4 5 6 7 8 9 10; do
 done
 test "$started" -eq 1
 grep -q '"service":"blackglass-server"' "$temporary/container-health.json"
-docker stop --time 30 "$container" >/dev/null
+docker stop --timeout 30 "$container" >/dev/null
 container=
 
+for destination in "$archive" "$checksum" "$raw_binary" "$raw_checksum"; do
+    if test -e "$destination" || test -L "$destination"; then
+        echo "refusing to overwrite an existing release artifact: $destination" >&2
+        exit 1
+    fi
+done
+
+# Stage on the destination filesystem, then use no-overwrite hard links so a
+# failed build can never replace a previously qualified release artifact.
+publish_staging=$(mktemp -d "$dist_dir/.blackglass-publish.XXXXXX")
+cp "$staged_archive" "$publish_staging/$archive_name"
+cp "$staged_checksum" "$publish_staging/$archive_name.sha256"
+cp "$staged_raw_binary" "$publish_staging/$raw_binary_name"
+cp "$staged_raw_checksum" "$publish_staging/$raw_binary_name.sha256"
+for name in "$archive_name" "$archive_name.sha256" "$raw_binary_name" "$raw_binary_name.sha256"; do
+    if ! ln "$publish_staging/$name" "$dist_dir/$name"; then
+        for candidate in "$archive_name" "$archive_name.sha256" "$raw_binary_name" "$raw_binary_name.sha256"; do
+            if test -e "$dist_dir/$candidate" \
+                && test "$dist_dir/$candidate" -ef "$publish_staging/$candidate"; then
+                rm -f "$dist_dir/$candidate"
+            fi
+        done
+        echo "release publication raced with another writer; no artifacts were retained" >&2
+        exit 1
+    fi
+done
+rm -rf "$publish_staging"
+publish_staging=
 "$project_root/ops/verify-linux-release.sh" "$target" "$archive" "$raw_binary"
 echo "release ready: $archive and $raw_binary"

@@ -1,10 +1,16 @@
 sync-control.example.com {
-    encode zstd gzip
-    @operations path /health /ready /metrics
-    respond @operations 404
-    reverse_proxy 127.0.0.1:3000
+	encode zstd gzip
+	@operations path /health /ready /metrics
+	respond @operations 404
+	reverse_proxy 127.0.0.1:3000 {
+		# Overwrite rather than append so the server can trust exactly one
+		# client address from the explicitly configured loopback proxy.
+		header_up X-Forwarded-For {remote_host}
+	}
 }
 
 sync-data.example.com {
-    reverse_proxy 127.0.0.1:3003
+	reverse_proxy 127.0.0.1:3003 {
+		header_up X-Forwarded-For {remote_host}
+	}
 }

@@ -5,6 +5,7 @@ use crate::{
 use anyhow::{Context, Result, bail};
 use rusqlite::{Connection, OptionalExtension, params, types::Value};
 use std::{
+    collections::HashSet,
     fs::{File, OpenOptions},
     io,
     path::{Path, PathBuf},
@@ -13,10 +14,12 @@ use std::{
 };
 use uuid::Uuid;
 
-const CURRENT_SCHEMA_VERSION: i64 = 3;
-const SUPPORTED_MIGRATIONS: &[i64] = &[1, 2, 3];
+const CURRENT_SCHEMA_VERSION: i64 = 4;
+const SUPPORTED_MIGRATIONS: &[i64] = &[1, 2, 3, 4];
 pub(crate) const MAX_VAULTS: i64 = 100;
 pub(crate) const MAX_JS_SAFE_INTEGER: i64 = 9_007_199_254_740_991;
+const MAX_RETIRED_VAULTS: i64 = 65_536;
+const MAX_SESSIONS: i64 = 1024;
 
 #[derive(Clone)]
 pub struct Db(Arc<Mutex<Connection>>);
@@ -117,7 +120,24 @@ impl Db {
         let token = auth::new_token();
         let hash = auth::token_hash(&token);
         let now = now_ms();
-        self.with(|c| { c.execute("DELETE FROM sessions WHERE expires_at <= ? OR revoked_at IS NOT NULL", [now])?; c.execute("INSERT INTO sessions(token_hash, created_at, expires_at, revoked_at) VALUES(?,?,?,NULL)", params![hash, now, now + ttl_secs * 1000])?; Ok(()) })?;
+        self.with(|c| {
+            let transaction = c.transaction()?;
+            transaction.execute(
+                "DELETE FROM sessions WHERE expires_at <= ? OR revoked_at IS NOT NULL",
+                [now],
+            )?;
+            let count: i64 =
+                transaction.query_row("SELECT COUNT(*) FROM sessions", [], |row| row.get(0))?;
+            if count >= MAX_SESSIONS {
+                bail!("active session limit reached")
+            }
+            transaction.execute(
+                "INSERT INTO sessions(token_hash, created_at, expires_at, revoked_at) VALUES(?,?,?,NULL)",
+                params![hash, now, now + ttl_secs * 1000],
+            )?;
+            transaction.commit()?;
+            Ok(())
+        })?;
         Ok(token)
     }
 
@@ -152,6 +172,16 @@ impl Db {
             )? == 1)
         })
         .unwrap_or(false)
+    }
+
+    pub fn is_retired_vault(&self, vault: &str) -> Result<bool> {
+        self.with(|connection| {
+            Ok(connection.query_row(
+                "SELECT EXISTS(SELECT 1 FROM retired_vaults WHERE id=?)",
+                [vault],
+                |row| row.get::<_, i64>(0),
+            )? == 1)
+        })
     }
 
     pub fn revoke_session(&self, token: &str) -> Result<()> {
@@ -218,7 +248,21 @@ impl Db {
         self.with(|c| Ok(c.execute("UPDATE vaults SET name=? WHERE id=?", params![name, id])? == 1))
     }
     pub fn delete_vault(&self, id: &str) -> Result<bool> {
-        self.with(|c| Ok(c.execute("DELETE FROM vaults WHERE id=?", [id])? == 1))
+        self.with(|c| {
+            let tx = c.transaction()?;
+            let exists = tx.query_row(
+                "SELECT EXISTS(SELECT 1 FROM vaults WHERE id=?)",
+                [id],
+                |row| row.get::<_, i64>(0),
+            )? == 1;
+            if !exists {
+                return Ok(false);
+            }
+            retire_vault_identity(&tx, id, now_ms())?;
+            tx.execute("DELETE FROM vaults WHERE id=?", [id])?;
+            tx.commit()?;
+            Ok(true)
+        })
     }
     pub fn migrate_vault(&self, source_id: &str, replacement: &Vault) -> Result<bool> {
         self.with(|c| {
@@ -247,6 +291,7 @@ impl Db {
                     replacement.password
                 ],
             )?;
+            retire_vault_identity(&tx, source_id, now_ms())?;
             tx.execute("DELETE FROM vaults WHERE id=?", [source_id])?;
             tx.commit()?;
             Ok(true)
@@ -561,6 +606,7 @@ fn migrate(c: &Connection) -> Result<()> {
             1 => MIGRATION_1_SQL,
             2 => MIGRATION_2_SQL,
             3 => MIGRATION_3_SQL,
+            4 => MIGRATION_4_SQL,
             _ => bail!("no implementation for database migration {version}"),
         };
         apply_migration(c, version, sql)?;
@@ -582,10 +628,17 @@ const MIGRATION_2_SQL: &str = "
     CREATE TABLE sessions(token_hash TEXT PRIMARY KEY,created_at INTEGER NOT NULL,expires_at INTEGER NOT NULL,revoked_at INTEGER);
     CREATE INDEX sessions_expiry ON sessions(expires_at);
 ";
-// Version 3 marks the recovery epoch contract. Copy-first migration to this
-// version rotates every vault identity after schema application, forcing stale
-// clients to reselect and take a fresh snapshot.
+// Version 3 shipped without schema objects. Never rewrite applied migrations.
 const MIGRATION_3_SQL: &str = "";
+// Version 4 persists bounded recovery markers so an exact client holding a
+// retired vault identity receives the renderer's required `Vault not found`
+// signal even though restore also invalidates every bearer session.
+const MIGRATION_4_SQL: &str = "
+    CREATE TABLE retired_vaults(
+        id TEXT PRIMARY KEY,
+        retired_at INTEGER NOT NULL
+    );
+";
 
 fn apply_migration(c: &Connection, version: i64, sql: &str) -> Result<()> {
     let tx = c.unchecked_transaction()?;
@@ -663,8 +716,18 @@ fn verify_schema_at_version(c: &Connection, version: i64) -> Result<()> {
             verify_foreign_keys(c)?;
             verify_logical_invariants(c, false)?;
         }
-        2 | 3 => {
+        2 => {
             verify_blackglass_schema(c)?;
+            verify_foreign_keys(c)?;
+            verify_logical_invariants(c, true)?;
+        }
+        3 => {
+            verify_blackglass_schema(c)?;
+            verify_foreign_keys(c)?;
+            verify_logical_invariants(c, true)?;
+        }
+        4 => {
+            verify_v4_schema(c)?;
             verify_foreign_keys(c)?;
             verify_logical_invariants(c, true)?;
         }
@@ -701,9 +764,16 @@ pub fn restore_database(source: &Path, destination: &Path) -> Result<()> {
 }
 
 pub fn migrate_versioned_database(source: &Path, destination: &Path) -> Result<()> {
+    let _state_lock = crate::server::acquire_database_lock(source)?;
     let source = open_existing_read_only(source, "versioned migration source")?;
     verify_sqlite_integrity(&source).context("versioned migration source validation failed")?;
-    verify_recorded_schema(&source).context("versioned migration source validation failed")?;
+    let source_version =
+        verify_recorded_schema(&source).context("versioned migration source validation failed")?;
+    if source_version == CURRENT_SCHEMA_VERSION {
+        bail!(
+            "database is already at schema version {CURRENT_SCHEMA_VERSION}; use `backup` for a byte-preserving copy or `restore` to establish a new recovery epoch"
+        )
+    }
 
     with_new_database(destination, "versioned migration destination", |target| {
         run_online_backup(&source, target)?;
@@ -711,7 +781,9 @@ pub fn migrate_versioned_database(source: &Path, destination: &Path) -> Result<(
         verify_recorded_schema(target).context("copied migration source validation failed")?;
         target.pragma_update(None, "foreign_keys", "ON")?;
         migrate(target)?;
-        rotate_recovery_epoch(target)?;
+        if source_version < 3 {
+            rotate_recovery_epoch(target)?;
+        }
         set_portable_journal(target)?;
         verify_connection(target)
     })
@@ -754,13 +826,43 @@ fn rotate_recovery_epoch(connection: &mut Connection) -> Result<usize> {
             .query_map([], |row| row.get::<_, String>(0))?
             .collect::<rusqlite::Result<Vec<_>>>()?
     };
+    let mut reserved = {
+        let mut query =
+            connection.prepare("SELECT id FROM vaults UNION SELECT id FROM retired_vaults")?;
+        query
+            .query_map([], |row| row.get::<_, String>(0))?
+            .collect::<rusqlite::Result<HashSet<_>>>()?
+    };
     let replacements = vault_ids
         .into_iter()
-        .map(|old_id| (old_id, Uuid::new_v4().to_string()))
+        .map(|old_id| {
+            let new_id = loop {
+                let candidate = Uuid::new_v4().to_string();
+                if reserved.insert(candidate.clone()) {
+                    break candidate;
+                }
+            };
+            (old_id, new_id)
+        })
         .collect::<Vec<_>>();
 
     let transaction = connection.transaction()?;
+    let retirement_time = now_ms();
+    let retained_old_vaults = (MAX_RETIRED_VAULTS - replacements.len() as i64).max(0);
+    transaction.execute(
+        "DELETE FROM retired_vaults
+          WHERE id IN (
+              SELECT id FROM retired_vaults
+               ORDER BY retired_at DESC,id DESC
+               LIMIT -1 OFFSET ?
+          )",
+        [retained_old_vaults],
+    )?;
     for (old_id, new_id) in &replacements {
+        transaction.execute(
+            "INSERT OR REPLACE INTO retired_vaults(id,retired_at) VALUES(?,?)",
+            params![old_id, retirement_time],
+        )?;
         transaction.execute(
             "INSERT INTO vaults(
                  id,name,keyhash,salt,host,region,encryption_version,size,created,password,version
@@ -778,6 +880,29 @@ fn rotate_recovery_epoch(connection: &mut Connection) -> Result<usize> {
     transaction.execute("DELETE FROM sessions", [])?;
     transaction.commit()?;
     Ok(replacements.len())
+}
+
+fn retire_vault_identity(
+    transaction: &rusqlite::Transaction<'_>,
+    vault_id: &str,
+    retired_at: i64,
+) -> Result<()> {
+    // Prune before inserting so a clock rollback or a future-dated marker
+    // cannot push the table over its verified hard bound.
+    transaction.execute(
+        "DELETE FROM retired_vaults
+          WHERE id IN (
+              SELECT id FROM retired_vaults
+               ORDER BY retired_at DESC,id DESC
+               LIMIT -1 OFFSET ?
+          )",
+        [MAX_RETIRED_VAULTS - 1],
+    )?;
+    transaction.execute(
+        "INSERT OR REPLACE INTO retired_vaults(id,retired_at) VALUES(?,?)",
+        params![vault_id, retired_at],
+    )?;
+    Ok(())
 }
 
 fn run_online_backup(source: &Connection, destination: &mut Connection) -> Result<()> {
@@ -932,6 +1057,56 @@ pub fn rebind_data_host(path: &Path, new_host: &str, backup: &Path) -> Result<us
     Ok(changed)
 }
 
+pub fn purge_deleted_history(path: &Path, vault: &str, backup: &Path) -> Result<usize> {
+    if vault.is_empty() || vault.len() > 64 {
+        bail!("vault ID must be between 1 and 64 bytes")
+    }
+    let _state_lock = crate::server::acquire_database_lock(path)?;
+    backup_database(path, backup).context("pre-purge backup failed")?;
+    let mut connection = open_existing_read_write(path, "deleted-history purge database")?;
+    connection.busy_timeout(std::time::Duration::from_secs(5))?;
+    connection.pragma_update(None, "foreign_keys", "ON")?;
+    verify_connection(&connection).context("deleted-history purge database validation failed")?;
+    let transaction = connection.transaction()?;
+    let exists: i64 = transaction.query_row(
+        "SELECT EXISTS(SELECT 1 FROM vaults WHERE id=?)",
+        [vault],
+        |row| row.get(0),
+    )?;
+    if exists != 1 {
+        bail!("vault not found")
+    }
+    let changed = transaction.execute(
+        "WITH heads(path,uid) AS (
+             SELECT history.path,MAX(history.uid)
+               FROM revisions history
+              WHERE history.vault_id=?
+              GROUP BY history.path
+         ), deleted_heads(path,uid) AS (
+             SELECT heads.path,heads.uid
+               FROM heads
+               JOIN revisions head ON head.uid=heads.uid
+              WHERE head.deleted=1
+         )
+         DELETE FROM revisions
+          WHERE vault_id=?
+            AND EXISTS(
+                SELECT 1 FROM deleted_heads
+                 WHERE deleted_heads.path=revisions.path
+                   AND deleted_heads.uid<>revisions.uid
+            )",
+        params![vault, vault],
+    )?;
+    let version: i64 =
+        transaction.query_row("SELECT version FROM vaults WHERE id=?", [vault], |row| {
+            row.get(0)
+        })?;
+    refresh_vault(&transaction, vault, version)?;
+    transaction.commit()?;
+    verify_connection(&connection).context("post-purge database validation failed")?;
+    Ok(changed)
+}
+
 fn verify_v1_schema(c: &Connection) -> Result<()> {
     verify_schema_objects(
         c,
@@ -993,23 +1168,40 @@ fn verify_v1_schema(c: &Connection) -> Result<()> {
 }
 
 fn verify_blackglass_schema(c: &Connection) -> Result<()> {
-    verify_schema_objects(
-        c,
-        &[
-            ("index", "revisions_vault_path", "revisions"),
-            ("index", "revisions_vault_uid", "revisions"),
-            ("index", "sessions_expiry", "sessions"),
-            ("index", "sqlite_autoindex_sessions_1", "sessions"),
-            ("index", "sqlite_autoindex_vaults_1", "vaults"),
-            ("table", "revision_content", "revision_content"),
-            ("table", "revisions", "revisions"),
-            ("table", "schema_migrations", "schema_migrations"),
-            ("table", "sessions", "sessions"),
-            ("table", "sqlite_sequence", "sqlite_sequence"),
-            ("table", "vaults", "vaults"),
-        ],
-        "Blackglass",
-    )?;
+    verify_blackglass_schema_with_recovery_epoch(c, false)
+}
+
+fn verify_v4_schema(c: &Connection) -> Result<()> {
+    verify_blackglass_schema_with_recovery_epoch(c, true)
+}
+
+fn verify_blackglass_schema_with_recovery_epoch(
+    c: &Connection,
+    recovery_epoch: bool,
+) -> Result<()> {
+    let mut objects = vec![
+        ("index", "revisions_vault_path", "revisions"),
+        ("index", "revisions_vault_uid", "revisions"),
+        ("index", "sessions_expiry", "sessions"),
+        ("index", "sqlite_autoindex_sessions_1", "sessions"),
+        ("index", "sqlite_autoindex_vaults_1", "vaults"),
+        ("table", "revision_content", "revision_content"),
+        ("table", "revisions", "revisions"),
+        ("table", "schema_migrations", "schema_migrations"),
+        ("table", "sessions", "sessions"),
+        ("table", "sqlite_sequence", "sqlite_sequence"),
+        ("table", "vaults", "vaults"),
+    ];
+    if recovery_epoch {
+        objects.push((
+            "index",
+            "sqlite_autoindex_retired_vaults_1",
+            "retired_vaults",
+        ));
+        objects.push(("table", "retired_vaults", "retired_vaults"));
+        objects.sort_unstable();
+    }
+    verify_schema_objects(c, &objects, "Blackglass")?;
     verify_exact_table(
         c,
         "schema_migrations",
@@ -1025,6 +1217,9 @@ fn verify_blackglass_schema(c: &Connection) -> Result<()> {
         "Blackglass",
     )?;
     verify_exact_table(c, "sessions", SESSION_COLUMNS, "Blackglass")?;
+    if recovery_epoch {
+        verify_exact_table(c, "retired_vaults", RETIRED_VAULT_COLUMNS, "Blackglass")?;
+    }
     verify_exact_table(c, "sqlite_sequence", SQLITE_SEQUENCE_COLUMNS, "Blackglass")?;
 
     verify_exact_indexes(c, "schema_migrations", &[], "Blackglass")?;
@@ -1056,6 +1251,17 @@ fn verify_blackglass_schema(c: &Connection) -> Result<()> {
         ],
         "Blackglass",
     )?;
+    if recovery_epoch {
+        verify_exact_indexes(
+            c,
+            "retired_vaults",
+            &[IndexExpectation::primary_key(
+                "sqlite_autoindex_retired_vaults_1",
+                &["id"],
+            )],
+            "Blackglass",
+        )?;
+    }
     verify_exact_indexes(c, "sqlite_sequence", &[], "Blackglass")?;
 
     verify_exact_foreign_keys(c, "schema_migrations", &[], "Blackglass")?;
@@ -1073,6 +1279,9 @@ fn verify_blackglass_schema(c: &Connection) -> Result<()> {
         "Blackglass",
     )?;
     verify_exact_foreign_keys(c, "sessions", &[], "Blackglass")?;
+    if recovery_epoch {
+        verify_exact_foreign_keys(c, "retired_vaults", &[], "Blackglass")?;
+    }
     verify_exact_foreign_keys(c, "sqlite_sequence", &[], "Blackglass")?;
     Ok(())
 }
@@ -1192,6 +1401,10 @@ const SESSION_COLUMNS: &[ExpectedColumn] = &[
     ("created_at", "INTEGER", true, None, 0),
     ("expires_at", "INTEGER", true, None, 0),
     ("revoked_at", "INTEGER", false, None, 0),
+];
+const RETIRED_VAULT_COLUMNS: &[ExpectedColumn] = &[
+    ("id", "TEXT", false, None, 1),
+    ("retired_at", "INTEGER", true, None, 0),
 ];
 const SQLITE_SEQUENCE_COLUMNS: &[ExpectedColumn] =
     &[("name", "", false, None, 0), ("seq", "", false, None, 0)];
@@ -1684,6 +1897,45 @@ fn verify_logical_invariants(c: &Connection, external_content: bool) -> Result<(
             ),
             "session token and timestamps",
         )?;
+        reject_invalid_row(
+            c,
+            &format!(
+                "SELECT CAST(COUNT(*) AS TEXT) FROM sessions HAVING COUNT(*) > {}",
+                MAX_SESSIONS
+            ),
+            "session count limit",
+        )?;
+    }
+    if table_exists(c, "retired_vaults")? {
+        reject_invalid_row(
+            c,
+            &format!(
+                "SELECT id FROM retired_vaults
+                  WHERE typeof(id) <> 'text' OR length(id) NOT BETWEEN 1 AND 64 OR
+                        typeof(retired_at) <> 'integer' OR
+                        retired_at NOT BETWEEN 0 AND {}
+                  LIMIT 1",
+                MAX_JS_SAFE_INTEGER
+            ),
+            "retired vault marker fields",
+        )?;
+        reject_invalid_row(
+            c,
+            &format!(
+                "SELECT CAST(COUNT(*) AS TEXT) FROM retired_vaults
+                  HAVING COUNT(*) > {}",
+                MAX_RETIRED_VAULTS
+            ),
+            "retired vault marker count",
+        )?;
+        reject_invalid_row(
+            c,
+            "SELECT retired.id
+               FROM retired_vaults retired
+               JOIN vaults active ON active.id=retired.id
+              LIMIT 1",
+            "active and retired vault identities are disjoint",
+        )?;
     }
     Ok(())
 }
@@ -1912,6 +2164,17 @@ mod tests {
         assert_eq!(verify_recorded_schema(&connection).unwrap(), 1);
     }
 
+    fn downgrade_current_database_to_v3(path: &Path) {
+        let connection = Connection::open(path).unwrap();
+        connection
+            .execute_batch(
+                "DROP TABLE retired_vaults;
+                 DELETE FROM schema_migrations WHERE version=4;",
+            )
+            .unwrap();
+        assert_eq!(verify_recorded_schema(&connection).unwrap(), 3);
+    }
+
     fn execute_sql(path: &Path, sql: &str) {
         let connection = Connection::open(path).unwrap();
         connection.execute_batch(sql).unwrap();
@@ -2018,6 +2281,59 @@ mod tests {
     }
 
     #[test]
+    fn shipped_v3_migrates_to_v4_without_rotating_identity_or_sessions() {
+        let dir = tempfile::tempdir().unwrap();
+        let source = dir.path().join("shipped-v3.sqlite");
+        let destination = dir.path().join("current-v4.sqlite");
+        let db = Db::open(&source).unwrap();
+        let session = db.issue_session(60).unwrap();
+        db.create_vault(&Vault {
+            id: "stable-v3-vault".into(),
+            name: "Stable".into(),
+            keyhash: Some("key".into()),
+            salt: Some("salt".into()),
+            host: "localhost:3003".into(),
+            region: "Blackglass Server".into(),
+            encryption_version: 3,
+            size: 0,
+            created: 1,
+            password: None,
+        })
+        .unwrap();
+        db.checkpoint().unwrap();
+        drop(db);
+        downgrade_current_database_to_v3(&source);
+        let source_before = std::fs::read(&source).unwrap();
+
+        migrate_versioned_database(&source, &destination).unwrap();
+
+        assert_eq!(std::fs::read(&source).unwrap(), source_before);
+        let migrated = Db::open(&destination).unwrap();
+        assert_eq!(migrated.list_vaults().unwrap()[0].id, "stable-v3-vault");
+        assert!(migrated.valid_session(&session));
+        assert!(!migrated.is_retired_vault("stable-v3-vault").unwrap());
+        migrated
+            .with(|connection| {
+                assert_eq!(migration_versions(connection)?, vec![1, 2, 3, 4]);
+                Ok(())
+            })
+            .unwrap();
+    }
+
+    #[test]
+    fn current_schema_migration_is_rejected_without_creating_a_copy() {
+        let dir = tempfile::tempdir().unwrap();
+        let source = dir.path().join("current.sqlite");
+        let destination = dir.path().join("unexpected-copy.sqlite");
+        create_current_database(&source);
+        assert_error_contains(
+            migrate_versioned_database(&source, &destination),
+            "already at schema version 4",
+        );
+        assert!(!destination.exists());
+    }
+
+    #[test]
     fn vault_replacement_rolls_back_on_failure_and_removes_old_history_on_success() {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("vault-migration.sqlite");
@@ -2062,6 +2378,7 @@ mod tests {
         assert!(database.migrate_vault(&source.id, &conflicting).is_err());
         assert!(database.find_vault(&source.id).unwrap().is_some());
         assert_eq!(database.current_version(&source.id).unwrap(), 1);
+        assert!(!database.is_retired_vault(&source.id).unwrap());
 
         let replacement = Vault {
             id: "new-vault".into(),
@@ -2077,6 +2394,7 @@ mod tests {
         };
         assert!(database.migrate_vault(&source.id, &replacement).unwrap());
         assert!(database.find_vault(&source.id).unwrap().is_none());
+        assert!(database.is_retired_vault(&source.id).unwrap());
         assert_eq!(
             database.find_vault(&replacement.id).unwrap().unwrap().size,
             0
@@ -2087,6 +2405,10 @@ mod tests {
                 .unwrap()
                 .is_empty()
         );
+        assert!(database.delete_vault(&replacement.id).unwrap());
+        assert!(database.find_vault(&replacement.id).unwrap().is_none());
+        assert!(database.is_retired_vault(&replacement.id).unwrap());
+        assert!(!database.delete_vault(&replacement.id).unwrap());
     }
 
     #[test]
@@ -2233,6 +2555,186 @@ mod tests {
     }
 
     #[test]
+    fn deleted_history_purge_preserves_live_file_history_and_keeps_tombstone_heads() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("purge-deleted.sqlite");
+        let backup = dir.path().join("purge-deleted.backup.sqlite");
+        let database = Db::open(&path).unwrap();
+        database
+            .create_vault(&Vault {
+                id: "vault".into(),
+                name: "Vault".into(),
+                keyhash: Some("key".into()),
+                salt: Some("salt".into()),
+                host: "localhost:3003".into(),
+                region: "Blackglass Server".into(),
+                encryption_version: 3,
+                size: 0,
+                created: 1,
+                password: None,
+            })
+            .unwrap();
+        let revision = |path: &str, hash: &str, deleted: bool| NewRevision {
+            vault_id: "vault".into(),
+            path: path.into(),
+            relatedpath: None,
+            extension: "md".into(),
+            hash: hash.into(),
+            ctime: 1,
+            mtime: 2,
+            folder: false,
+            deleted,
+            size: 0,
+            pieces: 0,
+            device: "test".into(),
+            user_id: 1,
+        };
+        database
+            .add_empty_revision(&revision("live", "live-1", false))
+            .unwrap();
+        database
+            .add_empty_revision(&revision("live", "live-2", false))
+            .unwrap();
+        database
+            .add_empty_revision(&revision("deleted", "deleted-1", false))
+            .unwrap();
+        let tombstone = database
+            .add_empty_revision(&revision("deleted", "deleted-2", true))
+            .unwrap();
+        database.checkpoint().unwrap();
+        drop(database);
+
+        assert_eq!(purge_deleted_history(&path, "vault", &backup).unwrap(), 1);
+        verify_database(&backup).unwrap();
+        let database = Db::open(&path).unwrap();
+        assert_eq!(
+            database.history("vault", "live", None, 10).unwrap().len(),
+            2
+        );
+        let deleted = database.history("vault", "deleted", None, 10).unwrap();
+        assert_eq!(deleted.len(), 1);
+        assert_eq!(deleted[0].uid, tombstone.uid);
+        assert!(deleted[0].deleted);
+        assert_eq!(
+            database
+                .list_deleted_page("vault", false, 0, 10)
+                .unwrap()
+                .len(),
+            0
+        );
+    }
+
+    #[test]
+    fn deleted_history_paginates_past_the_old_256_item_boundary() {
+        let dir = tempfile::tempdir().unwrap();
+        let database = Db::open(&dir.path().join("deleted-pagination.sqlite")).unwrap();
+        database
+            .create_vault(&Vault {
+                id: "vault".into(),
+                name: "Vault".into(),
+                keyhash: Some("key".into()),
+                salt: Some("salt".into()),
+                host: "localhost:3003".into(),
+                region: "Blackglass Server".into(),
+                encryption_version: 3,
+                size: 0,
+                created: 1,
+                password: None,
+            })
+            .unwrap();
+        for index in 0..300 {
+            for deleted in [false, true] {
+                database
+                    .add_empty_revision(&NewRevision {
+                        vault_id: "vault".into(),
+                        path: format!("opaque-{index:03}"),
+                        relatedpath: None,
+                        extension: "md".into(),
+                        hash: if deleted {
+                            String::new()
+                        } else {
+                            format!("hash-{index}")
+                        },
+                        ctime: 1,
+                        mtime: 2,
+                        folder: false,
+                        deleted,
+                        size: 0,
+                        pieces: 0,
+                        device: "test".into(),
+                        user_id: 1,
+                    })
+                    .unwrap();
+            }
+        }
+
+        let mut after = 0;
+        let mut deleted = Vec::new();
+        loop {
+            let page = database
+                .list_deleted_page("vault", false, after, 64)
+                .unwrap();
+            let page_len = page.len();
+            if let Some(last) = page.last() {
+                after = last.uid;
+            }
+            deleted.extend(page);
+            if page_len < 64 {
+                break;
+            }
+        }
+        assert_eq!(deleted.len(), 300);
+        assert!(deleted.windows(2).all(|pair| pair[0].uid < pair[1].uid));
+    }
+
+    #[test]
+    fn restore_rolls_back_when_the_resulting_notice_exceeds_the_event_bound() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("restore-boundary.sqlite");
+        let database = Db::open(&path).unwrap();
+        database
+            .create_vault(&Vault {
+                id: "vault".into(),
+                name: "Vault".into(),
+                keyhash: Some("key".into()),
+                salt: Some("salt".into()),
+                host: "localhost:3003".into(),
+                region: "Blackglass Server".into(),
+                encryption_version: 3,
+                size: 0,
+                created: 1,
+                password: None,
+            })
+            .unwrap();
+        let source = database
+            .add_empty_revision(&NewRevision {
+                vault_id: "vault".into(),
+                path: "opaque".into(),
+                relatedpath: None,
+                extension: "md".into(),
+                hash: "hash".into(),
+                ctime: 1,
+                mtime: 2,
+                folder: false,
+                deleted: false,
+                size: 0,
+                pieces: 0,
+                device: "test".into(),
+                user_id: 1,
+            })
+            .unwrap();
+
+        assert_error_contains(
+            database.restore("vault", source.uid, &"d".repeat(40_000)),
+            "restored revision metadata exceeds the bounded event size",
+        );
+        assert_eq!(database.current_version("vault").unwrap(), source.uid);
+        let history = database.history("vault", "opaque", None, 10).unwrap();
+        assert_eq!(history.len(), 1);
+        assert_eq!(history[0].uid, source.uid);
+    }
+
+    #[test]
     fn sessions_revisions_and_backup_restore_survive_round_trip() {
         let dir = tempfile::tempdir().unwrap();
         let primary = dir.path().join("primary.sqlite");
@@ -2296,6 +2798,7 @@ mod tests {
         assert_ne!(restored_vault.id, "v1");
         assert_eq!(copy.current_version("v1").unwrap(), 0);
         assert_eq!(copy.current_version(&restored_vault.id).unwrap(), 1);
+        assert!(copy.is_retired_vault("v1").unwrap());
         assert!(!copy.valid_session(&backup_active));
         assert!(db.valid_session(&backup_active));
     }
@@ -2727,7 +3230,7 @@ mod tests {
         let connection = Connection::open(&source).unwrap();
         connection
             .execute(
-                "INSERT INTO schema_migrations(version, applied_at) VALUES(4, 4)",
+                "INSERT INTO schema_migrations(version, applied_at) VALUES(5, 5)",
                 [],
             )
             .unwrap();
@@ -2742,7 +3245,7 @@ mod tests {
             revoke_all_sessions(&source).map(|_| ()),
             Db::open(&source).map(|_| ()),
         ] {
-            assert_error_contains(result, "schema version 4 is newer");
+            assert_error_contains(result, "schema version 5 is newer");
         }
         assert!(!backup.exists());
         assert!(!restored.exists());
@@ -2959,7 +3462,7 @@ mod tests {
         let connection = Connection::open(&current).unwrap();
         connection
             .execute(
-                "INSERT INTO schema_migrations(version, applied_at) VALUES(4, 4)",
+                "INSERT INTO schema_migrations(version, applied_at) VALUES(5, 5)",
                 [],
             )
             .unwrap();
@@ -2967,7 +3470,7 @@ mod tests {
         let future_destination = dir.path().join("future-destination.sqlite");
         assert_error_contains(
             migrate_legacy_database(&current, &future_destination),
-            "schema version 4 is newer",
+            "schema version 5 is newer",
         );
         assert!(!future_destination.exists());
     }

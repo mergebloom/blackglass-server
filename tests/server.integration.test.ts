@@ -324,7 +324,7 @@ describe("single-user compatibility service", () => {
     expect(await probe.nextJson()).toEqual({ res: "ok" });
 
     await pushMetadata(probe, "old-path", "old-live");
-    await pushMetadata(probe, "old-path", "", { deleted: true });
+    const oldTombstone = await pushMetadata(probe, "old-path", "", { deleted: true });
     await pushMetadata(probe, "new-path", "new-live", {
       relatedpath: "old-path",
     });
@@ -340,6 +340,14 @@ describe("single-user compatibility service", () => {
     expect(afterPurge.items).toHaveLength(1);
     expect(afterPurge.items[0].uid).toBe(restored.uid);
     probe.sendJson({ op: "history", path: "old-path", last: null });
+    const oldHistory = await probe.nextJson();
+    expect(oldHistory.items).toHaveLength(1);
+    expect(oldHistory.items[0]).toMatchObject({
+      uid: oldTombstone.uid,
+      path: "old-path",
+      deleted: true,
+    });
+    probe.sendJson({ op: "deleted", suppressrenames: false });
     expect((await probe.nextJson()).items).toEqual([]);
   });
 

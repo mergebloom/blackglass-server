@@ -78,6 +78,8 @@ async function transcript(endpoint: Endpoint): Promise<unknown[]> {
   const deleted = await ws.nextJson(); output.push(normalize(deleted, endpoint)); output.push(await ws.nextJson());
   ws.json({ op: "deleted", suppressrenames: false }); output.push(normalize(await ws.nextJson(), endpoint));
   ws.json({ op: "history", path: "encrypted-path", last: null }); output.push(normalize(await ws.nextJson(), endpoint));
+  ws.json({ op: "purge" }); output.push(await ws.nextJson());
+  ws.json({ op: "deleted", suppressrenames: false }); output.push(normalize(await ws.nextJson(), endpoint));
   ws.json({ op: "size" }); output.push(await ws.nextJson());
   ws.json({ op: "usernames" }); output.push(await ws.nextJson());
   ws.json({ op: "ping" }); output.push(await ws.nextJson());

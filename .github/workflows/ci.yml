@@ -24,7 +24,9 @@ jobs:
       - run: bun run server:measure
       - run: shellcheck ops/*.sh
       - name: Verify systemd hardening unit
-        run: systemd-analyze verify ops/blackglass-server.service
+        run: |
+          sudo systemd-sysusers ops/blackglass-server.sysusers.conf
+          systemd-analyze verify ops/blackglass-server.service
       - name: Validate example Caddy ingress
         run: >-
           docker run --rm

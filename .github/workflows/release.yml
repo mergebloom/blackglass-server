@@ -9,6 +9,10 @@ on:
 permissions:
   contents: read
 
+concurrency:
+  group: release-${{ github.repository }}
+  cancel-in-progress: false
+
 jobs:
   gate:
     name: Full release gate
@@ -61,6 +65,9 @@ jobs:
         with:
           bun-version: 1.3.8
       - uses: docker/setup-buildx-action@bb05f3f5519dd87d3ba754cc423b652a5edd6d2c # v4.2.0
+        with:
+          version: v0.33.0
+          driver-opts: image=moby/buildkit:v0.30.0@sha256:0168606be2315b7c807a03b3d8aa79beefdb31c98740cebdffdfeebf31190c9f
       - run: npm ci
       - run: ./ops/build-linux-release.sh "${{ matrix.target }}"
       - name: Qualify the exact exported binary
@@ -76,11 +83,39 @@ jobs:
               tests/rust-server.integration.test.ts \
               tests/database-migration.integration.test.ts \
               tests/server-parity.integration.test.ts
+          resource_report="${binaries[0]}.resource-report.json"
+          BLACKGLASS_RUST_BINARY="${binaries[0]}" \
+            BLACKGLASS_RELEASE_TARGET="${{ matrix.target }}" \
+            bun run server:measure "$resource_report"
+          binary_sha=$(sha256sum "${binaries[0]}" | cut -d ' ' -f 1)
+          jq -e \
+            --arg sha "$binary_sha" \
+            --arg revision "$GITHUB_SHA" \
+            --arg target "${{ matrix.target }}" \
+            '.schemaVersion == 3 and
+             .passed == true and
+             .binarySha256 == $sha and
+             .sourceRevision == $revision and
+             .target == $target and
+             .workload.concurrentUploads == 4 and
+             .workload.uploadBytesEach == 67108864 and
+             .workload.measuredUploadBytes == 268435456 and
+             .workload.concurrentPulls == 8 and
+             .workload.concurrentArgonRequests == 10 and
+             .workload.websocketConnections == 16 and
+             .workload.historyRevisions == 100 and
+             .workload.argon2PolicyMaximum == {
+               algorithm: "argon2id", version: 19, memoryKiB: 65536,
+               timeCost: 5, parallelism: 4, concurrentChecks: 1
+             } and
+             .limits == { maxPeakRssMiB: 224, maxDeltaRssMiB: 128 }' \
+            "$resource_report"
       - uses: actions/attest@f7c74d28b9d84cb8768d0b8ca14a4bac6ef463e6 # v4.2.0
         with:
           subject-path: |
             artifacts/releases/*.tar.gz
             artifacts/releases/blackglass-server-v*-${{ matrix.target }}
+            artifacts/releases/blackglass-server-v*-${{ matrix.target }}.resource-report.json
       - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
         with:
           name: blackglass-server-${{ matrix.target }}
@@ -89,6 +124,7 @@ jobs:
             artifacts/releases/blackglass-server-v*-${{ matrix.target }}.tar.gz.sha256
             artifacts/releases/blackglass-server-v*-${{ matrix.target }}
             artifacts/releases/blackglass-server-v*-${{ matrix.target }}.sha256
+            artifacts/releases/blackglass-server-v*-${{ matrix.target }}.resource-report.json
           if-no-files-found: error
           compression-level: 0
 
@@ -127,18 +163,39 @@ jobs:
           test -n "$version"
           test "$GITHUB_REF_NAME" = "v$version"
           mkdir release-assets
-          find incoming -type f -name '*.tar.gz' -exec cp '{}' release-assets/ \;
-          find incoming -type f -name '*.tar.gz.sha256' -exec cp '{}' release-assets/ \;
           for architecture in amd64 arm64; do
-            find incoming -type f -name "blackglass-server-v${version}-linux-${architecture}" -exec cp '{}' release-assets/ \;
-            find incoming -type f -name "blackglass-server-v${version}-linux-${architecture}.sha256" -exec cp '{}' release-assets/ \;
-            test -f "release-assets/blackglass-server-v${version}-linux-${architecture}"
-            test -f "release-assets/blackglass-server-v${version}-linux-${architecture}.sha256"
+            base="blackglass-server-v${version}-linux-${architecture}"
+            for filename in \
+              "$base.tar.gz" \
+              "$base.tar.gz.sha256" \
+              "$base" \
+              "$base.sha256" \
+              "$base.resource-report.json"; do
+              matches=()
+              mapfile -d '' -t matches < <(find incoming -type f -name "$filename" -print0)
+              test "${#matches[@]}" -eq 1
+              cp -- "${matches[0]}" "release-assets/$filename"
+            done
+            binary_sha=$(sha256sum "release-assets/$base" | cut -d ' ' -f 1)
+            jq -e \
+              --arg sha "$binary_sha" \
+              --arg revision "$GITHUB_SHA" \
+              --arg target "linux-${architecture}" \
+              '.schemaVersion == 3 and
+               .passed == true and
+               .binarySha256 == $sha and
+               .sourceRevision == $revision and
+               .target == $target and
+               .workload.concurrentUploads == 4 and
+               .workload.argon2PolicyMaximum.memoryKiB == 65536 and
+               .limits.maxPeakRssMiB == 224' \
+              "release-assets/$base.resource-report.json"
           done
           test "$(find release-assets -type f -name '*.tar.gz' | wc -l)" -eq 2
           test "$(find release-assets -type f -name '*.tar.gz.sha256' | wc -l)" -eq 2
+          test "$(find release-assets -type f -name '*.resource-report.json' | wc -l)" -eq 2
           cd release-assets
-          sha256sum ./*.tar.gz ./blackglass-server-v*-linux-amd64 ./blackglass-server-v*-linux-arm64 > SHA256SUMS
+          sha256sum ./*.tar.gz ./blackglass-server-v*-linux-amd64 ./blackglass-server-v*-linux-arm64 ./*.resource-report.json > SHA256SUMS
           sha256sum -c ./*.tar.gz.sha256
           sha256sum -c ./blackglass-server-v*-linux-*.sha256
           printf 'VERSION=%s\n' "$version" >> "$GITHUB_ENV"
@@ -147,6 +204,9 @@ jobs:
         with:
           subject-path: release-assets/*
       - uses: docker/setup-buildx-action@bb05f3f5519dd87d3ba754cc423b652a5edd6d2c # v4.2.0
+        with:
+          version: v0.33.0
+          driver-opts: image=moby/buildkit:v0.30.0@sha256:0168606be2315b7c807a03b3d8aa79beefdb31c98740cebdffdfeebf31190c9f
       - name: Sign in to GitHub Container Registry
         shell: bash
         env:
@@ -154,110 +214,39 @@ jobs:
         run: echo "$GHCR_TOKEN" | docker login ghcr.io --username "$GITHUB_ACTOR" --password-stdin
       - name: Publish multi-architecture image
         shell: bash
+        env:
+          GH_TOKEN: ${{ github.token }}
         run: |
-          set -euo pipefail
-          existing_version=0
-          if docker buildx imagetools inspect "$IMAGE:$VERSION" >/dev/null 2>&1; then
-            existing_version=1
-          fi
-          image_tags=(--tag "$IMAGE:$VERSION")
-          if [[ "$VERSION" != *-* ]]; then
-            image_tags+=(--tag "$IMAGE:latest")
-          fi
-          image_sources=()
-          for architecture in amd64 arm64; do
-            archive="release-assets/blackglass-server-v${VERSION}-linux-${architecture}.tar.gz"
-            raw_binary="release-assets/blackglass-server-v${VERSION}-linux-${architecture}"
-            ./ops/verify-linux-release.sh "linux-${architecture}" "$archive" "$raw_binary"
-            if [[ "$existing_version" -eq 1 ]]; then
-              docker pull --platform "linux/${architecture}" "$IMAGE:$VERSION"
-              existing_container=$(docker create --platform "linux/${architecture}" "$IMAGE:$VERSION")
-              docker cp "$existing_container:/usr/local/bin/blackglass-server" "existing-${architecture}"
-              docker rm "$existing_container"
-              cmp "$raw_binary" "existing-${architecture}"
-              docker image inspect "$IMAGE:$VERSION" > "existing-${architecture}-image.json"
-              jq -e --arg version "$VERSION" --arg revision "$GITHUB_SHA" '
-                .[0].Config.User == "65532:65532" and
-                .[0].Config.Entrypoint == ["/usr/local/bin/blackglass-server"] and
-                .[0].Config.Labels["org.opencontainers.image.version"] == $version and
-                .[0].Config.Labels["org.opencontainers.image.revision"] == $revision
-              ' "existing-${architecture}-image.json"
-              continue
-            fi
-            context="image-context/${architecture}"
-            mkdir -p "${context}/state"
-            cp "$raw_binary" "${context}/blackglass-server"
-            chmod 0555 "${context}/blackglass-server"
-            touch "${context}/state/.blackglass-state"
-            metadata="image-metadata-${architecture}.json"
-            docker buildx build \
-              --platform "linux/${architecture}" \
-              --file ops/Dockerfile.prebuilt \
-              --build-arg "TARGETARCH=${architecture}" \
-              --build-arg "VERSION=$VERSION" \
-              --build-arg "SOURCE_REVISION=$GITHUB_SHA" \
-              --provenance=false \
-              --metadata-file "$metadata" \
-              --output "type=image,name=${IMAGE},push-by-digest=true,name-canonical=true,push=true" \
-              "$context"
-            architecture_digest=$(jq -r '."containerimage.digest"' "$metadata")
-            test "$architecture_digest" != null
-            image_sources+=("${IMAGE}@${architecture_digest}")
-          done
-          if [[ "$existing_version" -eq 0 ]]; then
-            docker buildx imagetools create "${image_tags[@]}" "${image_sources[@]}"
-          fi
-          docker buildx imagetools inspect "$IMAGE:$VERSION" --format '{{json .Manifest}}' > image-manifest.json
-          jq -e '([.manifests[].platform | select(.os == "linux") | .architecture] | sort) == ["amd64", "arm64"]' image-manifest.json
-          digest=$(jq -r '.digest' image-manifest.json)
-          test "$digest" != null
-          if [[ "$VERSION" != *-* && "$existing_version" -eq 1 ]]; then
-            if docker buildx imagetools inspect "$IMAGE:latest" --format '{{json .Manifest}}' > latest-image-manifest.json 2>/dev/null; then
-              test "$(jq -r '.digest' latest-image-manifest.json)" = "$digest"
-            else
-              docker buildx imagetools create --tag "$IMAGE:latest" "$IMAGE:$VERSION"
-            fi
-          fi
-          printf 'IMAGE_DIGEST=%s\n' "$digest" >> "$GITHUB_ENV"
+          bash ops/publish-oci-version.sh \
+            "$VERSION" \
+            "$IMAGE" \
+            "$GITHUB_SHA" \
+            release-assets
       - uses: actions/attest@f7c74d28b9d84cb8768d0b8ca14a4bac6ef463e6 # v4.2.0
         with:
           subject-name: ${{ env.IMAGE }}
           subject-digest: ${{ env.IMAGE_DIGEST }}
           push-to-registry: true
-      - name: Create or resume immutable GitHub release
+      - name: Create or resume verified GitHub release
         shell: bash
         env:
           GH_TOKEN: ${{ github.token }}
         run: |
           set -euo pipefail
-          if ! gh release view "$GITHUB_REF_NAME" >/dev/null 2>&1; then
-            gh release create "$GITHUB_REF_NAME" \
-              --draft \
-              --verify-tag \
-              --generate-notes \
-              --title "Blackglass Server $VERSION"
-          fi
-          mkdir -p existing-release-assets
-          for asset in release-assets/*; do
-            name=$(basename "$asset")
-            if gh api \
-              -H 'Accept: application/vnd.github+json' \
-              "/repos/$GITHUB_REPOSITORY/releases/tags/$GITHUB_REF_NAME" \
-              --jq '.assets[].name' | grep -Fqx "$name"; then
-              gh release download "$GITHUB_REF_NAME" \
-                --pattern "$name" \
-                --dir existing-release-assets
-              cmp "$asset" "existing-release-assets/$name"
-            else
-              gh release upload "$GITHUB_REF_NAME" "$asset"
-            fi
-          done
-          find release-assets -maxdepth 1 -type f -exec basename '{}' \; | sort > expected-release-assets.txt
-          gh api \
-            -H 'Accept: application/vnd.github+json' \
-            "/repos/$GITHUB_REPOSITORY/releases/tags/$GITHUB_REF_NAME" \
-            --jq '.assets[].name' | sort > actual-release-assets.txt
-          diff -u expected-release-assets.txt actual-release-assets.txt
-          if [[ "$(gh release view "$GITHUB_REF_NAME" --json isDraft --jq .isDraft)" == true ]]; then
-            gh release edit "$GITHUB_REF_NAME" --draft=false
-          fi
+          mapfile -d '' -t release_files < <(
+            find release-assets -maxdepth 1 -type f -print0 | sort -z
+          )
+          test "${#release_files[@]}" -eq 11
+          bash ops/publish-release.sh \
+            "$GITHUB_REF_NAME" \
+            "Blackglass Server $VERSION" \
+            "${release_files[@]}"
+      - name: Promote verified stable release to latest
+        shell: bash
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          bash ops/promote-oci-latest.sh \
+            "$VERSION" \
+            "$IMAGE" \
+            "$IMAGE_DIGEST"

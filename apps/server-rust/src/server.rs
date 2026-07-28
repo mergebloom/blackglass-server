@@ -9,7 +9,7 @@ use axum::{
     Json, Router,
     body::{Body, Bytes, to_bytes},
     extract::{
-        DefaultBodyLimit, Request, State, WebSocketUpgrade,
+        ConnectInfo, DefaultBodyLimit, Request, State, WebSocketUpgrade,
         ws::{CloseFrame, Message, WebSocket},
     },
     http::{HeaderMap, HeaderValue, StatusCode, Uri, header},
@@ -20,15 +20,17 @@ use axum::{
 use futures_util::{SinkExt, StreamExt, stream::SplitSink};
 use serde_json::{Value, json};
 use std::{
+    collections::{HashMap, VecDeque},
     fs,
     future::Future,
     io::Write,
+    net::{IpAddr, SocketAddr},
     path::PathBuf,
     sync::{
-        Arc,
+        Arc, Mutex as StdMutex,
         atomic::{AtomicU64, Ordering},
     },
-    time::{Duration, SystemTime, UNIX_EPOCH},
+    time::{Duration, Instant, SystemTime, UNIX_EPOCH},
 };
 use tokio::{
     io::AsyncWriteExt,
@@ -47,6 +49,12 @@ const CONTROL_BODY_DEADLINE: Duration = Duration::from_secs(5);
 const GRACEFUL_CONNECTION_DRAIN_DEADLINE: Duration = Duration::from_secs(15);
 const SESSION_REVALIDATE_INTERVAL: Duration = Duration::from_secs(5);
 const SOCKET_WRITE_TIMEOUT: Duration = Duration::from_secs(10);
+const SIGNIN_QUEUE_TIMEOUT: Duration = Duration::from_secs(10);
+const SIGNIN_RATE_WINDOW: Duration = Duration::from_secs(60);
+const SIGNIN_ATTEMPTS_PER_SOURCE: usize = 6;
+const MAX_SIGNIN_WAITERS: usize = 8;
+const MAX_UNAUTHENTICATED_WS_PER_SOURCE: usize = 4;
+const MAX_SOURCE_LIMIT_ENTRIES: usize = 4096;
 pub(crate) const MAX_CONTROL_BODY_READERS: usize = 32;
 pub(crate) const MAX_CONTROL_REQUESTS: usize = 16;
 pub(crate) const MAX_DB_WORKERS: usize = 2;
@@ -87,12 +95,115 @@ pub struct AppState {
     uploads: Arc<Semaphore>,
     connections: Arc<Semaphore>,
     auth_checks: Arc<Semaphore>,
+    auth_waiters: Arc<Semaphore>,
+    source_limits: Arc<StdMutex<SourceLimits>>,
     control_body_readers: Arc<Semaphore>,
     control_requests: Arc<Semaphore>,
     db_workers: Arc<Semaphore>,
     large_responses: Arc<Semaphore>,
     shutdown: watch::Receiver<bool>,
     metrics: Arc<Metrics>,
+}
+
+#[derive(Default)]
+struct SourceLimits {
+    entries: HashMap<IpAddr, SourceLimitEntry>,
+}
+
+struct SourceLimitEntry {
+    signin_attempts: VecDeque<Instant>,
+    unauthenticated_websockets: usize,
+    last_seen: Instant,
+}
+
+impl SourceLimits {
+    fn make_room(&mut self, source: IpAddr, now: Instant) {
+        self.entries.retain(|_, entry| {
+            entry.unauthenticated_websockets > 0
+                || now.duration_since(entry.last_seen) <= SIGNIN_RATE_WINDOW
+        });
+        if !self.entries.contains_key(&source)
+            && self.entries.len() >= MAX_SOURCE_LIMIT_ENTRIES
+            && let Some(oldest) = self
+                .entries
+                .iter()
+                .filter(|(_, entry)| entry.unauthenticated_websockets == 0)
+                .min_by_key(|(_, entry)| entry.last_seen)
+                .map(|(address, _)| *address)
+        {
+            self.entries.remove(&oldest);
+        }
+    }
+
+    fn entry(&mut self, source: IpAddr, now: Instant) -> Option<&mut SourceLimitEntry> {
+        self.make_room(source, now);
+        if !self.entries.contains_key(&source) && self.entries.len() >= MAX_SOURCE_LIMIT_ENTRIES {
+            return None;
+        }
+        Some(
+            self.entries
+                .entry(source)
+                .or_insert_with(|| SourceLimitEntry {
+                    signin_attempts: VecDeque::new(),
+                    unauthenticated_websockets: 0,
+                    last_seen: now,
+                }),
+        )
+    }
+
+    fn admit_signin(&mut self, source: IpAddr, now: Instant) -> bool {
+        let Some(entry) = self.entry(source, now) else {
+            return false;
+        };
+        while entry
+            .signin_attempts
+            .front()
+            .is_some_and(|attempt| now.duration_since(*attempt) >= SIGNIN_RATE_WINDOW)
+        {
+            entry.signin_attempts.pop_front();
+        }
+        entry.last_seen = now;
+        if entry.signin_attempts.len() >= SIGNIN_ATTEMPTS_PER_SOURCE {
+            return false;
+        }
+        entry.signin_attempts.push_back(now);
+        true
+    }
+
+    fn refund_successful_signin(&mut self, source: IpAddr) {
+        if let Some(entry) = self.entries.get_mut(&source) {
+            entry.signin_attempts.pop_back();
+            entry.last_seen = Instant::now();
+        }
+    }
+
+    fn admit_websocket(&mut self, source: IpAddr, now: Instant) -> bool {
+        let Some(entry) = self.entry(source, now) else {
+            return false;
+        };
+        entry.last_seen = now;
+        if entry.unauthenticated_websockets >= MAX_UNAUTHENTICATED_WS_PER_SOURCE {
+            return false;
+        }
+        entry.unauthenticated_websockets += 1;
+        true
+    }
+}
+
+struct SourceConnectionPermit {
+    source: IpAddr,
+    limits: Arc<StdMutex<SourceLimits>>,
+}
+
+impl Drop for SourceConnectionPermit {
+    fn drop(&mut self) {
+        if let Ok(mut limits) = self.limits.lock()
+            && let Some(entry) = limits.entries.get_mut(&self.source)
+        {
+            entry.unauthenticated_websockets = entry.unauthenticated_websockets.saturating_sub(1);
+            entry.last_seen = Instant::now();
+        }
+    }
 }
 
 pub async fn run(config: Config) -> Result<()> {
@@ -123,6 +234,8 @@ pub async fn run(config: Config) -> Result<()> {
         uploads: Arc::new(Semaphore::new(max_uploads)),
         connections: Arc::new(Semaphore::new(max_connections)),
         auth_checks: Arc::new(Semaphore::new(auth::MAX_CONCURRENT_PASSWORD_CHECKS)),
+        auth_waiters: Arc::new(Semaphore::new(MAX_SIGNIN_WAITERS)),
+        source_limits: Arc::new(StdMutex::new(SourceLimits::default())),
         control_body_readers: Arc::new(Semaphore::new(MAX_CONTROL_BODY_READERS)),
         control_requests: Arc::new(Semaphore::new(MAX_CONTROL_REQUESTS)),
         db_workers: Arc::new(Semaphore::new(MAX_DB_WORKERS)),
@@ -139,18 +252,24 @@ pub async fn run(config: Config) -> Result<()> {
     let mut cstop = state.shutdown.clone();
     let mut dstop = state.shutdown.clone();
     let control_task = tokio::spawn(async move {
-        axum::serve(control_listener, control)
-            .with_graceful_shutdown(async move {
-                wait_for_shutdown(&mut cstop).await;
-            })
-            .await
+        axum::serve(
+            control_listener,
+            control.into_make_service_with_connect_info::<SocketAddr>(),
+        )
+        .with_graceful_shutdown(async move {
+            wait_for_shutdown(&mut cstop).await;
+        })
+        .await
     });
     let data_task = tokio::spawn(async move {
-        axum::serve(data_listener, data)
-            .with_graceful_shutdown(async move {
-                wait_for_shutdown(&mut dstop).await;
-            })
-            .await
+        axum::serve(
+            data_listener,
+            data.into_make_service_with_connect_info::<SocketAddr>(),
+        )
+        .with_graceful_shutdown(async move {
+            wait_for_shutdown(&mut dstop).await;
+        })
+        .await
     });
     let listener_result =
         supervise_listeners(shutdown_tx, control_task, data_task, shutdown_signal()).await;
@@ -344,7 +463,13 @@ async fn preflight(State(s): State<AppState>, headers: HeaderMap) -> Response {
     response
 }
 
-async fn control(State(s): State<AppState>, uri: Uri, headers: HeaderMap, body: Bytes) -> Response {
+async fn control(
+    ConnectInfo(peer): ConnectInfo<SocketAddr>,
+    State(s): State<AppState>,
+    uri: Uri,
+    headers: HeaderMap,
+    body: Bytes,
+) -> Response {
     s.metrics.control.fetch_add(1, Ordering::Relaxed);
     let request_origin = match permitted_origin(&s, &headers) {
         Ok(origin) => origin,
@@ -368,8 +493,9 @@ async fn control(State(s): State<AppState>, uri: Uri, headers: HeaderMap, body: 
             );
         }
     };
+    let source = request_source(&s.config, peer, &headers);
     let result = match uri.path() {
-        "/user/signin" => signin(&s, value).await,
+        "/user/signin" => signin(&s, source, value).await,
         "/user/signup" | "/user/forgetpass" | "/user/resendconfirmation" => {
             Err("Accounts are managed by the Blackglass Server administrator".into())
         }
@@ -384,17 +510,36 @@ async fn control(State(s): State<AppState>, uri: Uri, headers: HeaderMap, body: 
     }
 }
 
-async fn signin(s: &AppState, v: Value) -> std::result::Result<Value, String> {
+async fn signin(s: &AppState, source: IpAddr, v: Value) -> std::result::Result<Value, String> {
     let req: Signin =
         serde_json::from_value(v).map_err(|_| "Invalid email or password".to_string())?;
-    let permit = match s.auth_checks.clone().try_acquire_owned() {
-        Ok(permit) => permit,
+    let admitted = s
+        .source_limits
+        .lock()
+        .map_err(|_| "Try again later".to_string())?
+        .admit_signin(source, Instant::now());
+    if !admitted {
+        s.metrics.auth_failures.fetch_add(1, Ordering::Relaxed);
+        warn!(event = "signin_rate_limited");
+        return Err("Too many sign-in attempts; try again later".into());
+    }
+    let waiter = match s.auth_waiters.clone().try_acquire_owned() {
+        Ok(waiter) => waiter,
         Err(_) => {
             s.metrics.auth_failures.fetch_add(1, Ordering::Relaxed);
             warn!(event = "signin_capacity_reached");
             return Err("Try again later".into());
         }
     };
+    let permit = match timeout(SIGNIN_QUEUE_TIMEOUT, s.auth_checks.clone().acquire_owned()).await {
+        Ok(Ok(permit)) => permit,
+        _ => {
+            s.metrics.auth_failures.fetch_add(1, Ordering::Relaxed);
+            warn!(event = "signin_queue_timed_out");
+            return Err("Try again later".into());
+        }
+    };
+    drop(waiter);
     let email_ok = req
         .email
         .as_deref()
@@ -412,6 +557,9 @@ async fn signin(s: &AppState, v: Value) -> std::result::Result<Value, String> {
         s.metrics.auth_failures.fetch_add(1, Ordering::Relaxed);
         warn!(event = "signin_failed");
         return Err("Invalid email or password".into());
+    }
+    if let Ok(mut limits) = s.source_limits.lock() {
+        limits.refund_successful_signin(source);
     }
     let ttl = s.config.session_ttl.as_secs() as i64;
     let token = db_task(s, move |db| db.issue_session(ttl))
@@ -670,17 +818,36 @@ fn invalidate_vault(s: &AppState, vault: String) {
     });
 }
 
-async fn upgrade(State(s): State<AppState>, headers: HeaderMap, ws: WebSocketUpgrade) -> Response {
+async fn upgrade(
+    ConnectInfo(peer): ConnectInfo<SocketAddr>,
+    State(s): State<AppState>,
+    headers: HeaderMap,
+    ws: WebSocketUpgrade,
+) -> Response {
     if permitted_origin(&s, &headers).is_err() {
         return StatusCode::FORBIDDEN.into_response();
     }
+    let source = request_source(&s.config, peer, &headers);
+    let source_permit = {
+        let admitted = s
+            .source_limits
+            .lock()
+            .is_ok_and(|mut limits| limits.admit_websocket(source, Instant::now()));
+        if !admitted {
+            return StatusCode::TOO_MANY_REQUESTS.into_response();
+        }
+        SourceConnectionPermit {
+            source,
+            limits: s.source_limits.clone(),
+        }
+    };
     let permit = match s.connections.clone().try_acquire_owned() {
         Ok(permit) => permit,
         Err(_) => return StatusCode::SERVICE_UNAVAILABLE.into_response(),
     };
     ws.max_frame_size(PIECE_SIZE as usize)
         .max_message_size(PIECE_SIZE as usize)
-        .on_upgrade(move |socket| socket_loop(s, socket, permit))
+        .on_upgrade(move |socket| socket_loop(s, socket, permit, source_permit))
         .into_response()
 }
 
@@ -704,6 +871,7 @@ async fn socket_loop(
     s: AppState,
     socket: WebSocket,
     _connection_permit: tokio::sync::OwnedSemaphorePermit,
+    source_permit: SourceConnectionPermit,
 ) {
     s.metrics.ws_connections.fetch_add(1, Ordering::Relaxed);
     let (mut tx, mut rx) = socket.split();
@@ -716,6 +884,7 @@ async fn socket_loop(
         device: "Unknown device".into(),
         pending: None,
     };
+    let mut source_permit = Some(source_permit);
     let authentication_deadline = tokio::time::sleep(AUTHENTICATION_DEADLINE);
     tokio::pin!(authentication_deadline);
     let mut session_revalidation = interval(SESSION_REVALIDATE_INTERVAL);
@@ -752,13 +921,17 @@ async fn socket_loop(
             incoming = rx.next() => match incoming {
                 Some(Ok(Message::Close(_))) => break,
                 Some(Ok(msg)) => {
-                    if let Err(error) = handle_message(
+                    let result = handle_message(
                         &s,
                         &mut session,
                         &mut events,
                         &mut tx,
                         msg,
-                    ).await {
+                    ).await;
+                    if session.authenticated {
+                        drop(source_permit.take());
+                    }
+                    if let Err(error) = result {
                         warn!(event = "websocket_error", error = %error);
                         s.metrics.errors.fetch_add(1, Ordering::Relaxed);
                         break
@@ -903,23 +1076,28 @@ async fn init(
     let token_hash = auth::token_hash(&token);
     let lookup_id = id.clone();
     let validation_hash = token_hash.clone();
-    let (vault, valid_session) = db_task(s, move |db| {
+    let token_has_session_shape = token.len() == 64
+        && token
+            .bytes()
+            .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte));
+    let keyhash = v.get("keyhash").and_then(Value::as_str).map(str::to_owned);
+    let enc = v.get("encryption_version").and_then(Value::as_i64);
+    let (vault, valid_session, retired_vault) = db_task(s, move |db| {
         Ok((
             db.find_vault(&lookup_id)?,
-            token.len() == 64 && db.valid_session_hash(&validation_hash),
+            token_has_session_shape && db.valid_session_hash(&validation_hash),
+            db.is_retired_vault(&lookup_id)?,
         ))
     })
     .await?;
     let Some(vault) = vault else {
-        if valid_session {
+        if valid_session || (token_has_session_shape && retired_vault) {
             send(tx, json!({"res":"err","msg":"Vault not found"})).await?;
             return close(tx, 1008, "Vault not found").await;
         }
         send(tx, json!({"res":"err","msg":"Unable to authenticate"})).await?;
         return Ok(());
     };
-    let keyhash = v.get("keyhash").and_then(Value::as_str).map(str::to_owned);
-    let enc = v.get("encryption_version").and_then(Value::as_i64);
     if !valid_session
         || keyhash.as_deref() != vault.keyhash.as_deref()
         || enc != Some(vault.encryption_version)
@@ -1295,7 +1473,7 @@ async fn deleted(
                 drop(response);
                 send(
                     tx,
-                    json!({"err":"Deleted response exceeds the safe wire limit; purge deleted history and retry"}),
+                    json!({"err":"Deleted response exceeds the safe wire limit; ask the server operator to stop the service, run `blackglass-server purge-deleted <database> <vault-id> <backup>`, and retry"}),
                 )
                 .await?;
                 return Ok(());
@@ -1538,6 +1716,25 @@ fn permitted_origin<'a>(
     } else {
         Err(())
     }
+}
+
+fn request_source(config: &Config, peer: SocketAddr, headers: &HeaderMap) -> IpAddr {
+    if config.trusted_proxy != Some(peer.ip()) {
+        return peer.ip();
+    }
+    let Some(forwarded) = headers
+        .get("x-forwarded-for")
+        .and_then(|value| value.to_str().ok())
+        .map(str::trim)
+        .filter(|value| !value.is_empty() && !value.contains(','))
+        .and_then(|value| value.parse::<IpAddr>().ok())
+    else {
+        // A trusted proxy must overwrite X-Forwarded-For with exactly one
+        // address. Missing, malformed, or ambiguous values collapse to the
+        // proxy source, which is safe and deliberately rate-limited.
+        return peer.ip();
+    };
+    forwarded
 }
 
 async fn db_task<T, F>(state: &AppState, operation: F) -> Result<T>
@@ -1873,6 +2070,53 @@ fn unexpected_listener_result(name: &str, result: ListenerJoinResult) -> Result<
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn forwarded_source_is_used_only_for_one_explicit_trusted_proxy() {
+        let directory = tempfile::tempdir().unwrap();
+        let mut config = Config::test(directory.path(), 3000, 3003).unwrap();
+        let proxy: IpAddr = "127.0.0.1".parse().unwrap();
+        let client: IpAddr = "198.51.100.23".parse().unwrap();
+        let peer = SocketAddr::new(proxy, 4242);
+        let mut headers = HeaderMap::new();
+        headers.insert("x-forwarded-for", "198.51.100.23".parse().unwrap());
+
+        assert_eq!(request_source(&config, peer, &headers), proxy);
+        config.trusted_proxy = Some(proxy);
+        assert_eq!(request_source(&config, peer, &headers), client);
+
+        headers.insert(
+            "x-forwarded-for",
+            "198.51.100.23, 203.0.113.8".parse().unwrap(),
+        );
+        assert_eq!(request_source(&config, peer, &headers), proxy);
+        headers.insert("x-forwarded-for", "not-an-ip".parse().unwrap());
+        assert_eq!(request_source(&config, peer, &headers), proxy);
+        let untrusted_peer = SocketAddr::new("10.0.0.9".parse().unwrap(), 4242);
+        headers.insert("x-forwarded-for", "198.51.100.23".parse().unwrap());
+        assert_eq!(
+            request_source(&config, untrusted_peer, &headers),
+            untrusted_peer.ip()
+        );
+    }
+
+    #[test]
+    fn source_limits_bound_signins_and_only_unauthenticated_websockets() {
+        let source: IpAddr = "198.51.100.23".parse().unwrap();
+        let other: IpAddr = "198.51.100.24".parse().unwrap();
+        let now = Instant::now();
+        let mut limits = SourceLimits::default();
+        for _ in 0..SIGNIN_ATTEMPTS_PER_SOURCE {
+            assert!(limits.admit_signin(source, now));
+        }
+        assert!(!limits.admit_signin(source, now));
+        assert!(limits.admit_signin(other, now));
+        for _ in 0..MAX_UNAUTHENTICATED_WS_PER_SOURCE {
+            assert!(limits.admit_websocket(source, now));
+        }
+        assert!(!limits.admit_websocket(source, now));
+        assert!(limits.admit_websocket(other, now));
+    }
 
     #[tokio::test]
     async fn listener_supervisor_propagates_an_unexpected_exit_and_stops_its_sibling() {

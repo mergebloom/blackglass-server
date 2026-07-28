@@ -113,6 +113,16 @@ async fn main() -> Result<()> {
             );
             Ok(())
         }
+        [command, database, vault, backup] if command == "purge-deleted" => {
+            let database = PathBuf::from(database);
+            let backup = PathBuf::from(backup);
+            let changed = db::purge_deleted_history(&database, vault, &backup)?;
+            println!(
+                "purged {changed} historical revision(s) for vault {vault}; verified backup: {}",
+                backup.display()
+            );
+            Ok(())
+        }
         [command, path] if command == "revoke-all-sessions" => {
             let path = PathBuf::from(path);
             println!("revoked sessions: {}", db::revoke_all_sessions(&path)?);
@@ -130,6 +140,7 @@ Usage:\n  {NAME} serve\n  {NAME} hash-password\n  {NAME} backup <database> <outp
 {NAME} migrate <versioned-database> <new-database>\n  \
 {NAME} migrate-legacy <legacy-database> <new-database>\n  \
 {NAME} rebind-data-host <database> <new-host> <backup>\n  \
+{NAME} purge-deleted <database> <vault-id> <backup>\n  \
 {NAME} revoke-all-sessions <database>\n  {NAME} build-info\n  {NAME} --version\n  {NAME} --help"
     );
 }

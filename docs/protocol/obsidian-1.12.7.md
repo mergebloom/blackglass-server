@@ -1,7 +1,5 @@
 # Obsidian 1.12.7 Sync protocol notes
 
-Status: static client inventory plus loopback server conformance tests.
-
 ## Control plane
 
 The renderer constructs the production base as `https://api.obsidian.md`.
@@ -158,8 +156,10 @@ device name, and account identity.
   flags/size, and device/user identifiers.
 - `restore` creates and broadcasts a new live revision; restoring a tombstone
   uses its most recent prior live content.
-- `purge` retains one current live head per live path, removes tombstoned path
-  history, and preserves the monotonic vault version.
+- `purge` retains one current head per path, including tombstones, removes
+  earlier history, and preserves the monotonic vault version. Retained
+  tombstones keep offline clients convergent but no longer appear in Deleted
+  because their prior live revision has been purged.
 
 ### Encryption upgrade contract
 
