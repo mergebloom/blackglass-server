@@ -85,30 +85,16 @@ jobs:
               tests/server-parity.integration.test.ts
           resource_report="${binaries[0]}.resource-report.json"
           BLACKGLASS_RUST_BINARY="${binaries[0]}" \
+            BLACKGLASS_EXPECTED_SOURCE_REVISION="$GITHUB_SHA" \
             BLACKGLASS_RELEASE_TARGET="${{ matrix.target }}" \
+            BLACKGLASS_RESOURCE_MODE=cgroup-v2 \
             bun run server:measure "$resource_report"
           binary_sha=$(sha256sum "${binaries[0]}" | cut -d ' ' -f 1)
           jq -e \
             --arg sha "$binary_sha" \
             --arg revision "$GITHUB_SHA" \
             --arg target "${{ matrix.target }}" \
-            '.schemaVersion == 3 and
-             .passed == true and
-             .binarySha256 == $sha and
-             .sourceRevision == $revision and
-             .target == $target and
-             .workload.concurrentUploads == 4 and
-             .workload.uploadBytesEach == 67108864 and
-             .workload.measuredUploadBytes == 268435456 and
-             .workload.concurrentPulls == 8 and
-             .workload.concurrentArgonRequests == 10 and
-             .workload.websocketConnections == 16 and
-             .workload.historyRevisions == 100 and
-             .workload.argon2PolicyMaximum == {
-               algorithm: "argon2id", version: 19, memoryKiB: 65536,
-               timeCost: 5, parallelism: 4, concurrentChecks: 1
-             } and
-             .limits == { maxPeakRssMiB: 224, maxDeltaRssMiB: 128 }' \
+            -f tools/verify-release-resource-report.jq \
             "$resource_report"
       - uses: actions/attest@f7c74d28b9d84cb8768d0b8ca14a4bac6ef463e6 # v4.2.0
         with:
@@ -183,14 +169,7 @@ jobs:
               --arg sha "$binary_sha" \
               --arg revision "$GITHUB_SHA" \
               --arg target "linux-${architecture}" \
-              '.schemaVersion == 3 and
-               .passed == true and
-               .binarySha256 == $sha and
-               .sourceRevision == $revision and
-               .target == $target and
-               .workload.concurrentUploads == 4 and
-               .workload.argon2PolicyMaximum.memoryKiB == 65536 and
-               .limits.maxPeakRssMiB == 224' \
+              -f tools/verify-release-resource-report.jq \
               "release-assets/$base.resource-report.json"
           done
           test "$(find release-assets -type f -name '*.tar.gz' | wc -l)" -eq 2

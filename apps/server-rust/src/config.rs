@@ -9,6 +9,11 @@ use std::{
 pub(crate) const MAX_WS_CONNECTIONS_LIMIT: usize = 16;
 pub(crate) const DEFAULT_MAX_WS_CONNECTIONS: usize = 16;
 pub(crate) const MAX_CONCURRENT_UPLOADS_LIMIT: usize = 4;
+pub(crate) const MAX_PER_FILE_BYTES: u64 = 900 * 1024 * 1024;
+// Bundled SQLite keeps the upstream 1,000,000,000-byte SQLITE_MAX_LENGTH.
+// Leave substantial room for encryption and record/header overhead instead of
+// advertising an upload which can be staged completely but never committed.
+const _: () = assert!(MAX_PER_FILE_BYTES + 50 * 1024 * 1024 < 1_000_000_000);
 
 #[derive(Clone, Debug)]
 pub struct Config {
@@ -77,9 +82,7 @@ impl Config {
             bail!("control and data ports must be distinct and non-zero");
         }
         let per_file_max = number("SELFHOST_PER_FILE_MAX", 200 * 1024 * 1024u64)?;
-        if per_file_max == 0 || per_file_max > 1024 * 1024 * 1024 {
-            bail!("SELFHOST_PER_FILE_MAX must be between 1 byte and 1 GiB");
-        }
+        validate_per_file_max(per_file_max)?;
         let session_ttl_seconds = number("SELFHOST_SESSION_TTL_SECONDS", 30 * 24 * 60 * 60u64)?;
         if !(300..=365 * 24 * 60 * 60).contains(&session_ttl_seconds) {
             bail!("SELFHOST_SESSION_TTL_SECONDS must be between 300 seconds and 365 days");
@@ -198,6 +201,15 @@ fn validate_concurrent_uploads(value: usize) -> Result<()> {
     if !(1..=MAX_CONCURRENT_UPLOADS_LIMIT).contains(&value) {
         bail!(
             "SELFHOST_MAX_CONCURRENT_UPLOADS must be between 1 and {MAX_CONCURRENT_UPLOADS_LIMIT}"
+        )
+    }
+    Ok(())
+}
+
+fn validate_per_file_max(value: u64) -> Result<()> {
+    if !(1..=MAX_PER_FILE_BYTES).contains(&value) {
+        bail!(
+            "SELFHOST_PER_FILE_MAX must be between 1 byte and {MAX_PER_FILE_BYTES} bytes (900 MiB SQLite-safe ceiling)"
         )
     }
     Ok(())
@@ -447,6 +459,17 @@ mod tests {
             assert!(
                 validate_concurrent_uploads(value).is_err(),
                 "passed: {value}"
+            );
+        }
+    }
+
+    #[test]
+    fn per_file_limit_stays_below_sqlite_default_maximum_length() {
+        validate_per_file_max(MAX_PER_FILE_BYTES).unwrap();
+        for value in [0, MAX_PER_FILE_BYTES + 1, 1024 * 1024 * 1024] {
+            assert!(
+                validate_per_file_max(value).is_err(),
+                "unsafe per-file maximum passed: {value}"
             );
         }
     }

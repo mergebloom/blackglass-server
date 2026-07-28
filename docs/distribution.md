@@ -51,6 +51,11 @@ identity with Linux host networking, loopback binding, the exact loopback
 trusted proxy, read-only rootfs, 256 MiB memory and 64-PID limits, and proves
 the control health endpoint and data listener are reachable.
 
+The package job then subjects the exact raw binary to the full protocol and
+recovery workload in a server-only, no-swap 256 MiB cgroup. Publication requires
+zero OOM events, bounded cgroup and process high-water measurements, matching
+artifact and in-image hashes, and a graceful exit.
+
 The builder image is pinned by multi-platform manifest digest in
 `ops/Dockerfile.release`; its added Alpine package closure, the Dockerfile
 frontend, Buildx version, BuildKit driver image, and GitHub Actions are pinned

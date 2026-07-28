@@ -1,6 +1,6 @@
 use crate::{
     auth,
-    config::Config,
+    config::{Config, MAX_WS_CONNECTIONS_LIMIT},
     db::{Db, MAX_JS_SAFE_INTEGER},
     model::*,
 };
@@ -36,14 +36,17 @@ use tokio::{
     io::AsyncWriteExt,
     net::TcpListener,
     sync::{Mutex as AsyncMutex, Semaphore, broadcast, watch},
-    time::{MissedTickBehavior, interval, timeout},
+    time::{MissedTickBehavior, interval, timeout, timeout_at},
 };
 use tracing::{info, warn};
 use uuid::Uuid;
 
 const PIECE_SIZE: i64 = 2 * 1024 * 1024;
 const AES_GCM_WIRE_OVERHEAD: u64 = 12 + 16;
-const REPLAY_PAGE_SIZE: i64 = 128;
+const REPLAY_PAGE_SIZE: i64 = 16;
+pub(crate) const MAX_REPLAY_PAGE_BYTES: usize = REPLAY_PAGE_SIZE as usize * MAX_EVENT_BYTES;
+pub(crate) const MAX_REPLAY_PAGES_BYTES: usize = MAX_REPLAY_PAGE_BYTES * MAX_WS_CONNECTIONS_LIMIT;
+const _: () = assert!(MAX_REPLAY_PAGES_BYTES <= 8 * 1024 * 1024);
 const AUTHENTICATION_DEADLINE: Duration = Duration::from_secs(5);
 const CONTROL_BODY_DEADLINE: Duration = Duration::from_secs(5);
 const GRACEFUL_CONNECTION_DRAIN_DEADLINE: Duration = Duration::from_secs(15);
@@ -58,6 +61,10 @@ const MAX_SOURCE_LIMIT_ENTRIES: usize = 4096;
 pub(crate) const MAX_CONTROL_BODY_READERS: usize = 32;
 pub(crate) const MAX_CONTROL_REQUESTS: usize = 16;
 pub(crate) const MAX_DB_WORKERS: usize = 2;
+pub(crate) const MAX_CONCURRENT_PULLS: usize = 2;
+pub(crate) const BULK_MEMORY_PERMITS: usize = 4;
+const ARGON2_MEMORY_PERMITS: u32 = 3;
+const _: () = assert!(ARGON2_MEMORY_PERMITS < BULK_MEMORY_PERMITS as u32);
 pub(crate) const MAX_CONTROL_BODY_BYTES: usize = 64 * 1024;
 pub(crate) const EVENT_CAPACITY: usize = 32;
 pub(crate) const MAX_EVENT_BYTES: usize = 32 * 1024;
@@ -102,6 +109,8 @@ pub struct AppState {
     control_body_readers: Arc<Semaphore>,
     control_requests: Arc<Semaphore>,
     db_workers: Arc<Semaphore>,
+    pulls: Arc<Semaphore>,
+    bulk_memory: Arc<Semaphore>,
     large_responses: Arc<Semaphore>,
     shutdown: watch::Receiver<bool>,
     metrics: Arc<Metrics>,
@@ -241,6 +250,8 @@ pub async fn run(config: Config) -> Result<()> {
         control_body_readers: Arc::new(Semaphore::new(MAX_CONTROL_BODY_READERS)),
         control_requests: Arc::new(Semaphore::new(MAX_CONTROL_REQUESTS)),
         db_workers: Arc::new(Semaphore::new(MAX_DB_WORKERS)),
+        pulls: Arc::new(Semaphore::new(MAX_CONCURRENT_PULLS)),
+        bulk_memory: Arc::new(Semaphore::new(BULK_MEMORY_PERMITS)),
         large_responses: Arc::new(Semaphore::new(1)),
         shutdown,
         metrics: Arc::new(Metrics::default()),
@@ -522,6 +533,7 @@ async fn control(
 }
 
 async fn signin(s: &AppState, source: IpAddr, v: Value) -> std::result::Result<Value, String> {
+    let queue_deadline = tokio::time::Instant::now() + SIGNIN_QUEUE_TIMEOUT;
     let req: Signin =
         serde_json::from_value(v).map_err(|_| "Invalid email or password".to_string())?;
     let admitted = s
@@ -542,7 +554,7 @@ async fn signin(s: &AppState, source: IpAddr, v: Value) -> std::result::Result<V
             return Err("Try again later".into());
         }
     };
-    let permit = match timeout(SIGNIN_QUEUE_TIMEOUT, s.auth_checks.clone().acquire_owned()).await {
+    let permit = match timeout_at(queue_deadline, s.auth_checks.clone().acquire_owned()).await {
         Ok(Ok(permit)) => permit,
         _ => {
             s.metrics.auth_failures.fetch_add(1, Ordering::Relaxed);
@@ -551,6 +563,19 @@ async fn signin(s: &AppState, source: IpAddr, v: Value) -> std::result::Result<V
         }
     };
     drop(waiter);
+    // Argon2 at the accepted policy maximum owns 64 MiB. Reserve three of four
+    // bulk-memory permits so one authenticated Sync lane always remains live.
+    // Bound admission so hostile sign-ins cannot hold the fair queue forever.
+    let Some(bulk_memory) =
+        acquire_password_memory(s.bulk_memory.clone(), s.shutdown.clone(), queue_deadline)
+            .await
+            .map_err(internal)?
+    else {
+        drop(permit);
+        s.metrics.auth_failures.fetch_add(1, Ordering::Relaxed);
+        warn!(event = "signin_memory_capacity_reached");
+        return Err("Try again later".into());
+    };
     let email_ok = req
         .email
         .as_deref()
@@ -559,7 +584,7 @@ async fn signin(s: &AppState, source: IpAddr, v: Value) -> std::result::Result<V
     let encoded = s.config.password_hash.clone();
     let password_ok = tokio::task::spawn_blocking(move || {
         let valid = auth::verify_password(&password, &encoded);
-        drop(permit);
+        drop((permit, bulk_memory));
         valid
     })
     .await
@@ -1199,6 +1224,14 @@ async fn init(
                 return Ok(());
             }
             cursor = revision.uid;
+            // Retain at most a small, explicitly bounded DB page per client,
+            // then admit each wire item separately. A trickle reader releases
+            // its permit between items and cannot monopolize the bulk pool.
+            let Some(_bulk_memory) =
+                acquire_bulk_memory(s.bulk_memory.clone(), s.shutdown.clone()).await?
+            else {
+                return Ok(());
+            };
             send(tx, serde_json::to_value(PushNotice::from(revision))?).await?;
         }
         if page_len < REPLAY_PAGE_SIZE as usize {
@@ -1327,7 +1360,14 @@ async fn upload_chunk(
     if p.pieces > p.revision.pieces || p.bytes > p.revision.size {
         return close(tx, 1009, "Upload exceeds declared size").await;
     }
-    write_staged_piece(&mut p.file, bytes).await?;
+    {
+        let Some(_bulk_memory) =
+            acquire_bulk_memory(s.bulk_memory.clone(), s.shutdown.clone()).await?
+        else {
+            return Ok(());
+        };
+        write_staged_piece(&mut p.file, bytes).await?;
+    }
     if p.pieces < p.revision.pieces {
         send(tx, json!({"res":"next"})).await?;
         return Ok(());
@@ -1413,6 +1453,21 @@ async fn pull(
         if !session_active(s, session).await {
             return close(tx, 1008, "Session expired or revoked").await;
         }
+        // A pull frame is 2 MiB and passes through SQLite, WebSocket, and
+        // kernel buffers. Admit two frames at a time and release the permit
+        // between pieces so slow readers cannot monopolize pull capacity.
+        let Some(_pull_permit) = acquire_pull_permit(s.pulls.clone(), s.shutdown.clone()).await?
+        else {
+            return Ok(());
+        };
+        let Some(_bulk_memory) =
+            acquire_bulk_memory(s.bulk_memory.clone(), s.shutdown.clone()).await?
+        else {
+            return Ok(());
+        };
+        if shutting_down(s) {
+            return Ok(());
+        }
         let len = (info.size - offset).min(PIECE_SIZE);
         let chunk = db_task(s, move |db| db.content_chunk(uid, offset, len)).await?;
         socket_send(tx, Message::Binary(chunk.into())).await?;
@@ -1421,6 +1476,50 @@ async fn pull(
     s.metrics.downloads.fetch_add(1, Ordering::Relaxed);
     Ok(())
 }
+
+async fn acquire_password_memory(
+    bulk_memory: Arc<Semaphore>,
+    mut shutdown: watch::Receiver<bool>,
+    deadline: tokio::time::Instant,
+) -> Result<Option<tokio::sync::OwnedSemaphorePermit>> {
+    tokio::select! {
+        biased;
+        _ = wait_for_shutdown(&mut shutdown) => Ok(None),
+        permit = timeout_at(
+            deadline,
+            bulk_memory.acquire_many_owned(ARGON2_MEMORY_PERMITS),
+        ) => match permit {
+            Ok(Ok(permit)) => Ok(Some(permit)),
+            Ok(Err(error)) => Err(error).context("bulk-memory pool stopped"),
+            Err(_) => Ok(None),
+        },
+    }
+}
+
+async fn acquire_bulk_memory(
+    bulk_memory: Arc<Semaphore>,
+    mut shutdown: watch::Receiver<bool>,
+) -> Result<Option<tokio::sync::OwnedSemaphorePermit>> {
+    tokio::select! {
+        biased;
+        _ = wait_for_shutdown(&mut shutdown) => Ok(None),
+        permit = bulk_memory.acquire_owned() => {
+            Ok(Some(permit.context("bulk-memory pool stopped")?))
+        },
+    }
+}
+
+async fn acquire_pull_permit(
+    pulls: Arc<Semaphore>,
+    mut shutdown: watch::Receiver<bool>,
+) -> Result<Option<tokio::sync::OwnedSemaphorePermit>> {
+    tokio::select! {
+        biased;
+        _ = wait_for_shutdown(&mut shutdown) => Ok(None),
+        permit = pulls.acquire_owned() => Ok(Some(permit.context("pull pool stopped")?)),
+    }
+}
+
 async fn history(
     s: &AppState,
     session: &Session,
@@ -1432,6 +1531,10 @@ async fn history(
         .acquire()
         .await
         .context("large-response pool stopped")?;
+    let Some(_bulk_memory) = acquire_bulk_memory(s.bulk_memory.clone(), s.shutdown.clone()).await?
+    else {
+        return Ok(());
+    };
     let Some(path) = v
         .get("path")
         .and_then(Value::as_str)
@@ -1476,6 +1579,10 @@ async fn deleted(
         .acquire()
         .await
         .context("large-response pool stopped")?;
+    let Some(_bulk_memory) = acquire_bulk_memory(s.bulk_memory.clone(), s.shutdown.clone()).await?
+    else {
+        return Ok(());
+    };
     let vault = session.vault.clone().unwrap();
     let suppress = v.get("suppressrenames").and_then(Value::as_bool) == Some(true);
     let _commit = s.commit_order.lock().await;
@@ -2149,6 +2256,137 @@ mod tests {
         assert_eq!(writer.visible, b"opaque ciphertext");
         assert!(writer.pending.is_empty());
         assert_eq!(writer.flushes, 1);
+    }
+
+    #[tokio::test]
+    async fn fixed_pull_queue_exits_promptly_on_shutdown() {
+        assert_eq!(MAX_CONCURRENT_PULLS, 2);
+        let pulls = Arc::new(Semaphore::new(MAX_CONCURRENT_PULLS));
+        let first = pulls.clone().acquire_owned().await.unwrap();
+        let second = pulls.clone().acquire_owned().await.unwrap();
+        let (shutdown_tx, shutdown) = watch::channel(false);
+        let waiting = tokio::spawn(acquire_pull_permit(pulls, shutdown));
+        tokio::task::yield_now().await;
+
+        shutdown_tx.send(true).unwrap();
+        let admitted = timeout(Duration::from_millis(250), waiting)
+            .await
+            .expect("queued pull ignored shutdown")
+            .expect("queued pull task panicked")
+            .expect("queued pull admission failed");
+        assert!(admitted.is_none());
+
+        drop((first, second));
+    }
+
+    #[tokio::test]
+    async fn password_memory_reservation_keeps_one_sync_lane_live() {
+        assert_eq!(BULK_MEMORY_PERMITS, 4);
+        assert_eq!(ARGON2_MEMORY_PERMITS, 3);
+        let bulk_memory = Arc::new(Semaphore::new(BULK_MEMORY_PERMITS));
+        let (_shutdown_tx, shutdown) = watch::channel(false);
+        let password = acquire_password_memory(
+            bulk_memory.clone(),
+            shutdown,
+            tokio::time::Instant::now() + Duration::from_millis(250),
+        )
+        .await
+        .unwrap()
+        .expect("password memory admission timed out");
+
+        assert_eq!(bulk_memory.available_permits(), 1);
+        let (_shutdown_tx, shutdown) = watch::channel(false);
+        let sync = timeout(
+            Duration::from_millis(250),
+            acquire_bulk_memory(bulk_memory.clone(), shutdown),
+        )
+        .await
+        .expect("password verification froze authenticated Sync")
+        .unwrap()
+        .expect("bulk-memory pool stopped");
+        assert_eq!(bulk_memory.available_permits(), 0);
+
+        drop(sync);
+        assert_eq!(bulk_memory.available_permits(), 1);
+        drop(password);
+        assert_eq!(bulk_memory.available_permits(), BULK_MEMORY_PERMITS);
+    }
+
+    #[test]
+    fn replay_page_has_an_explicit_memory_bound() {
+        assert_eq!(REPLAY_PAGE_SIZE, 16);
+        assert_eq!(MAX_REPLAY_PAGE_BYTES, 512 * 1024);
+        assert_eq!(MAX_REPLAY_PAGES_BYTES, 8 * 1024 * 1024);
+    }
+
+    #[tokio::test]
+    async fn queued_password_memory_reservation_is_fair_to_sync_work() {
+        let bulk_memory = Arc::new(Semaphore::new(BULK_MEMORY_PERMITS));
+        let first_active_sync = bulk_memory
+            .clone()
+            .acquire_many_owned(ARGON2_MEMORY_PERMITS)
+            .await
+            .unwrap();
+        let second_active_sync = bulk_memory.clone().acquire_owned().await.unwrap();
+        let (_shutdown_tx, shutdown) = watch::channel(false);
+        let waiting_password = tokio::spawn(acquire_password_memory(
+            bulk_memory.clone(),
+            shutdown,
+            tokio::time::Instant::now() + Duration::from_secs(1),
+        ));
+        tokio::task::yield_now().await;
+
+        let (_shutdown_tx, shutdown) = watch::channel(false);
+        let waiting_sync = tokio::spawn(acquire_bulk_memory(bulk_memory.clone(), shutdown));
+        tokio::task::yield_now().await;
+        assert!(!waiting_sync.is_finished());
+
+        drop(first_active_sync);
+        let password = timeout(Duration::from_millis(250), waiting_password)
+            .await
+            .expect("queued password reservation was bypassed")
+            .expect("queued password task panicked")
+            .expect("password memory admission failed")
+            .expect("password memory admission timed out");
+        tokio::task::yield_now().await;
+        assert!(!waiting_sync.is_finished());
+
+        drop(second_active_sync);
+        let sync = timeout(Duration::from_millis(250), waiting_sync)
+            .await
+            .expect("reserved Sync lane was not admitted")
+            .expect("queued Sync task panicked")
+            .expect("bulk-memory admission failed")
+            .expect("bulk-memory pool stopped");
+
+        drop((password, sync));
+    }
+
+    #[tokio::test]
+    async fn queued_password_memory_reservation_exits_promptly_on_shutdown() {
+        let bulk_memory = Arc::new(Semaphore::new(BULK_MEMORY_PERMITS));
+        let active = bulk_memory
+            .clone()
+            .acquire_many_owned(BULK_MEMORY_PERMITS as u32)
+            .await
+            .unwrap();
+        let (shutdown_tx, shutdown) = watch::channel(false);
+        let waiting = tokio::spawn(acquire_password_memory(
+            bulk_memory,
+            shutdown,
+            tokio::time::Instant::now() + Duration::from_secs(1),
+        ));
+        tokio::task::yield_now().await;
+
+        shutdown_tx.send(true).unwrap();
+        let admitted = timeout(Duration::from_millis(250), waiting)
+            .await
+            .expect("queued password reservation ignored shutdown")
+            .expect("queued password task panicked")
+            .expect("password memory admission failed");
+        assert!(admitted.is_none());
+
+        drop(active);
     }
 
     #[test]

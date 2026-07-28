@@ -19,11 +19,11 @@
     "server": "cargo run --release --manifest-path apps/server-rust/Cargo.toml -- serve",
     "server:bun-oracle": "bun run apps/server/src/index.ts",
     "server:check": "cargo check --manifest-path apps/server-rust/Cargo.toml",
-    "server:test": "cargo test --manifest-path apps/server-rust/Cargo.toml",
+    "server:test": "cargo test --locked --manifest-path apps/server-rust/Cargo.toml",
     "server:measure": "bun run tools/measure-rust-server.ts",
     "test:integration": "bun test tests/server.integration.test.ts",
     "verify:release-metadata": "./ops/verify-release-metadata.sh",
-    "check": "bun run verify:release-metadata && bun run typecheck && cargo fmt --manifest-path apps/server-rust/Cargo.toml -- --check && cargo clippy --locked --manifest-path apps/server-rust/Cargo.toml --all-targets -- -D warnings && bun test",
+    "check": "bun run verify:release-metadata && bun run typecheck && cargo fmt --manifest-path apps/server-rust/Cargo.toml -- --check && cargo clippy --locked --manifest-path apps/server-rust/Cargo.toml --all-targets -- -D warnings && bun run server:test && bun test",
     "test": "bun test",
     "typecheck": "tsc --noEmit"
   },

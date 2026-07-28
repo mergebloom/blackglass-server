@@ -354,11 +354,68 @@ impl Db {
     }
     pub fn content_chunk(&self, uid: i64, offset: i64, length: i64) -> Result<Vec<u8>> {
         self.with(|c| {
-            Ok(c.query_row(
-                "SELECT COALESCE((SELECT substr(content,?,?) FROM revision_content WHERE revision_content.uid=revisions.uid),substr(content,?,?)) FROM revisions WHERE uid=?",
-                params![offset + 1, length, offset + 1, length, uid],
-                |r| r.get(0),
-            )?)
+            if offset < 0 || !(0..=REVISION_PIECE_SIZE).contains(&length) {
+                bail!("invalid revision content chunk bounds")
+            }
+            let end = offset
+                .checked_add(length)
+                .context("revision content chunk bounds overflow")?;
+            let (declared_size, external, external_blob, inline, inline_blob): (
+                i64,
+                bool,
+                bool,
+                bool,
+                bool,
+            ) = c
+                .query_row(
+                    "SELECT r.size,
+                        EXISTS(SELECT 1 FROM revision_content rc WHERE rc.uid=r.uid),
+                        EXISTS(SELECT 1 FROM revision_content rc
+                                WHERE rc.uid=r.uid AND typeof(rc.content)='blob'),
+                        r.content IS NOT NULL,
+                        typeof(r.content)='blob'
+                   FROM revisions r WHERE r.uid=?",
+                    [uid],
+                    |row| {
+                        Ok((
+                            row.get(0)?,
+                            row.get::<_, i64>(1)? == 1,
+                            row.get::<_, i64>(2)? == 1,
+                            row.get::<_, i64>(3)? == 1,
+                            row.get::<_, i64>(4)? == 1,
+                        ))
+                    },
+                )
+                .optional()?
+                .context("revision content metadata not found")?;
+            if end > declared_size {
+                bail!("revision content chunk exceeds declared size")
+            }
+            if external != external_blob || inline != inline_blob || external == inline {
+                bail!("revision content storage is missing, duplicated, or not a BLOB")
+            }
+
+            // SQL substr() first materializes the complete BLOB. That makes a
+            // 2 MiB pull allocate as much as the configured per-file maximum.
+            // Incremental BLOB I/O reads only the bounded wire piece instead.
+            let table = if external {
+                "revision_content"
+            } else {
+                "revisions"
+            };
+            let blob = c.blob_open("main", table, "content", uid, true)?;
+            if i64::try_from(blob.len()).context("revision content length exceeds i64")?
+                != declared_size
+            {
+                bail!("revision content length changed after validation")
+            }
+            let offset =
+                usize::try_from(offset).context("revision content offset exceeds usize")?;
+            let length =
+                usize::try_from(length).context("revision content length exceeds usize")?;
+            let mut chunk = vec![0; length];
+            blob.read_at_exact(&mut chunk, offset)?;
+            Ok(chunk)
         })
     }
 
@@ -2090,6 +2147,41 @@ mod tests {
         drop(database);
     }
 
+    fn create_test_vault(database: &Db, id: &str) {
+        database
+            .create_vault(&Vault {
+                id: id.into(),
+                name: "Vault".into(),
+                keyhash: Some("key".into()),
+                salt: Some("salt".into()),
+                host: "localhost:3003".into(),
+                region: "Blackglass Server".into(),
+                encryption_version: 3,
+                size: 0,
+                created: 1,
+                password: None,
+            })
+            .unwrap();
+    }
+
+    fn test_file_revision(vault: &str, path: &str, size: i64) -> NewRevision {
+        NewRevision {
+            vault_id: vault.into(),
+            path: path.into(),
+            relatedpath: None,
+            extension: "bin".into(),
+            hash: format!("hash-{path}"),
+            ctime: 1,
+            mtime: 2,
+            folder: false,
+            deleted: false,
+            size,
+            pieces: (size + REVISION_PIECE_SIZE - 1) / REVISION_PIECE_SIZE,
+            device: "test".into(),
+            user_id: 1,
+        }
+    }
+
     fn create_legacy_database(path: &Path) {
         let connection = Connection::open(path).unwrap();
         connection
@@ -2240,6 +2332,172 @@ mod tests {
 
         drop(connection);
         assert!(database.ready());
+    }
+
+    #[test]
+    fn content_chunks_use_bounded_incremental_reads_for_external_blobs() {
+        let dir = tempfile::tempdir().unwrap();
+        let database = Db::open(&dir.path().join("external-content.sqlite")).unwrap();
+        create_test_vault(&database, "vault");
+        let content_len = REVISION_PIECE_SIZE as usize * 2 + 17;
+        let content = (0..content_len)
+            .map(|index| ((index * 31) % 251) as u8)
+            .collect::<Vec<_>>();
+        let staged = dir.path().join("staged-content");
+        std::fs::write(&staged, &content).unwrap();
+        let stored = database
+            .add_file_revision(
+                &test_file_revision("vault", "external", content_len as i64),
+                &staged,
+            )
+            .unwrap();
+        let piece = REVISION_PIECE_SIZE as usize;
+
+        assert_eq!(
+            database
+                .content_chunk(stored.uid, 0, REVISION_PIECE_SIZE)
+                .unwrap(),
+            content[..piece]
+        );
+        assert_eq!(
+            database
+                .content_chunk(stored.uid, REVISION_PIECE_SIZE, REVISION_PIECE_SIZE)
+                .unwrap(),
+            content[piece..piece * 2]
+        );
+        assert_eq!(
+            database
+                .content_chunk(stored.uid, REVISION_PIECE_SIZE * 2, 17)
+                .unwrap(),
+            content[piece * 2..]
+        );
+        assert_eq!(
+            database
+                .content_chunk(stored.uid, content_len as i64, 0)
+                .unwrap(),
+            Vec::<u8>::new()
+        );
+
+        assert_error_contains(
+            database.content_chunk(stored.uid, -1, 1),
+            "invalid revision content chunk bounds",
+        );
+        assert_error_contains(
+            database.content_chunk(stored.uid, 0, -1),
+            "invalid revision content chunk bounds",
+        );
+        assert_error_contains(
+            database.content_chunk(stored.uid, 0, REVISION_PIECE_SIZE + 1),
+            "invalid revision content chunk bounds",
+        );
+        assert_error_contains(
+            database.content_chunk(stored.uid, content_len as i64 - 1, 2),
+            "exceeds declared size",
+        );
+        assert_error_contains(
+            database.content_chunk(stored.uid, i64::MAX, 1),
+            "bounds overflow",
+        );
+
+        database
+            .with(|connection| {
+                connection.execute(
+                    "UPDATE revision_content SET content=zeroblob(?) WHERE uid=?",
+                    params![content_len as i64 - 1, stored.uid],
+                )?;
+                Ok(())
+            })
+            .unwrap();
+        assert_error_contains(
+            database.content_chunk(stored.uid, 0, 1),
+            "content length changed after validation",
+        );
+
+        database
+            .with(|connection| {
+                connection.execute(
+                    "UPDATE revision_content SET content=zeroblob(?) WHERE uid=?",
+                    params![content_len as i64, stored.uid],
+                )?;
+                connection.execute(
+                    "UPDATE revisions SET content=zeroblob(?) WHERE uid=?",
+                    params![content_len as i64, stored.uid],
+                )?;
+                Ok(())
+            })
+            .unwrap();
+        assert_error_contains(
+            database.content_chunk(stored.uid, 0, 1),
+            "storage is missing, duplicated, or not a BLOB",
+        );
+
+        database
+            .with(|connection| {
+                connection.execute(
+                    "UPDATE revisions SET content=NULL WHERE uid=?",
+                    [stored.uid],
+                )?;
+                connection.execute("DELETE FROM revision_content WHERE uid=?", [stored.uid])?;
+                Ok(())
+            })
+            .unwrap();
+        assert_error_contains(
+            database.content_chunk(stored.uid, 0, 1),
+            "storage is missing, duplicated, or not a BLOB",
+        );
+        assert_error_contains(
+            database.content_chunk(stored.uid + 1, 0, 1),
+            "content metadata not found",
+        );
+    }
+
+    #[test]
+    fn content_chunks_fall_back_to_legacy_inline_blobs() {
+        let dir = tempfile::tempdir().unwrap();
+        let database = Db::open(&dir.path().join("inline-content.sqlite")).unwrap();
+        create_test_vault(&database, "vault");
+        let content_len = REVISION_PIECE_SIZE as usize + 23;
+        let content = (0..content_len)
+            .map(|index| ((index * 17) % 253) as u8)
+            .collect::<Vec<_>>();
+        let revision = test_file_revision("vault", "inline", content_len as i64);
+        let stored = database
+            .with(|connection| add_revision(connection, &revision, Some(&content)))
+            .unwrap();
+        let piece = REVISION_PIECE_SIZE as usize;
+
+        assert_eq!(
+            database
+                .content_chunk(stored.uid, 0, REVISION_PIECE_SIZE)
+                .unwrap(),
+            content[..piece]
+        );
+        assert_eq!(
+            database
+                .content_chunk(stored.uid, REVISION_PIECE_SIZE - 11, 29)
+                .unwrap(),
+            content[piece - 11..piece + 18]
+        );
+        assert_eq!(
+            database
+                .content_chunk(stored.uid, REVISION_PIECE_SIZE, 23)
+                .unwrap(),
+            content[piece..]
+        );
+
+        database
+            .with(|connection| {
+                connection.execute(
+                    "UPDATE revisions SET content=zeroblob(?) WHERE uid=?",
+                    params![content_len as i64 - 1, stored.uid],
+                )?;
+                Ok(())
+            })
+            .unwrap();
+        assert_error_contains(
+            database.content_chunk(stored.uid, 0, 1),
+            "content length changed after validation",
+        );
     }
 
     #[test]

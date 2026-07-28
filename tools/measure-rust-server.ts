@@ -1,8 +1,33 @@
 import { createHash, randomBytes } from "node:crypto";
 import { createServer } from "node:net";
-import { mkdir, mkdtemp, readdir, rm, stat, writeFile } from "node:fs/promises";
+import {
+  chmod,
+  copyFile,
+  mkdir,
+  mkdtemp,
+  readFile,
+  readdir,
+  rm,
+  stat,
+  writeFile,
+} from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { basename, dirname, join, resolve } from "node:path";
+import {
+  type CgroupEvents,
+  cgroupResourceLimits,
+  evaluateCgroupResourceGate,
+  evaluateResourceGate,
+  parseCgroupEvents,
+  parseCgroupPidList,
+  parseCgroupScalar,
+  parseLinuxRssKiB,
+  parseUnifiedCgroupPath,
+  qualifyNativeLinuxTarget,
+  resourceLimits,
+  resourceReportSchemaVersion,
+  subtractCgroupEvents,
+} from "./resource-gate.ts";
 
 const pieceBytes = 2 * 1024 * 1024;
 const uploadBytes = 64 * 1024 * 1024;
@@ -11,16 +36,47 @@ const websocketConnections = 16;
 const concurrentUploads = 4;
 const concurrentPulls = 8;
 const concurrentArgonRequests = 10;
-const historyRevisions = 100;
-const maxPeakRssMiB = 224;
-const maxDeltaRssMiB = 128;
+const pullFrameConcurrencyLimit = 2;
+const bulkMemoryAdmission = Object.freeze({
+  totalPermits: 4,
+  argon2Permits: 3,
+  reservedSyncPermits: 1,
+});
+const historyRevisions = 128;
+const historyResponseItems = 100;
+const replayStormConnections = websocketConnections - concurrentUploads - 1;
+const replayPageSize = 16;
 const resourcePassword = "resource-password";
+const resourceMode = process.env.BLACKGLASS_RESOURCE_MODE ?? "process-rss";
+if (resourceMode !== "process-rss" && resourceMode !== "cgroup-v2") {
+  throw new Error("BLACKGLASS_RESOURCE_MODE must be process-rss or cgroup-v2");
+}
+const cgroupMode = resourceMode === "cgroup-v2";
 // A deterministic, non-secret test fixture at every accepted Argon2 work
 // maximum. Starting the server with it makes the measured password queue cover
 // the production configuration envelope rather than only the generated
 // default. Changing the accepted policy without updating this gate fails fast.
 const maximumWorkPasswordHash =
   "$argon2id$v=19$m=65536,t=5,p=4$YmxhY2tnbGFzcy1yZXNvdXJjZS1lbnZlbG9wZS12MQ$qF1GQ0hLTNgx8hhl7Qo3R7r1pSYB+eYXdX4KtmWP5VI";
+
+type CgroupContext = {
+  container: string;
+  image: string;
+  imageId: string;
+  volume: string;
+  stopped: boolean;
+  hostPid: number;
+  path: string;
+  eventsPath: string;
+  eventsBefore: CgroupEvents;
+  artifactBinarySha256: string;
+  stagedBinarySha256: string;
+  inImageBinarySha256: string;
+  nativeTarget: string;
+  hostPlatform: string;
+  hostArchitecture: string;
+  elfDescription: string;
+};
 
 class Probe {
   private queue: unknown[] = [];
@@ -36,10 +92,10 @@ class Probe {
     });
   }
 
-  static connect(url: string): Promise<Probe> {
+  static connect(url: string, extraHeaders: Record<string, string> = {}): Promise<Probe> {
     return new Promise((resolveProbe, reject) => {
       const socket = new WebSocket(url, {
-        headers: { Origin: "app://obsidian.md" },
+        headers: { Origin: "app://obsidian.md", ...extraHeaders },
       } as unknown as string[]);
       const probe = new Probe(socket);
       socket.addEventListener("open", () => resolveProbe(probe), { once: true });
@@ -80,30 +136,52 @@ const buildInfoResult = Bun.spawnSync([binary, "build-info"], {
 });
 if (buildInfoResult.exitCode !== 0) throw new Error(buildInfoResult.stderr.toString());
 const buildInfo = JSON.parse(buildInfoResult.stdout.toString());
+const expectedSourceRevision = process.env.BLACKGLASS_EXPECTED_SOURCE_REVISION;
+if (
+  expectedSourceRevision !== undefined &&
+  (!/^[0-9a-f]{40}$/.test(expectedSourceRevision) ||
+    buildInfo.sourceRevision !== expectedSourceRevision)
+) {
+  throw new Error("release binary source revision does not match the expected full commit");
+}
+if (cgroupMode && expectedSourceRevision === undefined) {
+  throw new Error("cgroup-v2 qualification requires BLACKGLASS_EXPECTED_SOURCE_REVISION");
+}
 const directory = await mkdtemp(join(tmpdir(), "blackglass-rust-resource-"));
 const [controlPort, dataPort] = await freePorts(2);
-const child = Bun.spawn([binary, "serve"], {
-  cwd: root,
-  stdout: "ignore",
-  stderr: "ignore",
-  env: {
-    ...process.env,
-    SELFHOST_BIND_HOST: "127.0.0.1",
-    SELFHOST_CONTROL_PORT: String(controlPort),
-    SELFHOST_DATA_PORT: String(dataPort),
-    SELFHOST_DATA_HOST: `127.0.0.1:${dataPort}`,
-    SELFHOST_DATABASE: join(directory, "server.sqlite"),
-    SELFHOST_STAGING_DIR: join(directory, "uploads"),
-    SELFHOST_EMAIL: "resource@example.test",
-    SELFHOST_PASSWORD_HASH: maximumWorkPasswordHash,
-    SELFHOST_NAME: "Resource test",
-    SELFHOST_PER_FILE_MAX: String(128 * 1024 * 1024),
-    SELFHOST_MAX_CONCURRENT_UPLOADS: String(concurrentUploads),
-    SELFHOST_ALLOWED_ORIGINS: "app://obsidian.md",
-    SELFHOST_TRUSTED_PROXY: "127.0.0.1",
-    SELFHOST_LOG_FORMAT: "pretty",
-  },
-});
+let child: ReturnType<typeof Bun.spawn> | undefined;
+let cgroup: CgroupContext | undefined;
+if (cgroupMode) {
+  try {
+    cgroup = await startCgroupContainer();
+  } catch (error) {
+    await rm(directory, { recursive: true, force: true });
+    throw error;
+  }
+} else {
+  child = Bun.spawn([binary, "serve"], {
+    cwd: root,
+    stdout: process.env.BLACKGLASS_RESOURCE_DEBUG === "1" ? "inherit" : "ignore",
+    stderr: process.env.BLACKGLASS_RESOURCE_DEBUG === "1" ? "inherit" : "ignore",
+    env: {
+      ...process.env,
+      SELFHOST_BIND_HOST: "127.0.0.1",
+      SELFHOST_CONTROL_PORT: String(controlPort),
+      SELFHOST_DATA_PORT: String(dataPort),
+      SELFHOST_DATA_HOST: `127.0.0.1:${dataPort}`,
+      SELFHOST_DATABASE: join(directory, "server.sqlite"),
+      SELFHOST_STAGING_DIR: join(directory, "uploads"),
+      SELFHOST_EMAIL: "resource@example.test",
+      SELFHOST_PASSWORD_HASH: maximumWorkPasswordHash,
+      SELFHOST_NAME: "Resource test",
+      SELFHOST_PER_FILE_MAX: String(128 * 1024 * 1024),
+      SELFHOST_MAX_CONCURRENT_UPLOADS: String(concurrentUploads),
+      SELFHOST_ALLOWED_ORIGINS: "app://obsidian.md",
+      SELFHOST_TRUSTED_PROXY: "127.0.0.1",
+      SELFHOST_LOG_FORMAT: "pretty",
+    },
+  });
+}
 const probes: Probe[] = [];
 
 try {
@@ -140,12 +218,30 @@ try {
     }
   }
 
-  for (let index = 1; index < websocketConnections - concurrentUploads; index++) {
-    const probe = await Probe.connect(`ws://127.0.0.1:${dataPort}`);
+  const replayWork: Promise<void>[] = [];
+  for (let offset = 0; offset < replayStormConnections; offset++) {
+    const index = offset + 1;
+    const probe = await Probe.connect(`ws://127.0.0.1:${dataPort}`, {
+      "x-forwarded-for": `198.51.100.${50 + index}`,
+    });
     sourceProbes.push(probe);
     probes.push(probe);
-    await initialize(probe, signin.token, vault, `Resource reader ${index}`);
+    let accepted!: () => void;
+    const authenticated = new Promise<void>((resolveAuthenticated) => {
+      accepted = resolveAuthenticated;
+    });
+    const initialization = initialize(
+      probe,
+      signin.token,
+      vault,
+      `Resource reader ${index}`,
+      false,
+      accepted,
+    );
+    replayWork.push(initialization);
+    await Promise.race([authenticated, initialization]);
   }
+  await Promise.all(replayWork);
 
   const uploadProbes: Probe[] = [];
   for (let index = 0; index < concurrentUploads; index++) {
@@ -168,6 +264,7 @@ try {
   await Bun.sleep(100);
 
   const baselineRssKiB = await rss();
+  const workloadStartedAt = performance.now();
   let peakRssKiB = baselineRssKiB;
   const rssSamplesKiB: number[] = [];
   const sharedUploadPiece = new Uint8Array(randomBytes(pieceBytes));
@@ -206,7 +303,6 @@ try {
     await Bun.sleep(25);
   }
   const [uploadResults, downloadSizes, historyResponse, signinResponses] = await work;
-  peakRssKiB = Math.max(peakRssKiB, await rss());
 
   if (uploadResults.length !== concurrentUploads) {
     throw new Error("not every concurrent upload committed");
@@ -214,7 +310,11 @@ try {
   if (downloadSizes.some((size) => size !== uploadBytes)) {
     throw new Error("a concurrent pull returned incomplete content");
   }
-  if (!Array.isArray(historyResponse.items) || historyResponse.items.length !== historyRevisions) {
+  if (
+    !Array.isArray(historyResponse.items) ||
+    historyResponse.items.length !== historyResponseItems ||
+    historyResponse.more !== true
+  ) {
     throw new Error("large history response was incomplete");
   }
   if (
@@ -226,75 +326,607 @@ try {
     throw new Error("bounded Argon2 workload returned an unexpected response");
   }
 
-  const databaseBytes = (await stat(join(directory, "server.sqlite"))).size;
-  const stagingEntries = await readdir(join(directory, "uploads"));
-  const unexpectedStagingEntries = stagingEntries.filter(
-    (entry) => entry !== ".blackglass-staging-v1",
+  // Prove that the measured binary completes maximum-policy password work
+  // while the permit deliberately reserved for authenticated Sync is active.
+  // Admission rejections in the larger overlap are valid, but cannot make a
+  // release pass without this deterministic 1+1 phase.
+  let reservedLaneWorkSettled = false;
+  const standaloneArgonWork = post(
+    "/user/signin",
+    { email: "resource@example.test", password: "standalone-wrong-password" },
+    { "x-forwarded-for": "198.51.100.250" },
   );
-  const binarySha256 = createHash("sha256")
-    .update(Buffer.from(await Bun.file(binary).arrayBuffer()))
-    .digest("hex");
-  const deltaRssKiB = peakRssKiB - baselineRssKiB;
-  const peakRssMiB = peakRssKiB / 1024;
-  const deltaRssMiB = deltaRssKiB / 1024;
+  const reservedSyncPullWork = download(sourceProbes[1]!, uploaded.uid);
+  const reservedLaneWork = Promise.all([standaloneArgonWork, reservedSyncPullWork]).finally(() => {
+    reservedLaneWorkSettled = true;
+  });
+  while (!reservedLaneWorkSettled) {
+    const sample = await rss();
+    rssSamplesKiB.push(sample);
+    peakRssKiB = Math.max(peakRssKiB, sample);
+    await Bun.sleep(25);
+  }
+  const [standaloneArgonResponse, reservedSyncPullBytes] = await reservedLaneWork;
+  const standaloneArgon2CompletedCheck =
+    standaloneArgonResponse.error === "Invalid email or password";
+  const reservedSyncPullCompleted = reservedSyncPullBytes === uploadBytes;
+  const argon2WithReservedSyncCompleted =
+    standaloneArgon2CompletedCheck && reservedSyncPullCompleted;
+  if (!argon2WithReservedSyncCompleted) {
+    throw new Error("maximum-policy Argon2 and its reserved Sync lane did not complete");
+  }
+  const concurrentArgon2CompletedChecks = signinResponses.filter(
+    (response) => response.error === "Invalid email or password",
+  ).length;
+  const concurrentArgon2RejectedRequests =
+    signinResponses.length - concurrentArgon2CompletedChecks;
+  const argon2CompletedChecks = concurrentArgon2CompletedChecks + 1;
+  const durationMs = Math.round(performance.now() - workloadStartedAt);
+
+  peakRssKiB = Math.max(peakRssKiB, await rss());
+  const linuxPeakRssKiB = await linuxPeakRss();
+  if (linuxPeakRssKiB !== null) peakRssKiB = Math.max(peakRssKiB, linuxPeakRssKiB);
+
+  const binarySha256 = await sha256Path(binary);
   const largeResponseBytes = Buffer.byteLength(JSON.stringify(historyResponse));
-  const workloadPassed =
+  const protocolWorkloadPassed =
     probes.length === websocketConnections &&
     sourceProbes.length === websocketConnections - concurrentUploads &&
     uploadProbes.length === concurrentUploads &&
     uploadResults.length === concurrentUploads &&
     downloadSizes.length === concurrentPulls &&
-    unexpectedStagingEntries.length === 0;
-  const report = {
-    schemaVersion: 3,
-    passed:
-      workloadPassed && peakRssMiB < maxPeakRssMiB && deltaRssMiB < maxDeltaRssMiB,
+    argon2WithReservedSyncCompleted &&
+    concurrentArgon2CompletedChecks >= 1 &&
+    argon2CompletedChecks >= 1;
+  const reportIdentity = {
     implementation: "rust-release",
     target: process.env.BLACKGLASS_RELEASE_TARGET ?? `${process.platform}-${process.arch}`,
     binaryName: basename(binary),
     binarySha256,
     sourceRevision: buildInfo.sourceRevision,
-    workload: {
-      seedUploadBytes: uploadBytes,
-      uploadBytesEach: uploadBytes,
-      concurrentUploads,
-      measuredUploadBytes: uploadBytes * concurrentUploads,
-      pieceBytes,
-      pieces,
-      websocketConnections,
-      concurrentPulls,
-      concurrentArgonRequests,
-      argon2PolicyMaximum: {
-        algorithm: "argon2id",
-        version: 19,
-        memoryKiB: 65_536,
-        timeCost: 5,
-        parallelism: 4,
-        concurrentChecks: 1,
-      },
-      historyRevisions,
-      largeResponseBytes,
-    },
-    baselineRssKiB,
-    rssSamplesKiB,
-    peakRssKiB,
-    deltaRssKiB,
-    peakRssMiB,
-    deltaRssMiB,
-    databaseBytes,
-    stagingEntries,
-    unexpectedStagingEntries,
-    limits: { maxPeakRssMiB, maxDeltaRssMiB },
   };
+  const workload = {
+    seedUploadBytes: uploadBytes,
+    uploadBytesEach: uploadBytes,
+    concurrentUploads,
+    measuredUploadBytes: uploadBytes * concurrentUploads,
+    pieceBytes,
+    pieces,
+    websocketConnections,
+    concurrentPulls,
+    pullFrameConcurrencyLimit,
+    replayStormConnections,
+    replayPageSize,
+    replayRevisions: historyRevisions,
+    concurrentArgonRequests,
+    bulkMemoryAdmission,
+    concurrentArgon2CompletedChecks,
+    concurrentArgon2RejectedRequests,
+    standaloneArgon2CompletedCheck,
+    reservedSyncPullBytes,
+    reservedSyncPullCompleted,
+    argon2WithReservedSyncCompleted,
+    argon2CompletedChecks,
+    argon2PolicyMaximum: {
+      algorithm: "argon2id",
+      version: 19,
+      memoryKiB: 65_536,
+      timeCost: 5,
+      parallelism: 4,
+      concurrentChecks: 1,
+    },
+    historyRevisions,
+    historyResponseItems,
+    largeResponseBytes,
+    durationMs,
+  };
+  if (cgroupMode) {
+    const context = cgroup!;
+    const cgroupDirectory = resolve("/sys/fs/cgroup", `.${context.path}`);
+    let memoryPeakBytes = parseCgroupScalar(
+      await readFile(join(cgroupDirectory, "memory.peak"), "utf8"),
+      "memory.peak",
+    );
+    const configuredMemoryBytes = parseCgroupScalar(
+      await readFile(join(cgroupDirectory, "memory.max"), "utf8"),
+      "memory.max",
+    );
+    const configuredMemorySwapBytes = parseCgroupScalar(
+      await readFile(join(cgroupDirectory, "memory.swap.max"), "utf8"),
+      "memory.swap.max",
+    );
+    let memoryEvents = parseCgroupEvents(await readFile(context.eventsPath, "utf8"));
+    const finalCgroupPids = parseCgroupPidList(
+      await readFile(join(cgroupDirectory, "cgroup.procs"), "utf8"),
+    );
+    const finalCopiedBinary = join(directory, "in-image-binary-final");
+    runDocker([
+      "cp",
+      `${context.container}:/usr/local/bin/blackglass-server`,
+      finalCopiedBinary,
+    ]);
+    const finalInImageBinarySha256 = await sha256Path(finalCopiedBinary);
+    for (const probe of probes) probe.socket.close();
+    await Bun.sleep(100);
+
+    // Docker removes the process and its cgroup after a successful stop. Keep
+    // the last valid kernel snapshots while the graceful drain runs so the
+    // release report includes shutdown allocations and non-killing OOM events,
+    // not only the steady-state workload.
+    const captureShutdownMeasurements = async () => {
+      const cgroupSnapshot = await readCgroupSnapshot(cgroupDirectory, context.eventsPath);
+      if (cgroupSnapshot) {
+        memoryPeakBytes = Math.max(memoryPeakBytes, cgroupSnapshot.memoryPeakBytes);
+        memoryEvents = cgroupSnapshot.memoryEvents;
+        const shutdownPeakRssKiB = await readLinuxPeakRssForPid(context.hostPid);
+        if (shutdownPeakRssKiB !== null) {
+          peakRssKiB = Math.max(peakRssKiB, shutdownPeakRssKiB);
+        }
+      }
+    };
+    await captureShutdownMeasurements();
+    const stopProcess = Bun.spawn(["docker", "stop", "--time", "30", context.container], {
+      stdout: "pipe",
+      stderr: "pipe",
+    });
+    let stopSettled = false;
+    const stopCompletion = stopProcess.exited.finally(() => {
+      stopSettled = true;
+    });
+    while (!stopSettled) {
+      await captureShutdownMeasurements();
+      await Bun.sleep(10);
+    }
+    const stopExitCode = await stopCompletion;
+    await captureShutdownMeasurements();
+    if (stopExitCode !== 0) {
+      throw new Error(
+        `docker stop failed: ${await new Response(stopProcess.stderr).text()}`,
+      );
+    }
+    context.stopped = true;
+    const memoryEventDelta = subtractCgroupEvents(memoryEvents, context.eventsBefore);
+    const inspection = dockerInspect(context.container);
+    const exitCode = Number(inspection.State.ExitCode);
+    const oomKilled = inspection.State.OOMKilled === true;
+    const stateError = String(inspection.State.Error ?? "");
+    const dockerMemoryLimitBytes = Number(inspection.HostConfig.Memory);
+    const dockerMemorySwapTotalBytes = Number(inspection.HostConfig.MemorySwap);
+    const capturedState = join(directory, "captured-state");
+    await mkdir(capturedState);
+    runDocker([
+      "cp",
+      `${context.container}:/var/lib/blackglass-server/.`,
+      capturedState,
+    ]);
+    const databaseBytes = (await stat(join(capturedState, "server.sqlite"))).size;
+    const stagingEntries = await readdir(join(capturedState, "uploads"));
+    const unexpectedStagingEntries = stagingEntries.filter(
+      (entry) => entry !== ".blackglass-staging-v1",
+    );
+    const workloadPassed = protocolWorkloadPassed && unexpectedStagingEntries.length === 0;
+    const deltaRssKiB = peakRssKiB - baselineRssKiB;
+    const processEvaluation = evaluateResourceGate(
+      workloadPassed,
+      baselineRssKiB,
+      peakRssKiB,
+    );
+    const { peakRssMiB, deltaRssMiB, processRssMarginMiB } = processEvaluation;
+    const identityHashesMatch =
+      binarySha256 === context.artifactBinarySha256 &&
+      binarySha256 === context.stagedBinarySha256 &&
+      binarySha256 === context.inImageBinarySha256 &&
+      binarySha256 === finalInImageBinarySha256;
+    const serverOnlyCgroup =
+      finalCgroupPids.length === 1 && finalCgroupPids[0] === context.hostPid;
+    const containerIsolationPassed =
+      inspection.Config.User === "65532:65532" &&
+      JSON.stringify(inspection.Config.Entrypoint) ===
+        JSON.stringify(["/usr/local/bin/blackglass-server"]) &&
+      JSON.stringify(inspection.Config.Cmd) === JSON.stringify(["serve"]) &&
+      inspection.Path === "/usr/local/bin/blackglass-server" &&
+      JSON.stringify(inspection.Args) === JSON.stringify(["serve"]) &&
+      inspection.HostConfig.ReadonlyRootfs === true &&
+      inspection.HostConfig.NetworkMode === "host" &&
+      Number(inspection.HostConfig.PidsLimit) === 64 &&
+      inspection.HostConfig.CapDrop?.includes("ALL") === true &&
+      inspection.HostConfig.SecurityOpt?.includes("no-new-privileges") === true &&
+      inspection.Mounts?.some((mount: any) =>
+        mountCoversPath(String(mount.Destination), "/usr/local/bin/blackglass-server"),
+      ) !== true;
+    const evaluation = evaluateCgroupResourceGate(
+      workloadPassed,
+      memoryPeakBytes,
+      configuredMemoryBytes,
+      configuredMemorySwapBytes,
+      memoryEvents.oom,
+      memoryEvents.oomKill,
+      memoryEvents.oomGroupKill,
+      oomKilled,
+      exitCode,
+    );
+    const report = {
+      schemaVersion: resourceReportSchemaVersion,
+      passed:
+        processEvaluation.passed &&
+        evaluation.passed &&
+        context.eventsBefore.oom === 0 &&
+        context.eventsBefore.oomKill === 0 &&
+        context.eventsBefore.oomGroupKill === 0 &&
+        memoryEvents.oom === 0 &&
+        memoryEvents.oomKill === 0 &&
+        memoryEvents.oomGroupKill === 0 &&
+        memoryEventDelta.oomGroupKill === 0 &&
+        dockerMemoryLimitBytes === cgroupResourceLimits.memoryMaxBytes &&
+        dockerMemorySwapTotalBytes === cgroupResourceLimits.dockerMemorySwapTotalBytes &&
+        identityHashesMatch &&
+        serverOnlyCgroup &&
+        containerIsolationPassed &&
+        inspection.Image === context.imageId &&
+        stateError === "",
+      ...reportIdentity,
+      workload,
+      measurement: "cgroup-v2",
+      baselineRssKiB,
+      rssSamplesKiB,
+      peakRssMeasurement: "linux-vmhwm",
+      peakRssKiB,
+      deltaRssKiB,
+      peakRssMiB,
+      deltaRssMiB,
+      processRssMarginMiB,
+      execution: {
+        nativeTarget: context.nativeTarget,
+        hostPlatform: context.hostPlatform,
+        hostArchitecture: context.hostArchitecture,
+        elfDescription: context.elfDescription,
+        nativeRunnerMatch: true,
+        imageId: context.imageId,
+        containerUser: inspection.Config.User,
+        artifactBinarySha256: context.artifactBinarySha256,
+        stagedBinarySha256: context.stagedBinarySha256,
+        inImageBinarySha256: context.inImageBinarySha256,
+        finalInImageBinarySha256,
+        identityHashesMatch,
+        serverOnlyCgroup,
+        cgroupProcessCount: finalCgroupPids.length,
+        harnessCgroupSeparated: true,
+        containerIsolationPassed,
+        entrypoint: inspection.Config.Entrypoint,
+        command: inspection.Config.Cmd,
+        readOnlyRootFilesystem: inspection.HostConfig.ReadonlyRootfs,
+        networkMode: inspection.HostConfig.NetworkMode,
+        pidsLimit: Number(inspection.HostConfig.PidsLimit),
+        capDrop: inspection.HostConfig.CapDrop,
+        securityOptions: inspection.HostConfig.SecurityOpt,
+      },
+      cgroup: {
+        version: 2,
+        eventsSource: basename(context.eventsPath),
+        memoryPeakBytes,
+        memoryMaxBytes: configuredMemoryBytes,
+        memorySwapMaxBytes: configuredMemorySwapBytes,
+        memoryEventsBefore: context.eventsBefore,
+        memoryEvents,
+        memoryEventDelta,
+      },
+      container: {
+        dockerMemoryLimitBytes,
+        dockerMemorySwapTotalBytes,
+        gracefulExit: exitCode === 0 && !oomKilled && stateError === "",
+        exitCode,
+        oomKilled,
+        stateError,
+      },
+      databaseBytes,
+      stagingEntries,
+      unexpectedStagingEntries,
+      limits: { ...resourceLimits, ...cgroupResourceLimits },
+    };
+    await emitReport(report);
+  } else {
+    const databaseBytes = (await stat(join(directory, "server.sqlite"))).size;
+    const stagingEntries = await readdir(join(directory, "uploads"));
+    const unexpectedStagingEntries = stagingEntries.filter(
+      (entry) => entry !== ".blackglass-staging-v1",
+    );
+    const workloadPassed = protocolWorkloadPassed && unexpectedStagingEntries.length === 0;
+    const deltaRssKiB = peakRssKiB - baselineRssKiB;
+    const resourceEvaluation = evaluateResourceGate(
+      workloadPassed,
+      baselineRssKiB,
+      peakRssKiB,
+    );
+    const { peakRssMiB, deltaRssMiB, processRssMarginMiB } = resourceEvaluation;
+    const report = {
+      schemaVersion: resourceReportSchemaVersion,
+      passed: resourceEvaluation.passed,
+      ...reportIdentity,
+      workload,
+      measurement: "process-rss",
+      baselineRssKiB,
+      rssSamplesKiB,
+      peakRssMeasurement: linuxPeakRssKiB === null ? "sampled-rss" : "linux-vmhwm",
+      peakRssKiB,
+      deltaRssKiB,
+      peakRssMiB,
+      deltaRssMiB,
+      processRssMarginMiB,
+      databaseBytes,
+      stagingEntries,
+      unexpectedStagingEntries,
+      limits: resourceLimits,
+    };
+    await emitReport(report);
+  }
+} finally {
+  for (const probe of probes) probe.socket.close();
+  if (child) {
+    child.kill("SIGTERM");
+    await child.exited;
+  }
+  if (cgroup) {
+    if (!cgroup.stopped) {
+      Bun.spawnSync(["docker", "stop", "--time", "30", cgroup.container]);
+    }
+    Bun.spawnSync(["docker", "rm", "--force", "--volumes", cgroup.container]);
+    Bun.spawnSync(["docker", "volume", "rm", "--force", cgroup.volume]);
+    Bun.spawnSync(["docker", "image", "rm", "--force", cgroup.image]);
+  }
+  await rm(directory, { recursive: true, force: true });
+}
+
+async function startCgroupContainer(): Promise<CgroupContext> {
+  const target = process.env.BLACKGLASS_RELEASE_TARGET;
+  const fileResult = Bun.spawnSync(["file", "--brief", binary]);
+  const fileDescription = fileResult.stdout.toString();
+  if (fileResult.exitCode !== 0) throw new Error(fileResult.stderr.toString());
+  const targetShape = qualifyNativeLinuxTarget(
+    target,
+    process.platform,
+    process.arch,
+    fileDescription,
+  );
+  const container = `blackglass-resource-${process.pid}-${Date.now()}`;
+  const image = `${container}:image`;
+  const volume = `${container}-state`;
+  const context = join(directory, "image-context");
+  await mkdir(join(context, "state"), { recursive: true });
+  await writeFile(join(context, "state/.blackglass-state"), "");
+  const stagedBinary = join(context, "blackglass-server");
+  await copyFile(binary, stagedBinary);
+  await chmod(stagedBinary, 0o555);
+  const artifactBinarySha256 = await sha256Path(binary);
+  const stagedBinarySha256 = await sha256Path(stagedBinary);
+  try {
+    runDocker([
+      "buildx",
+      "build",
+      "--load",
+      "--platform",
+      `linux/${targetShape.dockerArchitecture}`,
+      "--file",
+      join(root, "ops/Dockerfile.prebuilt"),
+      "--tag",
+      image,
+      "--build-arg",
+      `SOURCE_REVISION=${buildInfo.sourceRevision}`,
+      "--build-arg",
+      `SOURCE_URL=https://github.com/${process.env.GITHUB_REPOSITORY ?? "mergebloom/blackglass-server"}`,
+      "--build-arg",
+      `TARGETARCH=${targetShape.dockerArchitecture}`,
+      "--build-arg",
+      `VERSION=${buildInfo.version}`,
+      context,
+    ]);
+    const imageId = runDocker(["image", "inspect", "--format", "{{.Id}}", image]).trim();
+    runDocker(["volume", "create", volume]);
+    runDocker([
+      "create",
+      "--name",
+      container,
+      "--network",
+      "host",
+      "--stop-timeout",
+      "30",
+      "--memory",
+      "256m",
+      "--memory-swap",
+      "256m",
+      "--pids-limit",
+      "64",
+      "--ulimit",
+      "nofile=4096:4096",
+      "--read-only",
+      "--cap-drop",
+      "ALL",
+      "--security-opt",
+      "no-new-privileges",
+      "--tmpfs",
+      "/tmp:rw,noexec,nosuid,nodev,size=32m,mode=1777",
+      "--mount",
+      `type=volume,src=${volume},dst=/var/lib/blackglass-server`,
+      "--env",
+      "SELFHOST_BIND_HOST=127.0.0.1",
+      "--env",
+      `SELFHOST_CONTROL_PORT=${controlPort}`,
+      "--env",
+      `SELFHOST_DATA_PORT=${dataPort}`,
+      "--env",
+      `SELFHOST_DATA_HOST=127.0.0.1:${dataPort}`,
+      "--env",
+      "SELFHOST_EMAIL=resource@example.test",
+      "--env",
+      `SELFHOST_PASSWORD_HASH=${maximumWorkPasswordHash}`,
+      "--env",
+      "SELFHOST_NAME=Resource test",
+      "--env",
+      `SELFHOST_PER_FILE_MAX=${128 * 1024 * 1024}`,
+      "--env",
+      `SELFHOST_MAX_CONCURRENT_UPLOADS=${concurrentUploads}`,
+      "--env",
+      "SELFHOST_ALLOWED_ORIGINS=app://obsidian.md",
+      "--env",
+      "SELFHOST_TRUSTED_PROXY=127.0.0.1",
+      "--env",
+      "SELFHOST_LOG_FORMAT=pretty",
+      imageId,
+      "serve",
+    ]);
+    const createdInspection = dockerInspect(container);
+    if (
+      createdInspection.Image !== imageId ||
+      JSON.stringify(createdInspection.Config.Entrypoint) !==
+        JSON.stringify(["/usr/local/bin/blackglass-server"]) ||
+      JSON.stringify(createdInspection.Config.Cmd) !== JSON.stringify(["serve"]) ||
+      createdInspection.Path !== "/usr/local/bin/blackglass-server" ||
+      JSON.stringify(createdInspection.Args) !== JSON.stringify(["serve"]) ||
+      createdInspection.Config.User !== "65532:65532" ||
+      createdInspection.HostConfig.ReadonlyRootfs !== true ||
+      createdInspection.HostConfig.NetworkMode !== "host" ||
+      Number(createdInspection.HostConfig.PidsLimit) !== 64 ||
+      !createdInspection.HostConfig.CapDrop?.includes("ALL") ||
+      !createdInspection.HostConfig.SecurityOpt?.includes("no-new-privileges") ||
+      createdInspection.Mounts?.some((mount: any) =>
+        mountCoversPath(String(mount.Destination), "/usr/local/bin/blackglass-server"),
+      )
+    ) {
+      throw new Error("cgroup server container isolation or exact entrypoint drifted");
+    }
+    const copiedBinary = join(directory, "in-image-binary-start");
+    runDocker(["cp", `${container}:/usr/local/bin/blackglass-server`, copiedBinary]);
+    const inImageBinarySha256 = await sha256Path(copiedBinary);
+    runDocker(["start", container]);
+    const inspection = dockerInspect(container);
+    const hostPid = Number(inspection.State.Pid);
+    if (
+      !Number.isSafeInteger(hostPid) ||
+      hostPid <= 0 ||
+      inspection.State.Running !== true ||
+      inspection.Image !== imageId
+    ) {
+      throw new Error("cgroup server did not start as one native container process");
+    }
+    const path = await readUnifiedCgroupPath(`/proc/${hostPid}/cgroup`);
+    const harnessPath = await readUnifiedCgroupPath("/proc/self/cgroup");
+    if (path === harnessPath) throw new Error("server and workload harness share a cgroup");
+    const cgroupDirectory = resolve("/sys/fs/cgroup", `.${path}`);
+    if (!cgroupDirectory.startsWith("/sys/fs/cgroup/")) {
+      throw new Error("Docker returned an unsafe cgroup path");
+    }
+    const cgroupPids = parseCgroupPidList(
+      await readFile(join(cgroupDirectory, "cgroup.procs"), "utf8"),
+    );
+    if (cgroupPids.length !== 1 || cgroupPids[0] !== hostPid) {
+      throw new Error("resource cgroup contains a process other than the exact server");
+    }
+    const eventsLocal = join(cgroupDirectory, "memory.events.local");
+    const eventsPath = (await Bun.file(eventsLocal).exists())
+      ? eventsLocal
+      : join(cgroupDirectory, "memory.events");
+    const eventsBefore = parseCgroupEvents(await readFile(eventsPath, "utf8"));
+    return {
+      container,
+      image,
+      imageId,
+      volume,
+      stopped: false,
+      hostPid,
+      path,
+      eventsPath,
+      eventsBefore,
+      artifactBinarySha256,
+      stagedBinarySha256,
+      inImageBinarySha256,
+      nativeTarget: target!,
+      hostPlatform: process.platform,
+      hostArchitecture: process.arch,
+      elfDescription: fileDescription.trim(),
+    };
+  } catch (error) {
+    Bun.spawnSync(["docker", "rm", "--force", "--volumes", container]);
+    Bun.spawnSync(["docker", "volume", "rm", "--force", volume]);
+    Bun.spawnSync(["docker", "image", "rm", "--force", image]);
+    throw error;
+  }
+}
+
+function runDocker(args: string[]): string {
+  const result = Bun.spawnSync(["docker", ...args]);
+  if (result.exitCode !== 0) {
+    throw new Error(`docker ${args[0]} failed: ${result.stderr.toString()}`);
+  }
+  return result.stdout.toString();
+}
+
+function mountCoversPath(destination: string, path: string): boolean {
+  const normalized = destination === "/" ? "/" : destination.replace(/\/+$/, "");
+  return normalized === "/" || path === normalized || path.startsWith(`${normalized}/`);
+}
+
+function dockerInspect(container: string): any {
+  const result = Bun.spawnSync(["docker", "inspect", container]);
+  if (result.exitCode !== 0) {
+    throw new Error(`could not inspect cgroup container: ${result.stderr.toString()}`);
+  }
+  const inspections = JSON.parse(result.stdout.toString());
+  if (!Array.isArray(inspections) || inspections.length !== 1) {
+    throw new Error("Docker returned an invalid cgroup container inspection");
+  }
+  return inspections[0];
+}
+
+async function readCgroupSnapshot(
+  cgroupDirectory: string,
+  eventsPath: string,
+): Promise<{ memoryPeakBytes: number; memoryEvents: CgroupEvents } | null> {
+  try {
+    const [memoryPeak, memoryEvents] = await Promise.all([
+      readFile(join(cgroupDirectory, "memory.peak"), "utf8"),
+      readFile(eventsPath, "utf8"),
+    ]);
+    return {
+      memoryPeakBytes: parseCgroupScalar(memoryPeak, "memory.peak"),
+      memoryEvents: parseCgroupEvents(memoryEvents),
+    };
+  } catch (error) {
+    if (isDisappearedKernelPath(error)) return null;
+    throw error;
+  }
+}
+
+async function readLinuxPeakRssForPid(pid: number): Promise<number | null> {
+  try {
+    return parseLinuxRssKiB(await readFile(`/proc/${pid}/status`, "utf8"), "VmHWM");
+  } catch (error) {
+    if (isDisappearedKernelPath(error)) return null;
+    throw error;
+  }
+}
+
+function isDisappearedKernelPath(error: unknown): boolean {
+  const code =
+    typeof error === "object" && error !== null && "code" in error
+      ? String(error.code)
+      : "";
+  return code === "ENOENT" || code === "ESRCH";
+}
+
+async function readUnifiedCgroupPath(path: string): Promise<string> {
+  return parseUnifiedCgroupPath(await readFile(path, "utf8"));
+}
+
+async function sha256Path(path: string): Promise<string> {
+  return createHash("sha256")
+    .update(Buffer.from(await Bun.file(path).arrayBuffer()))
+    .digest("hex");
+}
+
+async function emitReport(report: Record<string, unknown> & { passed: boolean }) {
   await mkdir(dirname(output), { recursive: true });
   await writeFile(output, `${JSON.stringify(report, null, 2)}\n`, { mode: 0o600 });
   console.log(JSON.stringify(report, null, 2));
   if (!report.passed) process.exitCode = 1;
-} finally {
-  for (const probe of probes) probe.socket.close();
-  child.kill("SIGTERM");
-  await child.exited;
-  await rm(directory, { recursive: true, force: true });
 }
 
 async function initialize(
@@ -302,6 +934,8 @@ async function initialize(
   token: string,
   vault: Record<string, any>,
   device: string,
+  initial = true,
+  onAccepted?: () => void,
 ) {
   probe.json({
     op: "init",
@@ -309,12 +943,13 @@ async function initialize(
     id: vault.id,
     keyhash: vault.keyhash,
     version: 0,
-    initial: true,
+    initial,
     device,
     encryption_version: 3,
   });
   const accepted = await probe.next();
   if (accepted.res !== "ok") throw new Error("websocket init failed");
+  onAccepted?.();
   while (true) {
     const message = await probe.next();
     if (message.op === "ready") return;
@@ -383,12 +1018,24 @@ function metadataPush(path: string, hash: string) {
 }
 
 async function rss(): Promise<number> {
-  const result = Bun.spawnSync(["ps", "-o", "rss=", "-p", String(child.pid)], {
+  const pid = child?.pid ?? cgroup?.hostPid;
+  if (pid === undefined) throw new Error("server process is unavailable");
+  if (process.platform === "linux") {
+    return parseLinuxRssKiB(await readFile(`/proc/${pid}/status`, "utf8"), "VmRSS");
+  }
+  const result = Bun.spawnSync(["ps", "-o", "rss=", "-p", String(pid)], {
     stdout: "pipe",
     stderr: "pipe",
   });
   if (result.exitCode !== 0) throw new Error(result.stderr.toString());
   return Number(result.stdout.toString().trim());
+}
+
+async function linuxPeakRss(): Promise<number | null> {
+  if (process.platform !== "linux") return null;
+  const pid = child?.pid ?? cgroup?.hostPid;
+  if (pid === undefined) throw new Error("server process is unavailable");
+  return parseLinuxRssKiB(await readFile(`/proc/${pid}/status`, "utf8"), "VmHWM");
 }
 
 async function post(
@@ -411,7 +1058,12 @@ async function post(
 async function waitHealth() {
   const deadline = Date.now() + 30_000;
   while (Date.now() < deadline) {
-    if (child.exitCode !== null) throw new Error("server exited early");
+    if (child?.exitCode !== null && child?.exitCode !== undefined) {
+      throw new Error("server exited early");
+    }
+    if (cgroup && dockerInspect(cgroup.container).State.Running !== true) {
+      throw new Error("cgroup server exited early");
+    }
     try {
       if ((await fetch(`http://127.0.0.1:${controlPort}/ready`)).ok) return;
     } catch {}

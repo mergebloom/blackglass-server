@@ -29,7 +29,10 @@ Connections enable SQLite defensive mode and disable trusted schemas. Encrypted
 file bodies are staged in a mode-0600 file and committed with SQLite's
 incremental BLOB API. Ciphertext is in `revision_content`, whose BLOB is the
 last physical column; this preserves SQLite's zero-BLOB optimization and avoids
-a file-sized memory spike. Legacy inline BLOB rows remain readable.
+a file-sized memory spike. Legacy inline BLOB rows remain readable. The
+advertised per-file limit defaults to 200 MiB and is capped at 900 MiB so an
+encrypted row remains safely below bundled SQLite's default maximum value
+length; larger operator values fail during startup rather than after staging.
 
 ## Build and install
 
@@ -267,22 +270,32 @@ Each active upload holds at most one WebSocket frame (2 MiB) plus small
 metadata in memory and one ciphertext staging file on disk. Upload concurrency
 defaults to four and can be reduced, but cannot exceed the qualified limit of
 four. WebSocket admission defaults to 16 and cannot exceed 16. One bounded
-Argon2 check, an eight-request wait queue, 2 MiB
-frames, a single large JSON response, and bounded database workers fit the
-supplied 256 MiB service cap. Pulls read SQLite in 2 MiB pieces. This keeps
-memory bounded by concurrency, not vault or attachment size. SQLite is
+Argon2 check, an eight-request wait queue, 2 MiB frames, bounded reconnect
+pages, a single large JSON response, and bounded database workers stay inside
+the supplied 256 MiB service cap under the release workload.
+A fair memory-admission pool leaves one authenticated Sync lane available
+during password verification. Pulls read SQLite in 2 MiB pieces, with a fixed
+limit of two concurrent frames and admission released between pieces. This
+keeps memory bounded by concurrency, not vault or attachment size. SQLite is
 the correct database while the deployment remains a single writer node; do
 not place its files on a network filesystem.
 
-Each Linux package job measures its exact exported binary while holding 16
-authenticated WebSockets and overlapping four 64 MiB uploads, eight pulls, a
-large history response, and ten queued sign-in attempts using the maximum
-accepted Argon2id work parameters (`m=65536,t=5,p=4`). Peak RSS must stay below
-224 MiB, leaving at least 32 MiB below the service's 256 MiB hard cap; the
-192 MiB `MemoryHigh` threshold remains an intentional pressure signal rather
-than a kill boundary. The per-target resource report is a release asset and
-embeds the binary SHA-256, target, and source revision; any rebuild requires a
-new report.
+Each Linux package job runs its exact exported native binary as UID 65532 in a
+server-only cgroup with a 256 MiB memory maximum and swap disabled. The host
+workload first drives 11 concurrent large-metadata reconnects. It then holds 16
+authenticated WebSockets while overlapping four 64 MiB uploads, eight pulls, a
+large history response, and ten sign-in attempts at the maximum accepted
+Argon2id work parameters (`m=65536,t=5,p=4`). A separate phase requires that
+maximum-cost password work and the reserved Sync lane both complete.
+
+Qualification requires cgroup `memory.peak` to stay within 256 MiB; startup and
+final OOM counters to remain zero; exact artifact, staged, and in-image hashes
+to match; and a graceful non-OOM exit. Kernel `VmHWM` remains an additional
+gate: peak process RSS must stay below 224 MiB and the measured idle-to-peak
+increase below 128 MiB. The 192 MiB `MemoryHigh` threshold remains an
+intentional pressure signal rather than a kill boundary. The per-target report
+binds all measurements to the binary SHA-256, native target, and source
+revision; any rebuild requires a new report.
 
 ## Deletion and retention
 

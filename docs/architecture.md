@@ -25,8 +25,14 @@ reach the server. Managed-encryption vaults instead retain the server-generated
 recovery password required by the stock client, placing the operator inside
 that mode's confidentiality trust boundary. File pushes use private staging
 files and SQLite incremental BLOB writes; pulls are read in 2 MiB pieces.
-Memory is therefore bounded by configured concurrency rather than attachment
-size.
+At most two pull frames stream concurrently; readers queue between 2 MiB
+pieces, so slow readers cannot monopolize pull capacity. A fair shared
+memory-admission pool reserves three of four permits for password verification,
+leaving one authenticated Sync lane available while Argon2 runs. Memory is
+therefore bounded by fixed concurrency rather than attachment size. Reconnect
+replay retains at most 16 notices with at most 512 KiB of event text per client
+and releases memory admission after every notice, so slow readers cannot hold
+the pool indefinitely.
 
 ## Persistence
 
