@@ -2360,6 +2360,112 @@ fn unexpected_listener_result(name: &str, result: ListenerJoinResult) -> Result<
 #[cfg(test)]
 mod tests {
     use super::*;
+    use axum::{
+        body::Body,
+        http::{Request, StatusCode, header},
+    };
+    use sha2::{Digest, Sha256};
+    use tower::ServiceExt;
+
+    fn admin_test_state(directory: &std::path::Path) -> (AppState, String, String) {
+        let mut config = Config::test(directory, 3000, 3003).unwrap();
+        prepare_staging(&config.staging_dir).unwrap();
+        let admin_token = "independent-admin-http-test-token".to_owned();
+        config.admin = Some(crate::admin::AdminConfig {
+            bind_host: "127.0.0.1".parse().unwrap(),
+            port: 3010,
+            token_hash: hex::encode(Sha256::digest(admin_token.as_bytes())),
+        });
+        let max_connections = config.max_ws_connections;
+        let max_uploads = config.max_concurrent_uploads;
+        let db = Db::open(&config.database_path).unwrap();
+        let sync_token = db.issue_session(3600).unwrap();
+        let (_shutdown_tx, shutdown) = watch::channel(false);
+        (
+            AppState {
+                config: Arc::new(config),
+                db,
+                events: broadcast::channel(EVENT_CAPACITY).0,
+                commit_order: Arc::new(AsyncMutex::new(())),
+                uploads: Arc::new(Semaphore::new(max_uploads)),
+                connections: Arc::new(Semaphore::new(max_connections)),
+                auth_checks: Arc::new(Semaphore::new(auth::MAX_CONCURRENT_PASSWORD_CHECKS)),
+                auth_waiters: Arc::new(Semaphore::new(MAX_SIGNIN_WAITERS)),
+                source_limits: Arc::new(StdMutex::new(SourceLimits::default())),
+                control_body_readers: Arc::new(Semaphore::new(MAX_CONTROL_BODY_READERS)),
+                control_requests: Arc::new(Semaphore::new(MAX_CONTROL_REQUESTS)),
+                db_workers: Arc::new(Semaphore::new(MAX_DB_WORKERS)),
+                pulls: Arc::new(Semaphore::new(MAX_CONCURRENT_PULLS)),
+                bulk_memory: Arc::new(Semaphore::new(BULK_MEMORY_PERMITS)),
+                large_responses: Arc::new(Semaphore::new(1)),
+                shutdown,
+                metrics: Arc::new(Metrics::default()),
+                live_connections: crate::admin::LiveRegistry::new(max_connections),
+                admin_snapshots: Arc::new(Semaphore::new(1)),
+                started: Instant::now(),
+            },
+            admin_token,
+            sync_token,
+        )
+    }
+
+    #[tokio::test]
+    async fn admin_http_routes_are_isolated_authenticated_and_hardened() {
+        let directory = tempfile::tempdir().unwrap();
+        let (state, admin_token, sync_token) = admin_test_state(directory.path());
+        let admin = crate::admin::router(state.clone());
+
+        let shell = admin
+            .clone()
+            .oneshot(Request::get("/admin").body(Body::empty()).unwrap())
+            .await
+            .unwrap();
+        assert_eq!(shell.status(), StatusCode::OK);
+        assert_eq!(
+            shell.headers()["content-security-policy"],
+            crate::admin::CSP
+        );
+        assert_eq!(shell.headers()[header::CACHE_CONTROL], "no-store");
+        assert_eq!(shell.headers()["x-content-type-options"], "nosniff");
+        assert_eq!(shell.headers()["referrer-policy"], "no-referrer");
+
+        for authorization in [
+            None,
+            Some("Bearer wrong".to_owned()),
+            Some(format!("Bearer {sync_token}")),
+        ] {
+            let mut request = Request::get("/admin/api/snapshot");
+            if let Some(value) = authorization {
+                request = request.header(header::AUTHORIZATION, value);
+            }
+            let response = admin
+                .clone()
+                .oneshot(request.body(Body::empty()).unwrap())
+                .await
+                .unwrap();
+            assert_eq!(response.status(), StatusCode::UNAUTHORIZED);
+        }
+
+        let authorized = admin
+            .oneshot(
+                Request::get("/admin/api/snapshot?fresh=1")
+                    .header(header::AUTHORIZATION, format!("Bearer {admin_token}"))
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(authorized.status(), StatusCode::OK);
+        assert_eq!(authorized.headers()[header::CACHE_CONTROL], "no-store");
+
+        for public in [control_router(state.clone()), data_router(state)] {
+            let response = public
+                .oneshot(Request::get("/admin").body(Body::empty()).unwrap())
+                .await
+                .unwrap();
+            assert_eq!(response.status(), StatusCode::NOT_FOUND);
+        }
+    }
 
     #[derive(Default)]
     struct FlushBoundaryWriter {
