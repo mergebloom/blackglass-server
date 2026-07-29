@@ -1061,9 +1061,11 @@ async fn socket_loop(
                         }))).await;
                         break
                     }
+                    let delivered_uid = event.uid;
                     if socket_send(&mut tx, Message::Text(event.text.into())).await.is_err() {
                         break
                     }
+                    record_delivered_revision(session.live.as_ref(), delivered_uid);
                 },
                 Ok(_) => {},
                 Err(broadcast::error::RecvError::Lagged(_)) => {
@@ -1078,6 +1080,12 @@ async fn socket_loop(
         }
     }
     discard_pending_upload(&s, &mut session, "connection_closed").await;
+}
+
+fn record_delivered_revision(live: Option<&crate::admin::LiveGuard>, uid: i64) {
+    if let Some(live) = live {
+        live.activity(uid, "live");
+    }
 }
 
 async fn discard_pending_upload(s: &AppState, session: &mut Session, reason: &'static str) {
@@ -2328,12 +2336,20 @@ where
         ListenerTrigger::Control(result) => {
             let control = unexpected_listener_result("control", result);
             let data = listener_result("data", data_task.await);
-            control.and(data)
+            let admin = match admin_task {
+                Some(task) => listener_result("admin", task.await),
+                None => Ok(()),
+            };
+            control.and(data).and(admin)
         }
         ListenerTrigger::Data(result) => {
             let data = unexpected_listener_result("data", result);
             let control = listener_result("control", control_task.await);
-            data.and(control)
+            let admin = match admin_task {
+                Some(task) => listener_result("admin", task.await),
+                None => Ok(()),
+            };
+            data.and(control).and(admin)
         }
         ListenerTrigger::Admin(result) => {
             let admin = unexpected_listener_result("admin", result);
@@ -2713,6 +2729,75 @@ mod tests {
                 .to_string()
                 .contains("control listener exited unexpectedly")
         );
+    }
+
+    #[test]
+    fn delivered_live_revision_advances_registry_cursor_and_activity() {
+        let registry = crate::admin::LiveRegistry::new(1);
+        let guard = registry.register("vault", "device", 3).unwrap();
+        let before = registry.snapshot()[0].last_activity_at;
+        std::thread::sleep(Duration::from_millis(2));
+        record_delivered_revision(Some(&guard), 41);
+        let delivered = &registry.snapshot()[0];
+        assert_eq!(delivered.client_cursor, 41);
+        assert!(delivered.last_activity_at > before);
+        assert_eq!(delivered.state, "live");
+    }
+
+    #[tokio::test]
+    async fn listener_supervisor_awaits_admin_after_control_exit() {
+        let (shutdown_tx, mut shutdown_rx) = watch::channel(false);
+        let mut admin_shutdown = shutdown_rx.clone();
+        let admin_finished = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let finished = admin_finished.clone();
+        let control = tokio::spawn(async { Ok(()) });
+        let data = tokio::spawn(async move {
+            wait_for_shutdown(&mut shutdown_rx).await;
+            Ok(())
+        });
+        let admin = tokio::spawn(async move {
+            wait_for_shutdown(&mut admin_shutdown).await;
+            tokio::time::sleep(Duration::from_millis(10)).await;
+            finished.store(true, Ordering::SeqCst);
+            Ok(())
+        });
+        let _ = supervise_listeners(
+            shutdown_tx,
+            control,
+            data,
+            Some(admin),
+            std::future::pending(),
+        )
+        .await;
+        assert!(admin_finished.load(Ordering::SeqCst));
+    }
+
+    #[tokio::test]
+    async fn listener_supervisor_awaits_admin_after_data_exit() {
+        let (shutdown_tx, mut shutdown_rx) = watch::channel(false);
+        let mut admin_shutdown = shutdown_rx.clone();
+        let admin_finished = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let finished = admin_finished.clone();
+        let control = tokio::spawn(async move {
+            wait_for_shutdown(&mut shutdown_rx).await;
+            Ok(())
+        });
+        let data = tokio::spawn(async { Ok(()) });
+        let admin = tokio::spawn(async move {
+            wait_for_shutdown(&mut admin_shutdown).await;
+            tokio::time::sleep(Duration::from_millis(10)).await;
+            finished.store(true, Ordering::SeqCst);
+            Ok(())
+        });
+        let _ = supervise_listeners(
+            shutdown_tx,
+            control,
+            data,
+            Some(admin),
+            std::future::pending(),
+        )
+        .await;
+        assert!(admin_finished.load(Ordering::SeqCst));
     }
 
     #[tokio::test]

@@ -90,7 +90,10 @@ pub(crate) fn is_storage_quota_exceeded(error: &anyhow::Error) -> bool {
 }
 
 #[derive(Clone)]
-pub struct Db(Arc<Mutex<Connection>>);
+pub struct Db {
+    connection: Arc<Mutex<Connection>>,
+    path: Arc<PathBuf>,
+}
 
 impl Db {
     pub fn open(path: &Path) -> Result<Self> {
@@ -160,7 +163,10 @@ impl Db {
             if !existed {
                 sync_parent_directory(path)?;
             }
-            Ok(Self(Arc::new(Mutex::new(conn))))
+            Ok(Self {
+                connection: Arc::new(Mutex::new(conn)),
+                path: Arc::new(path.to_path_buf()),
+            })
         })();
 
         if result.is_err() && !existed {
@@ -171,44 +177,104 @@ impl Db {
 
     fn with<T>(&self, f: impl FnOnce(&mut Connection) -> Result<T>) -> Result<T> {
         let mut conn = self
-            .0
+            .connection
             .lock()
             .map_err(|_| anyhow::anyhow!("database lock poisoned"))?;
         f(&mut conn)
     }
 
     pub fn ready(&self) -> bool {
-        let Ok(connection) = self.0.try_lock() else {
+        let Ok(connection) = self.connection.try_lock() else {
             return false;
         };
         connection.query_row("SELECT 1", [], |_| Ok(())).is_ok()
     }
 
     pub(crate) fn admin_snapshot(&self, expected_host: &str) -> Result<AdminDatabaseSnapshot> {
-        self.with(|c| {
-            let deadline = std::time::Instant::now() + std::time::Duration::from_secs(2);
-            c.progress_handler(10_000, Some(move || std::time::Instant::now() >= deadline));
-            let result = (|| {
+        // Never queue behind or hold the Sync writer mutex for admin reporting.
+        // Each snapshot has isolated busy/progress state and is discarded after use.
+        let c = open_admin_connection(&self.path)?;
+        let deadline = std::time::Instant::now() + std::time::Duration::from_millis(250);
+        c.progress_handler(1_000, Some(move || std::time::Instant::now() >= deadline));
+        let result = (|| {
             let mut vault_query = c.prepare(
                 "WITH latest_path AS (SELECT vault_id,path,MAX(uid) uid FROM revisions GROUP BY vault_id,path), per_vault AS (SELECT r.vault_id,SUM(r.size) retained_bytes,SUM(CASE WHEN lp.uid=r.uid AND r.deleted=0 AND r.folder=0 THEN 1 ELSE 0 END) file_count,SUM(CASE WHEN lp.uid=r.uid AND r.deleted=1 THEN 1 ELSE 0 END) deleted_count FROM revisions r LEFT JOIN latest_path lp ON lp.uid=r.uid GROUP BY r.vault_id), latest_revision AS (SELECT r.vault_id,r.ts,r.device FROM revisions r JOIN (SELECT vault_id,MAX(uid) uid FROM revisions GROUP BY vault_id) x ON x.uid=r.uid) SELECT v.id,v.name,v.created,CASE WHEN v.password IS NULL THEN 'custom-password' ELSE 'managed' END,v.encryption_version,v.version,v.size,COALESCE(p.retained_bytes,0),COALESCE(p.file_count,0),COALESCE(p.deleted_count,0),l.ts,l.device FROM vaults v LEFT JOIN per_vault p ON p.vault_id=v.id LEFT JOIN latest_revision l ON l.vault_id=v.id ORDER BY v.created ASC LIMIT 100"
             )?;
-            let vaults = vault_query.query_map([], |r| Ok(AdminVault { id:r.get(0)?,name:r.get(1)?,created_at:r.get(2)?,encryption_mode:r.get(3)?,encryption_version:r.get(4)?,current_revision:r.get(5)?,live_bytes:r.get(6)?,retained_bytes:r.get(7)?,file_count:r.get(8)?,deleted_count:r.get(9)?,latest_activity_at:r.get(10)?,latest_device:r.get(11)? }))?.collect::<rusqlite::Result<Vec<_>>>()?;
+            let vaults = vault_query
+                .query_map([], |r| {
+                    Ok(AdminVault {
+                        id: r.get(0)?,
+                        name: r.get(1)?,
+                        created_at: r.get(2)?,
+                        encryption_mode: r.get(3)?,
+                        encryption_version: r.get(4)?,
+                        current_revision: r.get(5)?,
+                        live_bytes: r.get(6)?,
+                        retained_bytes: r.get(7)?,
+                        file_count: r.get(8)?,
+                        deleted_count: r.get(9)?,
+                        latest_activity_at: r.get(10)?,
+                        latest_device: r.get(11)?,
+                    })
+                })?
+                .collect::<rusqlite::Result<Vec<_>>>()?;
             let mut activity_query = c.prepare("SELECT r.ts,r.vault_id,v.name,r.device,CASE WHEN r.deleted=1 THEN 'deleted' WHEN r.folder=1 THEN 'folder' ELSE 'revision' END,r.extension,r.size,r.uid FROM revisions r JOIN vaults v ON v.id=r.vault_id ORDER BY r.uid DESC LIMIT 100")?;
-            let activity = activity_query.query_map([], |r| Ok(AdminActivity{timestamp:r.get(0)?,vault_id:r.get(1)?,vault_name:r.get(2)?,device:r.get(3)?,event_type:r.get(4)?,extension:r.get(5)?,size:r.get(6)?,revision:r.get(7)?}))?.collect::<rusqlite::Result<Vec<_>>>()?;
+            let activity = activity_query
+                .query_map([], |r| {
+                    Ok(AdminActivity {
+                        timestamp: r.get(0)?,
+                        vault_id: r.get(1)?,
+                        vault_name: r.get(2)?,
+                        device: r.get(3)?,
+                        event_type: r.get(4)?,
+                        extension: r.get(5)?,
+                        size: r.get(6)?,
+                        revision: r.get(7)?,
+                    })
+                })?
+                .collect::<rusqlite::Result<Vec<_>>>()?;
             let mut session_query=c.prepare("SELECT created_at,expires_at,revoked_at FROM sessions ORDER BY created_at DESC LIMIT 100")?;
-            let sessions=session_query.query_map([],|r|Ok(AdminSession{created_at:r.get(0)?,expires_at:r.get(1)?,revoked_at:r.get(2)?}))?.collect::<rusqlite::Result<Vec<_>>>()?;
-            let now=now_ms();
+            let sessions = session_query
+                .query_map([], |r| {
+                    Ok(AdminSession {
+                        created_at: r.get(0)?,
+                        expires_at: r.get(1)?,
+                        revoked_at: r.get(2)?,
+                    })
+                })?
+                .collect::<rusqlite::Result<Vec<_>>>()?;
+            let now = now_ms();
             let (session_count,active_sessions)=c.query_row("SELECT COUNT(*),COALESCE(SUM(CASE WHEN revoked_at IS NULL AND expires_at>? THEN 1 ELSE 0 END),0) FROM sessions",[now],|r|Ok((r.get(0)?,r.get(1)?)))?;
-            let logical_bytes=c.query_row("SELECT COALESCE(SUM(size),0) FROM vaults",[],|r|r.get(0))?;
-            let retained_bytes=c.query_row("SELECT COALESCE(SUM(size),0) FROM revisions",[],|r|r.get(0))?;
-            let mismatched_data_hosts=c.query_row("SELECT COUNT(*) FROM vaults WHERE host<>?",[expected_host],|r|r.get(0))?;
-            let vault_count=c.query_row("SELECT COUNT(*) FROM vaults",[],|r|r.get(0))?;
-            let activity_count=c.query_row("SELECT COUNT(*) FROM revisions",[],|r|r.get(0))?;
-                Ok(AdminDatabaseSnapshot{schema_version:CURRENT_SCHEMA_VERSION_PUBLIC,max_sessions:MAX_SESSIONS,vaults,activity,sessions,active_sessions,session_count,logical_bytes,retained_bytes,vault_count,activity_count,mismatched_data_hosts})
-            })();
-            c.progress_handler(0, None::<fn() -> bool>);
-            result
-        })
+            let logical_bytes =
+                c.query_row("SELECT COALESCE(SUM(size),0) FROM vaults", [], |r| r.get(0))?;
+            let retained_bytes =
+                c.query_row("SELECT COALESCE(SUM(size),0) FROM revisions", [], |r| {
+                    r.get(0)
+                })?;
+            let mismatched_data_hosts = c.query_row(
+                "SELECT COUNT(*) FROM vaults WHERE host<>?",
+                [expected_host],
+                |r| r.get(0),
+            )?;
+            let vault_count = c.query_row("SELECT COUNT(*) FROM vaults", [], |r| r.get(0))?;
+            let activity_count = c.query_row("SELECT COUNT(*) FROM revisions", [], |r| r.get(0))?;
+            Ok(AdminDatabaseSnapshot {
+                schema_version: CURRENT_SCHEMA_VERSION_PUBLIC,
+                max_sessions: MAX_SESSIONS,
+                vaults,
+                activity,
+                sessions,
+                active_sessions,
+                session_count,
+                logical_bytes,
+                retained_bytes,
+                vault_count,
+                activity_count,
+                mismatched_data_hosts,
+            })
+        })();
+        c.progress_handler(0, None::<fn() -> bool>);
+        result
     }
 
     pub fn issue_session(&self, ttl_secs: i64) -> Result<String> {
@@ -1158,6 +1224,15 @@ fn open_existing_read_only(path: &Path, label: &str) -> Result<Connection> {
     Ok(connection)
 }
 
+fn open_admin_connection(path: &Path) -> Result<Connection> {
+    // SQLITE_OPEN_URI is deliberately absent above, so URI metacharacters in
+    // configured paths cannot become SQLite connection options.
+    let connection = open_existing_read_only(path, "admin snapshot database")?;
+    connection.busy_timeout(std::time::Duration::from_millis(50))?;
+    connection.pragma_update(None, "query_only", "ON")?;
+    Ok(connection)
+}
+
 fn open_existing_read_write(path: &Path, label: &str) -> Result<Connection> {
     let resolved = resolve_existing_regular_file(path, label)?;
     let connection = Connection::open_with_flags(
@@ -1270,7 +1345,11 @@ pub fn revoke_all_sessions(path: &Path) -> Result<usize> {
     connection.busy_timeout(std::time::Duration::from_secs(5))?;
     connection.pragma_update(None, "foreign_keys", "ON")?;
     verify_connection(&connection).context("session database validation failed")?;
-    Db(Arc::new(Mutex::new(connection))).revoke_all_sessions()
+    Db {
+        connection: Arc::new(Mutex::new(connection)),
+        path: Arc::new(path.to_path_buf()),
+    }
+    .revoke_all_sessions()
 }
 
 pub fn rebind_data_host(path: &Path, new_host: &str, backup: &Path) -> Result<usize> {
@@ -2309,6 +2388,35 @@ fn secure_file(path: &Path) -> Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn admin_snapshot_uses_a_literal_query_only_connection_outside_writer_mutex() {
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("admin?mode=rw.sqlite");
+        let database = Db::open(&path).unwrap();
+        let admin = open_admin_connection(&path).unwrap();
+        assert_eq!(
+            admin
+                .query_row("PRAGMA query_only", [], |row| row.get::<_, i64>(0))
+                .unwrap(),
+            1
+        );
+        assert_eq!(
+            admin
+                .query_row("PRAGMA busy_timeout", [], |row| row.get::<_, i64>(0))
+                .unwrap(),
+            50
+        );
+        assert!(admin.execute("CREATE TABLE forbidden(value)", []).is_err());
+        let _writer_mutex = database.connection.lock().unwrap();
+        assert_eq!(
+            database
+                .admin_snapshot("127.0.0.1:3003")
+                .unwrap()
+                .vault_count,
+            0
+        );
+    }
     use crate::model::Vault;
 
     fn assert_error_contains<T>(result: Result<T>, expected: &str) {
@@ -2505,7 +2613,7 @@ mod tests {
     fn readiness_fails_fast_while_the_database_connection_is_busy() {
         let dir = tempfile::tempdir().unwrap();
         let database = Db::open(&dir.path().join("ready.sqlite")).unwrap();
-        let connection = database.0.lock().unwrap();
+        let connection = database.connection.lock().unwrap();
 
         assert!(!database.ready());
 
