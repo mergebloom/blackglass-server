@@ -113,13 +113,13 @@ it only by setting `SELFHOST_ADMIN_BIND_HOST`, `SELFHOST_ADMIN_PORT`, and
 hex characters; never put the plaintext admin token in the environment. Use a
 random token independent from all Sync sessions.
 
-Keep the listener on `127.0.0.1` (for example port `3010`). TLS remains the
+The admin bind is strictly loopback-only; unspecified addresses are rejected even when external Sync binding is acknowledged. Keep the listener on `127.0.0.1` (for example port `3010`). TLS remains the
 responsibility of a private reverse proxy. A safe remote shape is a tailnet-only
 hostname whose proxy route forwards `/admin` to `127.0.0.1:3010` and is not
 present in public DNS or the public Caddy site. Do not proxy the admin listener
 from the public control/data virtual hosts. The shell assets contain no server
 data; every `/admin/api/*` request requires `Authorization: Bearer <admin-token>`.
-The browser stores it in `sessionStorage`, polls no faster than ten seconds, and
+The browser stores it in `sessionStorage`, polls no faster than 30 seconds, and
 can forget it with **Forget token**.
 
 The console exposes bounded, explicit projections: readiness/version/schema,

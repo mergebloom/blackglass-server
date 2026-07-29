@@ -35,7 +35,6 @@ pub(crate) fn parse_admin_config(
     host: Option<&str>,
     port: Option<&str>,
     hash: Option<&str>,
-    unsafe_bind: bool,
     control_port: u16,
     data_port: u16,
 ) -> Result<Option<AdminConfig>> {
@@ -50,10 +49,8 @@ pub(crate) fn parse_admin_config(
     let bind_host: IpAddr = host
         .parse()
         .map_err(|_| anyhow::anyhow!("SELFHOST_ADMIN_BIND_HOST must be an IP address"))?;
-    if !(bind_host.is_loopback() || unsafe_bind && bind_host.is_unspecified()) {
-        bail!(
-            "admin listener must bind loopback unless SELFHOST_ACKNOWLEDGE_EXTERNAL_BIND=1 explicitly permits an unspecified container bind"
-        );
+    if !bind_host.is_loopback() {
+        bail!("SELFHOST_ADMIN_BIND_HOST must be a loopback IP address");
     }
     let port: u16 = port
         .parse()
@@ -167,6 +164,14 @@ impl LiveGuard {
             item.state = state.chars().take(32).collect();
         }
     }
+    pub(crate) fn protocol_activity(&self, state: &str) {
+        if let Ok(mut map) = self.registry.inner.lock()
+            && let Some(item) = map.get_mut(&self.id)
+        {
+            item.last_activity_at = now_ms();
+            item.state = state.chars().take(32).collect();
+        }
+    }
 }
 impl Drop for LiveGuard {
     fn drop(&mut self) {
@@ -207,6 +212,17 @@ struct Snapshot {
     sessions: Sessions,
     storage: Storage,
     diagnostics: Diagnostics,
+    counts: Counts,
+}
+#[derive(Serialize)]
+#[serde(rename_all = "camelCase")]
+struct Counts {
+    vaults_total: i64,
+    vaults_visible: usize,
+    activity_total: i64,
+    activity_visible: usize,
+    sessions_total: i64,
+    sessions_visible: usize,
 }
 #[derive(Serialize)]
 #[serde(rename_all = "camelCase")]
@@ -244,13 +260,15 @@ struct Storage {
 struct Diagnostics {
     readiness: bool,
     schema_version: i64,
-    staging_file_count: usize,
+    staging_accessible: bool,
+    staging_file_count: Option<usize>,
     oldest_staging_age_seconds: Option<u64>,
     data_host_mismatch: bool,
     admin_bind: String,
     control_bind: String,
     data_bind: String,
-    tls_termination: &'static str,
+    tls_handled_by_server: bool,
+    transport_security: &'static str,
 }
 
 pub(crate) fn router(state: AppState) -> Router {
@@ -301,8 +319,12 @@ async fn snapshot(State(s): State<AppState>, headers: HeaderMap) -> Response {
     ) {
         return StatusCode::UNAUTHORIZED.into_response();
     }
+    let Ok(_permit) = s.admin_snapshots.clone().try_acquire_owned() else {
+        return (StatusCode::TOO_MANY_REQUESTS, [(header::RETRY_AFTER, "30")]).into_response();
+    };
     let db = s.db.clone();
-    let data = match tokio::task::spawn_blocking(move || db.admin_snapshot()).await {
+    let expected_host = s.config.public_data_host.clone();
+    let data = match tokio::task::spawn_blocking(move || db.admin_snapshot(&expected_host)).await {
         Ok(Ok(v)) => v,
         _ => return StatusCode::SERVICE_UNAVAILABLE.into_response(),
     };
@@ -316,10 +338,18 @@ fn build_snapshot(s: &AppState, data: AdminDatabaseSnapshot) -> Snapshot {
         .admin
         .as_ref()
         .expect("admin router requires config");
+    let counts = Counts {
+        vaults_total: data.vault_count,
+        vaults_visible: data.vaults.len(),
+        activity_total: data.activity_count,
+        activity_visible: data.activity.len(),
+        sessions_total: data.session_count,
+        sessions_visible: data.sessions.len(),
+    };
     Snapshot {
         generated_at: now_ms(),
         overview: Overview {
-            healthy: ready,
+            healthy: ready && staging.accessible,
             version: env!("CARGO_PKG_VERSION"),
             source_revision: crate::SOURCE_REVISION,
             schema_version: data.schema_version,
@@ -350,19 +380,31 @@ fn build_snapshot(s: &AppState, data: AdminDatabaseSnapshot) -> Snapshot {
         diagnostics: Diagnostics {
             readiness: ready,
             schema_version: data.schema_version,
-            staging_file_count: staging.0,
-            oldest_staging_age_seconds: staging.1,
-            data_host_mismatch: false,
+            staging_accessible: staging.accessible,
+            staging_file_count: staging.count,
+            oldest_staging_age_seconds: staging.oldest_age_seconds,
+            data_host_mismatch: data.mismatched_data_hosts > 0,
             admin_bind: format!("{}:{}", admin.bind_host, admin.port),
             control_bind: format!("{}:{}", s.config.bind_host, s.config.control_port),
             data_bind: format!("{}:{}", s.config.bind_host, s.config.data_port),
-            tls_termination: "private reverse proxy",
+            tls_handled_by_server: false,
+            transport_security: "TLS is expected at the private reverse proxy; not observable by Blackglass",
         },
+        counts,
     }
 }
-fn staging_facts(path: &std::path::Path) -> (usize, Option<u64>) {
+struct StagingFacts {
+    accessible: bool,
+    count: Option<usize>,
+    oldest_age_seconds: Option<u64>,
+}
+fn staging_facts(path: &std::path::Path) -> StagingFacts {
     let Ok(entries) = std::fs::read_dir(path) else {
-        return (0, None);
+        return StagingFacts {
+            accessible: false,
+            count: None,
+            oldest_age_seconds: None,
+        };
     };
     let mut count = 0;
     let mut oldest: Option<u64> = None;
@@ -379,20 +421,23 @@ fn staging_facts(path: &std::path::Path) -> (usize, Option<u64>) {
             oldest = Some(oldest.unwrap_or_default().max(age.as_secs()));
         }
     }
-    (count, oldest)
+    StagingFacts {
+        accessible: true,
+        count: Some(count),
+        oldest_age_seconds: oldest,
+    }
 }
 
-pub(crate) const ADMIN_HTML: &str = r#"<!doctype html><html lang="en"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"><title>Blackglass · Server admin</title><link rel="stylesheet" href="/admin/styles.css"><script defer src="/admin/app.js"></script></head><body><header><strong>Blackglass</strong><span>Server admin</span><span id="refreshed">Not connected</span></header><main><section id="login"><h1>Read-only server view</h1><label>Admin token <input id="token" type="password" autocomplete="off"></label><button id="connect">Connect</button></section><div id="dashboard" hidden><div class="status"><strong id="health">Unknown</strong><span id="version"></span><button id="refresh">Refresh</button><button id="signout">Forget token</button></div><section><h2>Overview</h2><dl id="overview"></dl></section><section><h2>Vaults</h2><div id="vaults" class="rows"></div></section><section><h2>Live connections</h2><div id="connections" class="rows"></div></section><section><h2>Recent activity</h2><div id="activity" class="rows"></div></section><section><h2>Sessions</h2><div id="sessions" class="rows"></div></section><section><h2>Storage &amp; history</h2><dl id="storage"></dl></section><section><h2>Diagnostics</h2><dl id="diagnostics"></dl></section></div></main></body></html>"#;
-pub(crate) const ADMIN_CSS: &str = r#":root{color-scheme:light;--ink:#18201d;--muted:#66706b;--line:#d8dedb;--accent:#276b57}*{box-sizing:border-box}body{margin:0;color:var(--ink);background:#f8faf9;font:15px system-ui,sans-serif}header{display:flex;gap:1rem;align-items:baseline;padding:1rem max(1rem,calc((100% - 70rem)/2));border-bottom:1px solid var(--line)}header #refreshed{margin-left:auto;color:var(--muted)}main{max-width:70rem;margin:auto;padding:1rem}section{padding:1rem 0;border-bottom:1px solid var(--line)}h1,h2{font-weight:600}h2{font-size:1rem;text-transform:uppercase;letter-spacing:.06em}button,input{min-height:44px;border:1px solid var(--line);border-radius:3px;padding:.6rem;background:white;color:inherit}button{cursor:pointer}button:focus,input:focus{outline:3px solid #8ec6b4;outline-offset:2px}.status{display:flex;gap:.75rem;align-items:center}.status button:first-of-type{margin-left:auto}.rows>article{display:grid;grid-template-columns:minmax(10rem,1fr) 2fr;gap:.5rem;padding:.7rem 0;border-top:1px solid var(--line)}dl{display:grid;grid-template-columns:minmax(12rem,1fr) 2fr;gap:.5rem}dt{color:var(--muted)}dd{margin:0;font-family:ui-monospace,monospace}@media(max-width:600px){header{flex-wrap:wrap}.status{flex-wrap:wrap}.status button{flex:1}.rows>article,dl{grid-template-columns:1fr}header #refreshed{width:100%;margin:0}}"#;
-pub(crate) const ADMIN_JS: &str = r#"'use strict';const $=id=>document.getElementById(id),esc=v=>String(v??'Unavailable'),token=()=>sessionStorage.getItem('blackglass-admin-token');function dl(id,obj){const e=$(id);e.replaceChildren();for(const[k,v]of Object.entries(obj)){const dt=document.createElement('dt'),dd=document.createElement('dd');dt.textContent=k.replace(/[A-Z]/g,m=>' '+m.toLowerCase());dd.textContent=esc(v);e.append(dt,dd)}}function rows(id,items,empty){const e=$(id);e.replaceChildren();if(!items.length){e.textContent=empty;return}for(const item of items){const a=document.createElement('article'),b=document.createElement('strong'),d=document.createElement('span');b.textContent=esc(item.name||item.device||item.eventType||'Session');d.textContent=Object.entries(item).filter(([k])=>!['name','device','eventType'].includes(k)).map(([k,v])=>`${k}: ${esc(v)}`).join(' · ');a.append(b,d);e.append(a)}}async function load(){const r=await fetch('/admin/api/snapshot',{headers:{Authorization:`Bearer ${token()}`},cache:'no-store'});if(r.status===401){forget();return}if(!r.ok)throw Error('Snapshot unavailable');const x=await r.json();$('login').hidden=true;$('dashboard').hidden=false;$('health').textContent=x.overview.healthy?'Healthy':'Degraded';$('version').textContent=`Version ${x.overview.version}`;$('refreshed').textContent=`Last refreshed ${new Date(x.generatedAt).toLocaleTimeString()}`;dl('overview',{...x.overview,...x.limits});rows('vaults',x.vaults,'No vaults');rows('connections',x.liveConnections,'No active connections');rows('activity',x.recentActivity,'No recent revision activity');rows('sessions',x.sessions.items,'No sessions');dl('storage',x.storage);dl('diagnostics',x.diagnostics)}function forget(){sessionStorage.removeItem('blackglass-admin-token');$('dashboard').hidden=true;$('login').hidden=false;$('token').value=''}$('connect').onclick=()=>{sessionStorage.setItem('blackglass-admin-token',$('token').value);load().catch(e=>$('refreshed').textContent=e.message)};$('refresh').onclick=()=>load();$('signout').onclick=forget;if(token())load().catch(forget);setInterval(()=>{if(token())load().catch(()=>{})},10000);"#;
-
+pub(crate) const ADMIN_HTML: &str = r#"<!doctype html><html lang="en"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"><title>Blackglass · Server admin</title><link rel="stylesheet" href="/admin/styles.css"><script defer src="/admin/app.js"></script></head><body><header><strong>Blackglass</strong><span>Server admin</span><span id="refreshed" aria-live="polite">Not connected</span></header><main><section id="login"><h1>Read-only server view</h1><form id="login-form"><label>Admin token <input id="token" type="password" autocomplete="off" required></label><button id="connect" type="submit">Connect</button><p id="login-error" role="alert"></p></form></section><div id="dashboard" hidden><div class="status"><strong id="health" role="status" aria-live="polite">Unknown</strong><span id="version"></span><button id="refresh">Refresh</button><button id="signout">Forget token</button></div><section><h2>Overview &amp; limits</h2><dl id="overview"></dl></section><section><h2 id="vault-title">Vaults</h2><div id="vaults" class="rows"></div></section><section><h2 id="connection-title">Live connections</h2><div id="connections" class="rows"></div></section><section><h2 id="activity-title">Recent activity</h2><div id="activity" class="rows"></div></section><section><h2 id="session-title">Sessions</h2><div id="sessions" class="rows"></div></section><section><h2>Storage &amp; history</h2><dl id="storage"></dl></section><section><h2>Diagnostics</h2><dl id="diagnostics"></dl></section></div></main></body></html>"#;
+pub(crate) const ADMIN_CSS: &str = r#":root{color-scheme:light;--ink:#18201d;--muted:#66706b;--line:#d8dedb;--accent:#276b57}*{box-sizing:border-box}body{margin:0;color:var(--ink);background:#f8faf9;font:15px system-ui,sans-serif;overflow-wrap:anywhere}header{display:flex;gap:1rem;align-items:baseline;padding:1rem max(1rem,calc((100% - 70rem)/2));border-bottom:1px solid var(--line)}header #refreshed{margin-left:auto;color:var(--muted)}main{max-width:70rem;margin:auto;padding:1rem;min-width:0}section{padding:1rem 0;border-bottom:1px solid var(--line)}h1,h2{font-weight:600}h2{font-size:1rem;text-transform:uppercase;letter-spacing:.06em}button,input{min-height:44px;border:1px solid var(--line);border-radius:3px;padding:.6rem;background:white;color:inherit}button{cursor:pointer}button:disabled{cursor:wait;opacity:.55}button:focus,input:focus{outline:3px solid #8ec6b4;outline-offset:2px}.status{display:flex;gap:.75rem;align-items:center}.status button:first-of-type{margin-left:auto}.rows>article{display:grid;grid-template-columns:minmax(10rem,1fr) 2fr;gap:.5rem;padding:.7rem 0;border-top:1px solid var(--line);min-width:0}.fields{display:grid;grid-template-columns:repeat(auto-fit,minmax(10rem,1fr));gap:.35rem}.field{min-width:0}.label{display:block;color:var(--muted);font-size:.8rem}.value{display:block;font-family:ui-monospace,monospace}dl{display:grid;grid-template-columns:minmax(12rem,1fr) 2fr;gap:.5rem}dt{color:var(--muted)}dd{margin:0;font-family:ui-monospace,monospace}#login-error{color:#8a2d25}@media(max-width:600px){header{flex-wrap:wrap}.status{flex-wrap:wrap}.status button{flex:1}.rows>article,dl{grid-template-columns:1fr}header #refreshed{width:100%;margin:0}}"#;
+pub(crate) const ADMIN_JS: &str = r#"'use strict';const $=id=>document.getElementById(id);let pending=null;const token=()=>sessionStorage.getItem('blackglass-admin-token');const label=k=>k.replace(/[A-Z]/g,m=>' '+m.toLowerCase());const bytes=v=>v==null?'Unavailable':(()=>{let n=Number(v),u=['B','KiB','MiB','GiB','TiB'],i=0;while(Math.abs(n)>=1024&&i<4){n/=1024;i++}return `${n.toFixed(i?1:0)} ${u[i]}`})();const time=v=>v==null?'Unavailable':new Date(v).toLocaleString();const duration=v=>v==null?'Unavailable':v<60?`${v} s`:v<3600?`${Math.round(v/60)} min`:v<86400?`${Math.round(v/3600)} h`:`${Math.round(v/86400)} d`;const display=(k,v)=>k.match(/bytes|size/i)?bytes(v):k.match(/at$|timestamp|created|expires|revoked/i)&&typeof v==='number'?time(v):k.match(/seconds/i)?duration(v):typeof v==='boolean'?(v?'Yes':'No'):(v??'Unavailable');function dl(id,obj){const e=$(id);e.replaceChildren();for(const[k,v]of Object.entries(obj)){const dt=document.createElement('dt'),dd=document.createElement('dd');dt.textContent=label(k);dd.textContent=display(k,v);e.append(dt,dd)}}function rows(id,items,empty){const e=$(id);e.replaceChildren();if(!items.length){const p=document.createElement('p');p.textContent=empty;e.append(p);return}for(const item of items){const a=document.createElement('article'),b=document.createElement('strong'),d=document.createElement('div');d.className='fields';b.textContent=String(item.name||item.device||item.eventType||'Session');for(const[k,v]of Object.entries(item)){if(['name','device','eventType'].includes(k))continue;const f=document.createElement('span'),l=document.createElement('span'),x=document.createElement('span');f.className='field';l.className='label';x.className='value';l.textContent=label(k);x.textContent=display(k,v);f.append(l,x);d.append(f)}a.append(b,d);e.append(a)}}function busy(on){$('connect').disabled=on;$('refresh').disabled=on}function forget(message=''){sessionStorage.removeItem('blackglass-admin-token');$('dashboard').hidden=true;$('login').hidden=false;$('token').value='';$('refreshed').textContent='Not connected';$('login-error').textContent=message;$('token').focus()}async function load(manual=false){if(pending)return pending;pending=(async()=>{busy(true);$('login-error').textContent='';try{const r=await fetch('/admin/api/snapshot',{headers:{Authorization:`Bearer ${token()||''}`},cache:'no-store'});if(r.status===401){forget('Invalid admin token.');return}if(!r.ok)throw Error(r.status===429?'Snapshot already in progress; retry shortly.':'Snapshot unavailable.');const x=await r.json();$('login').hidden=true;$('dashboard').hidden=false;$('health').textContent=x.overview.healthy?'Healthy':'Degraded';$('version').textContent=`Version ${x.overview.version}`;$('refreshed').textContent=`Refreshed ${time(x.generatedAt)}`;dl('overview',{...x.overview,perFileLimitBytes:x.limits.perFileBytes,retainedStorageLimitBytes:x.limits.retainedStorageBytes,sessionLimit:x.limits.maxSessions,connectionLimit:x.limits.maxConnections,uploadLimit:x.limits.maxUploads});$('vault-title').textContent=`Vaults — ${x.counts.vaultsVisible} visible / ${x.counts.vaultsTotal} total`;$('connection-title').textContent=`Live connections — ${x.liveConnections.length} active`;$('activity-title').textContent=`Recent activity — ${x.counts.activityVisible} visible / ${x.counts.activityTotal} total`;$('session-title').textContent=`Sessions — ${x.sessions.active} active / ${x.sessions.total} total (${x.counts.sessionsVisible} visible)`;rows('vaults',x.vaults,'No vaults have been created.');rows('connections',x.liveConnections,'No active Sync connections.');rows('activity',x.recentActivity,'No revision activity recorded.');rows('sessions',x.sessions.items,'No sessions recorded.');dl('storage',x.storage);dl('diagnostics',x.diagnostics)}catch(e){const m=e instanceof Error?e.message:'Snapshot unavailable.';if($('dashboard').hidden)$('login-error').textContent=m;else $('refreshed').textContent=m;if(manual)$('refresh').focus()}finally{busy(false);pending=null}})();return pending}$('login-form').addEventListener('submit',e=>{e.preventDefault();sessionStorage.setItem('blackglass-admin-token',$('token').value);load(true)});$('refresh').onclick=()=>load(true);$('signout').onclick=()=>forget();if(token())load();setInterval(()=>{if(token())load()},30000);"#;
 #[cfg(test)]
 mod tests {
     use super::*;
     #[test]
     fn configuration_is_disabled_or_complete_and_loopback_only() {
         assert_eq!(
-            parse_admin_config(None, None, None, false, 3000, 3003).unwrap(),
+            parse_admin_config(None, None, None, 3000, 3003).unwrap(),
             None
         );
         let hash = "ab".repeat(32);
@@ -401,48 +446,24 @@ mod tests {
             (None, Some("3100"), None),
             (None, None, Some(hash.as_str())),
         ] {
-            assert!(parse_admin_config(p.0, p.1, p.2, false, 3000, 3003).is_err())
+            assert!(parse_admin_config(p.0, p.1, p.2, 3000, 3003).is_err())
         }
-        let c = parse_admin_config(
-            Some("127.0.0.1"),
-            Some("3100"),
-            Some(&hash),
-            false,
-            3000,
-            3003,
-        )
-        .unwrap()
-        .unwrap();
+        let c = parse_admin_config(Some("127.0.0.1"), Some("3100"), Some(&hash), 3000, 3003)
+            .unwrap()
+            .unwrap();
         assert!(c.bind_host.is_loopback());
         assert_eq!(c.port, 3100);
         assert!(
-            parse_admin_config(
-                Some("0.0.0.0"),
-                Some("3100"),
-                Some(&hash),
-                false,
-                3000,
-                3003
-            )
-            .is_err()
+            parse_admin_config(Some("0.0.0.0"), Some("3100"), Some(&hash), 3000, 3003).is_err()
         );
         assert!(
-            parse_admin_config(
-                Some("127.0.0.1"),
-                Some("3000"),
-                Some(&hash),
-                false,
-                3000,
-                3003
-            )
-            .is_err()
+            parse_admin_config(Some("127.0.0.1"), Some("3000"), Some(&hash), 3000, 3003).is_err()
         );
         assert!(
             parse_admin_config(
                 Some("127.0.0.1"),
                 Some("3100"),
                 Some(&"A".repeat(64)),
-                false,
                 3000,
                 3003
             )
@@ -471,7 +492,7 @@ mod tests {
         assert!(!ADMIN_HTML.contains("token_hash"));
         assert!(ADMIN_CSS.contains("@media"));
         assert!(ADMIN_CSS.contains("min-height:44px"));
-        for marker in ["sessionStorage", "Authorization", "10000"] {
+        for marker in ["sessionStorage", "Authorization", "30000"] {
             assert!(ADMIN_JS.contains(marker))
         }
         assert!(!ADMIN_JS.contains("localStorage"));
@@ -512,7 +533,7 @@ mod tests {
             })
             .unwrap();
             assert_eq!(
-                db.admin_snapshot()
+                db.admin_snapshot("127.0.0.1:3003")
                     .unwrap()
                     .vaults
                     .iter()
@@ -522,12 +543,13 @@ mod tests {
                 expected
             );
         }
-        let encoded = serde_json::to_string(&db.admin_snapshot().unwrap().vaults).unwrap();
+        let encoded =
+            serde_json::to_string(&db.admin_snapshot("127.0.0.1:3003").unwrap().vaults).unwrap();
         for secret in ["RECOVERY-SECRET", "KEYHASH-SECRET", "SALT-SECRET"] {
             assert!(!encoded.contains(secret));
         }
-        assert!(db.admin_snapshot().unwrap().vaults.len() <= 100);
-        assert!(db.admin_snapshot().unwrap().activity.len() <= 100);
-        assert!(db.admin_snapshot().unwrap().sessions.len() <= 100);
+        assert!(db.admin_snapshot("127.0.0.1:3003").unwrap().vaults.len() <= 100);
+        assert!(db.admin_snapshot("127.0.0.1:3003").unwrap().activity.len() <= 100);
+        assert!(db.admin_snapshot("127.0.0.1:3003").unwrap().sessions.len() <= 100);
     }
 }

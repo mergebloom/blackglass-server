@@ -69,6 +69,9 @@ pub(crate) struct AdminDatabaseSnapshot {
     pub session_count: i64,
     pub logical_bytes: i64,
     pub retained_bytes: i64,
+    pub vault_count: i64,
+    pub activity_count: i64,
+    pub mismatched_data_hosts: i64,
 }
 
 #[derive(Debug)]
@@ -181,10 +184,13 @@ impl Db {
         connection.query_row("SELECT 1", [], |_| Ok(())).is_ok()
     }
 
-    pub(crate) fn admin_snapshot(&self) -> Result<AdminDatabaseSnapshot> {
+    pub(crate) fn admin_snapshot(&self, expected_host: &str) -> Result<AdminDatabaseSnapshot> {
         self.with(|c| {
+            let deadline = std::time::Instant::now() + std::time::Duration::from_secs(2);
+            c.progress_handler(10_000, Some(move || std::time::Instant::now() >= deadline));
+            let result = (|| {
             let mut vault_query = c.prepare(
-                "SELECT v.id,v.name,v.created,CASE WHEN v.password IS NULL THEN 'custom-password' ELSE 'managed' END,v.encryption_version,v.version,v.size,COALESCE((SELECT SUM(r.size) FROM revisions r WHERE r.vault_id=v.id),0),COALESCE((SELECT COUNT(*) FROM revisions r WHERE r.vault_id=v.id AND r.uid IN (SELECT MAX(r2.uid) FROM revisions r2 WHERE r2.vault_id=v.id GROUP BY r2.path) AND r.deleted=0 AND r.folder=0),0),COALESCE((SELECT COUNT(*) FROM revisions r WHERE r.vault_id=v.id AND r.uid IN (SELECT MAX(r2.uid) FROM revisions r2 WHERE r2.vault_id=v.id GROUP BY r2.path) AND r.deleted=1),0),(SELECT r.ts FROM revisions r WHERE r.vault_id=v.id ORDER BY r.uid DESC LIMIT 1),(SELECT r.device FROM revisions r WHERE r.vault_id=v.id ORDER BY r.uid DESC LIMIT 1) FROM vaults v ORDER BY v.created ASC LIMIT 100"
+                "WITH latest_path AS (SELECT vault_id,path,MAX(uid) uid FROM revisions GROUP BY vault_id,path), per_vault AS (SELECT r.vault_id,SUM(r.size) retained_bytes,SUM(CASE WHEN lp.uid=r.uid AND r.deleted=0 AND r.folder=0 THEN 1 ELSE 0 END) file_count,SUM(CASE WHEN lp.uid=r.uid AND r.deleted=1 THEN 1 ELSE 0 END) deleted_count FROM revisions r LEFT JOIN latest_path lp ON lp.uid=r.uid GROUP BY r.vault_id), latest_revision AS (SELECT r.vault_id,r.ts,r.device FROM revisions r JOIN (SELECT vault_id,MAX(uid) uid FROM revisions GROUP BY vault_id) x ON x.uid=r.uid) SELECT v.id,v.name,v.created,CASE WHEN v.password IS NULL THEN 'custom-password' ELSE 'managed' END,v.encryption_version,v.version,v.size,COALESCE(p.retained_bytes,0),COALESCE(p.file_count,0),COALESCE(p.deleted_count,0),l.ts,l.device FROM vaults v LEFT JOIN per_vault p ON p.vault_id=v.id LEFT JOIN latest_revision l ON l.vault_id=v.id ORDER BY v.created ASC LIMIT 100"
             )?;
             let vaults = vault_query.query_map([], |r| Ok(AdminVault { id:r.get(0)?,name:r.get(1)?,created_at:r.get(2)?,encryption_mode:r.get(3)?,encryption_version:r.get(4)?,current_revision:r.get(5)?,live_bytes:r.get(6)?,retained_bytes:r.get(7)?,file_count:r.get(8)?,deleted_count:r.get(9)?,latest_activity_at:r.get(10)?,latest_device:r.get(11)? }))?.collect::<rusqlite::Result<Vec<_>>>()?;
             let mut activity_query = c.prepare("SELECT r.ts,r.vault_id,v.name,r.device,CASE WHEN r.deleted=1 THEN 'deleted' WHEN r.folder=1 THEN 'folder' ELSE 'revision' END,r.extension,r.size,r.uid FROM revisions r JOIN vaults v ON v.id=r.vault_id ORDER BY r.uid DESC LIMIT 100")?;
@@ -195,7 +201,13 @@ impl Db {
             let (session_count,active_sessions)=c.query_row("SELECT COUNT(*),COALESCE(SUM(CASE WHEN revoked_at IS NULL AND expires_at>? THEN 1 ELSE 0 END),0) FROM sessions",[now],|r|Ok((r.get(0)?,r.get(1)?)))?;
             let logical_bytes=c.query_row("SELECT COALESCE(SUM(size),0) FROM vaults",[],|r|r.get(0))?;
             let retained_bytes=c.query_row("SELECT COALESCE(SUM(size),0) FROM revisions",[],|r|r.get(0))?;
-            Ok(AdminDatabaseSnapshot{schema_version:CURRENT_SCHEMA_VERSION_PUBLIC,max_sessions:MAX_SESSIONS,vaults,activity,sessions,active_sessions,session_count,logical_bytes,retained_bytes})
+            let mismatched_data_hosts=c.query_row("SELECT COUNT(*) FROM vaults WHERE host<>?",[expected_host],|r|r.get(0))?;
+            let vault_count=c.query_row("SELECT COUNT(*) FROM vaults",[],|r|r.get(0))?;
+            let activity_count=c.query_row("SELECT COUNT(*) FROM revisions",[],|r|r.get(0))?;
+                Ok(AdminDatabaseSnapshot{schema_version:CURRENT_SCHEMA_VERSION_PUBLIC,max_sessions:MAX_SESSIONS,vaults,activity,sessions,active_sessions,session_count,logical_bytes,retained_bytes,vault_count,activity_count,mismatched_data_hosts})
+            })();
+            c.progress_handler(0, None::<fn() -> bool>);
+            result
         })
     }
 

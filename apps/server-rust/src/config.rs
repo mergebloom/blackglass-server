@@ -138,7 +138,6 @@ impl Config {
             value("SELFHOST_ADMIN_BIND_HOST").as_deref(),
             value("SELFHOST_ADMIN_PORT").as_deref(),
             value("SELFHOST_ADMIN_TOKEN_HASH").as_deref(),
-            external_bind_acknowledged,
             control_port,
             data_port,
         )?;

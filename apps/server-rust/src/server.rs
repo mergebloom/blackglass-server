@@ -120,6 +120,7 @@ pub struct AppState {
     shutdown: watch::Receiver<bool>,
     metrics: Arc<Metrics>,
     pub(crate) live_connections: crate::admin::LiveRegistry,
+    pub(crate) admin_snapshots: Arc<Semaphore>,
     pub(crate) started: Instant,
 }
 
@@ -263,6 +264,7 @@ pub async fn run(config: Config) -> Result<()> {
         shutdown,
         metrics: Arc::new(Metrics::default()),
         live_connections: crate::admin::LiveRegistry::new(max_connections),
+        admin_snapshots: Arc::new(Semaphore::new(1)),
         started: Instant::now(),
     };
     let control = control_router(state.clone());
@@ -311,11 +313,14 @@ pub async fn run(config: Config) -> Result<()> {
                 .await
         })
     });
-    let listener_result =
-        supervise_listeners(shutdown_tx, control_task, data_task, shutdown_signal()).await;
-    if let Some(task) = admin_task {
-        task.await.context("admin listener task failed")??;
-    }
+    let listener_result = supervise_listeners(
+        shutdown_tx,
+        control_task,
+        data_task,
+        admin_task,
+        shutdown_signal(),
+    )
+    .await;
     let drain_result = wait_for_connection_drain(&state).await;
     let (checkpoint_result, cleanup_result) = if drain_result.is_ok() {
         (
@@ -1120,6 +1125,9 @@ async fn handle_message(
                 }
             };
             let op = v.get("op").and_then(Value::as_str).unwrap_or("");
+            if let Some(live) = &session.live {
+                live.protocol_activity(op);
+            }
             if !session.authenticated {
                 if op != "init" {
                     return close(tx, 1008, "Authentication required").await;
@@ -1158,6 +1166,9 @@ async fn handle_message(
         Message::Binary(bytes) => {
             if !session.authenticated || !session_active(s, session).await {
                 return close(tx, 1008, "Authentication required").await;
+            }
+            if let Some(live) = &session.live {
+                live.protocol_activity("uploading");
             }
             upload_chunk(s, session, events, tx, &bytes).await
         }
@@ -2280,12 +2291,14 @@ enum ListenerTrigger {
     Shutdown,
     Control(ListenerJoinResult),
     Data(ListenerJoinResult),
+    Admin(ListenerJoinResult),
 }
 
 async fn supervise_listeners<S>(
     shutdown_tx: watch::Sender<bool>,
     mut control_task: tokio::task::JoinHandle<std::io::Result<()>>,
     mut data_task: tokio::task::JoinHandle<std::io::Result<()>>,
+    mut admin_task: Option<tokio::task::JoinHandle<std::io::Result<()>>>,
     shutdown_requested: S,
 ) -> Result<()>
 where
@@ -2296,6 +2309,7 @@ where
         _ = &mut shutdown_requested => ListenerTrigger::Shutdown,
         result = &mut control_task => ListenerTrigger::Control(result),
         result = &mut data_task => ListenerTrigger::Data(result),
+        result = async { match admin_task.as_mut() { Some(task) => task.await, None => std::future::pending().await } } => ListenerTrigger::Admin(result),
     };
     let expected_shutdown = matches!(trigger, ListenerTrigger::Shutdown);
     info!(event = "shutdown_requested", expected = expected_shutdown);
@@ -2305,7 +2319,11 @@ where
         ListenerTrigger::Shutdown => {
             let control = listener_result("control", control_task.await);
             let data = listener_result("data", data_task.await);
-            control.and(data)
+            let admin = match admin_task {
+                Some(task) => listener_result("admin", task.await),
+                None => Ok(()),
+            };
+            control.and(data).and(admin)
         }
         ListenerTrigger::Control(result) => {
             let control = unexpected_listener_result("control", result);
@@ -2316,6 +2334,12 @@ where
             let data = unexpected_listener_result("data", result);
             let control = listener_result("control", control_task.await);
             data.and(control)
+        }
+        ListenerTrigger::Admin(result) => {
+            let admin = unexpected_listener_result("admin", result);
+            let control = listener_result("control", control_task.await);
+            let data = listener_result("data", data_task.await);
+            admin.and(control).and(data)
         }
     }
 }
@@ -2573,7 +2597,7 @@ mod tests {
         });
         let error = timeout(
             Duration::from_secs(1),
-            supervise_listeners(shutdown_tx, control, data, std::future::pending()),
+            supervise_listeners(shutdown_tx, control, data, None, std::future::pending()),
         )
         .await
         .expect("supervisor stalled")
@@ -2582,6 +2606,39 @@ mod tests {
             error
                 .to_string()
                 .contains("control listener exited unexpectedly")
+        );
+    }
+
+    #[tokio::test]
+    async fn listener_supervisor_propagates_an_unexpected_admin_exit() {
+        let (shutdown_tx, mut shutdown_rx) = watch::channel(false);
+        let mut other_shutdown = shutdown_rx.clone();
+        let control = tokio::spawn(async move {
+            wait_for_shutdown(&mut shutdown_rx).await;
+            Ok(())
+        });
+        let data = tokio::spawn(async move {
+            wait_for_shutdown(&mut other_shutdown).await;
+            Ok(())
+        });
+        let admin = tokio::spawn(async { Ok(()) });
+        let error = timeout(
+            Duration::from_secs(1),
+            supervise_listeners(
+                shutdown_tx,
+                control,
+                data,
+                Some(admin),
+                std::future::pending(),
+            ),
+        )
+        .await
+        .expect("supervisor stalled")
+        .expect_err("unexpected admin exit was accepted");
+        assert!(
+            error
+                .to_string()
+                .contains("admin listener exited unexpectedly")
         );
     }
 
