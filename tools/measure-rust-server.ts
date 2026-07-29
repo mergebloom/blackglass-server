@@ -714,7 +714,14 @@ async function startCgroupContainer(): Promise<CgroupContext> {
   await mkdir(join(context, "state"), { recursive: true });
   await writeFile(join(context, "state/.blackglass-state"), "");
   const stagedBinary = join(context, "blackglass-server");
-  await copyFile(binary, stagedBinary);
+  await Promise.all([
+    copyFile(binary, stagedBinary),
+    copyFile(join(root, "LICENSE"), join(context, "LICENSE")),
+    copyFile(
+      join(root, "THIRD_PARTY_NOTICES.md"),
+      join(context, "THIRD_PARTY_NOTICES.md"),
+    ),
+  ]);
   await chmod(stagedBinary, 0o555);
   const artifactBinarySha256 = await sha256Path(binary);
   const stagedBinarySha256 = await sha256Path(stagedBinary);
