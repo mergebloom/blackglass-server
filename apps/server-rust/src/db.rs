@@ -22,6 +22,54 @@ pub(crate) const MAX_VAULTS: i64 = 100;
 pub(crate) const MAX_JS_SAFE_INTEGER: i64 = 9_007_199_254_740_991;
 const MAX_RETIRED_VAULTS: i64 = 65_536;
 const MAX_SESSIONS: i64 = 1024;
+pub(crate) const CURRENT_SCHEMA_VERSION_PUBLIC: i64 = CURRENT_SCHEMA_VERSION;
+
+#[derive(Clone, Debug, serde::Serialize)]
+#[serde(rename_all = "camelCase")]
+pub(crate) struct AdminVault {
+    pub id: String,
+    pub name: String,
+    pub created_at: i64,
+    pub encryption_mode: String,
+    pub encryption_version: i64,
+    pub current_revision: i64,
+    pub live_bytes: i64,
+    pub retained_bytes: i64,
+    pub file_count: i64,
+    pub deleted_count: i64,
+    pub latest_activity_at: Option<i64>,
+    pub latest_device: Option<String>,
+}
+#[derive(Clone, Debug, serde::Serialize)]
+#[serde(rename_all = "camelCase")]
+pub(crate) struct AdminActivity {
+    pub timestamp: i64,
+    pub vault_id: String,
+    pub vault_name: String,
+    pub device: String,
+    pub event_type: String,
+    pub extension: String,
+    pub size: i64,
+    pub revision: i64,
+}
+#[derive(Clone, Debug, serde::Serialize)]
+#[serde(rename_all = "camelCase")]
+pub(crate) struct AdminSession {
+    pub created_at: i64,
+    pub expires_at: i64,
+    pub revoked_at: Option<i64>,
+}
+pub(crate) struct AdminDatabaseSnapshot {
+    pub schema_version: i64,
+    pub max_sessions: i64,
+    pub vaults: Vec<AdminVault>,
+    pub activity: Vec<AdminActivity>,
+    pub sessions: Vec<AdminSession>,
+    pub active_sessions: i64,
+    pub session_count: i64,
+    pub logical_bytes: i64,
+    pub retained_bytes: i64,
+}
 
 #[derive(Debug)]
 struct StorageQuotaExceeded;
@@ -131,6 +179,24 @@ impl Db {
             return false;
         };
         connection.query_row("SELECT 1", [], |_| Ok(())).is_ok()
+    }
+
+    pub(crate) fn admin_snapshot(&self) -> Result<AdminDatabaseSnapshot> {
+        self.with(|c| {
+            let mut vault_query = c.prepare(
+                "SELECT v.id,v.name,v.created,CASE WHEN v.password IS NULL THEN 'custom-password' ELSE 'managed' END,v.encryption_version,v.version,v.size,COALESCE((SELECT SUM(r.size) FROM revisions r WHERE r.vault_id=v.id),0),COALESCE((SELECT COUNT(*) FROM revisions r WHERE r.vault_id=v.id AND r.uid IN (SELECT MAX(r2.uid) FROM revisions r2 WHERE r2.vault_id=v.id GROUP BY r2.path) AND r.deleted=0 AND r.folder=0),0),COALESCE((SELECT COUNT(*) FROM revisions r WHERE r.vault_id=v.id AND r.uid IN (SELECT MAX(r2.uid) FROM revisions r2 WHERE r2.vault_id=v.id GROUP BY r2.path) AND r.deleted=1),0),(SELECT r.ts FROM revisions r WHERE r.vault_id=v.id ORDER BY r.uid DESC LIMIT 1),(SELECT r.device FROM revisions r WHERE r.vault_id=v.id ORDER BY r.uid DESC LIMIT 1) FROM vaults v ORDER BY v.created ASC LIMIT 100"
+            )?;
+            let vaults = vault_query.query_map([], |r| Ok(AdminVault { id:r.get(0)?,name:r.get(1)?,created_at:r.get(2)?,encryption_mode:r.get(3)?,encryption_version:r.get(4)?,current_revision:r.get(5)?,live_bytes:r.get(6)?,retained_bytes:r.get(7)?,file_count:r.get(8)?,deleted_count:r.get(9)?,latest_activity_at:r.get(10)?,latest_device:r.get(11)? }))?.collect::<rusqlite::Result<Vec<_>>>()?;
+            let mut activity_query = c.prepare("SELECT r.ts,r.vault_id,v.name,r.device,CASE WHEN r.deleted=1 THEN 'deleted' WHEN r.folder=1 THEN 'folder' ELSE 'revision' END,r.extension,r.size,r.uid FROM revisions r JOIN vaults v ON v.id=r.vault_id ORDER BY r.uid DESC LIMIT 100")?;
+            let activity = activity_query.query_map([], |r| Ok(AdminActivity{timestamp:r.get(0)?,vault_id:r.get(1)?,vault_name:r.get(2)?,device:r.get(3)?,event_type:r.get(4)?,extension:r.get(5)?,size:r.get(6)?,revision:r.get(7)?}))?.collect::<rusqlite::Result<Vec<_>>>()?;
+            let mut session_query=c.prepare("SELECT created_at,expires_at,revoked_at FROM sessions ORDER BY created_at DESC LIMIT 100")?;
+            let sessions=session_query.query_map([],|r|Ok(AdminSession{created_at:r.get(0)?,expires_at:r.get(1)?,revoked_at:r.get(2)?}))?.collect::<rusqlite::Result<Vec<_>>>()?;
+            let now=now_ms();
+            let (session_count,active_sessions)=c.query_row("SELECT COUNT(*),COALESCE(SUM(CASE WHEN revoked_at IS NULL AND expires_at>? THEN 1 ELSE 0 END),0) FROM sessions",[now],|r|Ok((r.get(0)?,r.get(1)?)))?;
+            let logical_bytes=c.query_row("SELECT COALESCE(SUM(size),0) FROM vaults",[],|r|r.get(0))?;
+            let retained_bytes=c.query_row("SELECT COALESCE(SUM(size),0) FROM revisions",[],|r|r.get(0))?;
+            Ok(AdminDatabaseSnapshot{schema_version:CURRENT_SCHEMA_VERSION_PUBLIC,max_sessions:MAX_SESSIONS,vaults,activity,sessions,active_sessions,session_count,logical_bytes,retained_bytes})
+        })
     }
 
     pub fn issue_session(&self, ttl_secs: i64) -> Result<String> {

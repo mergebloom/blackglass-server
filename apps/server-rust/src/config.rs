@@ -40,6 +40,7 @@ pub struct Config {
     pub max_concurrent_uploads: usize,
     pub max_ws_connections: usize,
     pub trusted_proxy: Option<IpAddr>,
+    pub admin: Option<crate::admin::AdminConfig>,
     pub json_logs: bool,
 }
 
@@ -133,6 +134,14 @@ impl Config {
                 Ok(address)
             })
             .transpose()?;
+        let admin = crate::admin::parse_admin_config(
+            value("SELFHOST_ADMIN_BIND_HOST").as_deref(),
+            value("SELFHOST_ADMIN_PORT").as_deref(),
+            value("SELFHOST_ADMIN_TOKEN_HASH").as_deref(),
+            external_bind_acknowledged,
+            control_port,
+            data_port,
+        )?;
         Ok(Self {
             bind_host,
             control_port,
@@ -151,6 +160,7 @@ impl Config {
             max_concurrent_uploads,
             max_ws_connections,
             trusted_proxy,
+            admin,
             json_logs: value("SELFHOST_LOG_FORMAT").as_deref() != Some("pretty"),
         })
     }
@@ -175,6 +185,7 @@ impl Config {
             max_concurrent_uploads: 2,
             max_ws_connections: DEFAULT_MAX_WS_CONNECTIONS,
             trusted_proxy: None,
+            admin: None,
             json_logs: false,
         })
     }

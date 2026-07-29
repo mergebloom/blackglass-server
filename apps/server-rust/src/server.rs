@@ -119,6 +119,8 @@ pub struct AppState {
     large_responses: Arc<Semaphore>,
     shutdown: watch::Receiver<bool>,
     metrics: Arc<Metrics>,
+    pub(crate) live_connections: crate::admin::LiveRegistry,
+    pub(crate) started: Instant,
 }
 
 #[derive(Default)]
@@ -260,13 +262,24 @@ pub async fn run(config: Config) -> Result<()> {
         large_responses: Arc::new(Semaphore::new(1)),
         shutdown,
         metrics: Arc::new(Metrics::default()),
+        live_connections: crate::admin::LiveRegistry::new(max_connections),
+        started: Instant::now(),
     };
     let control = control_router(state.clone());
     let data = data_router(state.clone());
     let control_listener =
         TcpListener::bind((state.config.bind_host, state.config.control_port)).await?;
     let data_listener = TcpListener::bind((state.config.bind_host, state.config.data_port)).await?;
-    info!(event="server_started",control=%control_listener.local_addr()?,data=%data_listener.local_addr()?,database=%state.config.database_path.display());
+    let admin_listener = if let Some(admin) = &state.config.admin {
+        Some(
+            TcpListener::bind((admin.bind_host, admin.port))
+                .await
+                .context("bind admin listener")?,
+        )
+    } else {
+        None
+    };
+    info!(event="server_started",control=%control_listener.local_addr()?,data=%data_listener.local_addr()?,admin=?admin_listener.as_ref().and_then(|l|l.local_addr().ok()),database=%state.config.database_path.display());
     let mut cstop = state.shutdown.clone();
     let mut dstop = state.shutdown.clone();
     let control_task = tokio::spawn(async move {
@@ -289,8 +302,20 @@ pub async fn run(config: Config) -> Result<()> {
         })
         .await
     });
+    let admin_task = admin_listener.map(|listener| {
+        let router = crate::admin::router(state.clone());
+        let mut stop = state.shutdown.clone();
+        tokio::spawn(async move {
+            axum::serve(listener, router)
+                .with_graceful_shutdown(async move { wait_for_shutdown(&mut stop).await })
+                .await
+        })
+    });
     let listener_result =
         supervise_listeners(shutdown_tx, control_task, data_task, shutdown_signal()).await;
+    if let Some(task) = admin_task {
+        task.await.context("admin listener task failed")??;
+    }
     let drain_result = wait_for_connection_drain(&state).await;
     let (checkpoint_result, cleanup_result) = if drain_result.is_ok() {
         (
@@ -912,6 +937,7 @@ struct Session {
     vault: Option<String>,
     device: String,
     pending: Option<Pending>,
+    live: Option<crate::admin::LiveGuard>,
 }
 struct Pending {
     revision: NewRevision,
@@ -939,6 +965,7 @@ async fn socket_loop(
         vault: None,
         device: "Unknown device".into(),
         pending: None,
+        live: None,
     };
     let mut source_permit = Some(source_permit);
     let authentication_deadline = tokio::time::sleep(AUTHENTICATION_DEADLINE);
@@ -1220,6 +1247,9 @@ async fn init(
     )
     .unwrap_or("Unknown device")
     .into();
+    session.live = s
+        .live_connections
+        .register(&vault.id, &session.device, version);
     let initial = v.get("initial").and_then(Value::as_bool).unwrap_or(false);
     let ready_version = {
         // Establish the replay/live boundary while commits are serialized. Replacing
@@ -1285,6 +1315,9 @@ async fn init(
         }
     }
     send(tx, json!({"op":"ready","version":ready_version})).await?;
+    if let Some(live) = &session.live {
+        live.activity(ready_version, "ready");
+    }
     Ok(())
 }
 

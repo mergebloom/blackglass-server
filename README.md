@@ -72,6 +72,12 @@ cargo run --release --locked \
 The default listeners are `127.0.0.1:3000` and `127.0.0.1:3003`.
 Plaintext credentials and transport are for loopback development only.
 
+An optional dependency-free, read-only admin console can run on a third,
+independently configured listener. It is disabled unless all three admin
+variables are set, is never mounted on either Sync listener, and accepts a
+separate bearer token whose configuration contains only a lowercase SHA-256
+hash. See the production guide; never publish this listener to the Internet.
+
 ## Deploy
 
 Tagged releases produce checksummed static-musl archives and separately

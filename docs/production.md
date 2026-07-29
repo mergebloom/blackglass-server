@@ -104,6 +104,29 @@ does both with `127.0.0.1`. Otherwise leave it unset and add equivalent
 per-source limits at ingress. `SELFHOST_MAX_WS_CONNECTIONS` defaults to 16 and
 is constrained to 1..16 by the qualified memory envelope.
 
+## Read-only admin console
+
+The optional Phase 1 admin console is observation-only: it has no mutation,
+backup, configuration, revocation, deletion, purge, or restore controls. Enable
+it only by setting `SELFHOST_ADMIN_BIND_HOST`, `SELFHOST_ADMIN_PORT`, and
+`SELFHOST_ADMIN_TOKEN_HASH` together. The hash is exactly 64 lowercase SHA-256
+hex characters; never put the plaintext admin token in the environment. Use a
+random token independent from all Sync sessions.
+
+Keep the listener on `127.0.0.1` (for example port `3010`). TLS remains the
+responsibility of a private reverse proxy. A safe remote shape is a tailnet-only
+hostname whose proxy route forwards `/admin` to `127.0.0.1:3010` and is not
+present in public DNS or the public Caddy site. Do not proxy the admin listener
+from the public control/data virtual hosts. The shell assets contain no server
+data; every `/admin/api/*` request requires `Authorization: Bearer <admin-token>`.
+The browser stores it in `sessionStorage`, polls no faster than ten seconds, and
+can forget it with **Forget token**.
+
+The console exposes bounded, explicit projections: readiness/version/schema,
+configured limits, vault metadata and encryption mode, recent revision metadata
+without encrypted paths, session timestamps without token hashes, storage
+counts, staging diagnostics, and a bounded in-memory live-connection view.
+
 ## Health, metrics, and logs
 
 - `GET /health` is process liveness.
