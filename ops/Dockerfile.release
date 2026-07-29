@@ -46,6 +46,7 @@ RUN --mount=type=cache,id=blackglass-cargo-registry-$TARGETARCH,target=/usr/loca
 COPY apps/server-rust/src ./apps/server-rust/src
 COPY ops/blackglass-server.service ./ops/blackglass-server.service
 COPY LICENSE /metadata/LICENSE
+COPY THIRD_PARTY_NOTICES.md /metadata/THIRD_PARTY_NOTICES.md
 COPY ops/release/INSTALL.md /metadata/INSTALL.md
 COPY ops/blackglass-server.env.example /metadata/blackglass-server.env.example
 COPY ops/blackglass-server.service /metadata/blackglass-server.service
@@ -103,6 +104,7 @@ RUN set -eu; \
     chmod 0755 "/package/$bundle/blackglass-server"; \
     cp /metadata/INSTALL.md "/package/$bundle/INSTALL.md"; \
     cp /metadata/LICENSE "/package/$bundle/LICENSE"; \
+    cp /metadata/THIRD_PARTY_NOTICES.md "/package/$bundle/THIRD_PARTY_NOTICES.md"; \
     cp /metadata/blackglass-server.env.example "/package/$bundle/blackglass-server.env.example"; \
     cp /metadata/blackglass-server.service "/package/$bundle/blackglass-server.service"; \
     cp /metadata/blackglass-server.sysusers.conf "/package/$bundle/blackglass-server.sysusers.conf"; \
@@ -150,6 +152,8 @@ LABEL org.opencontainers.image.title="Blackglass Server" \
       org.opencontainers.image.version="$VERSION"
 
 COPY --from=build --chmod=0555 /target/release/blackglass-server /usr/local/bin/blackglass-server
+COPY --from=build /metadata/LICENSE /licenses/LICENSE
+COPY --from=build /metadata/THIRD_PARTY_NOTICES.md /licenses/THIRD_PARTY_NOTICES.md
 COPY --from=build --chown=65532:65532 /runtime-state/ /var/lib/blackglass-server/
 
 ENV PATH=/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin \

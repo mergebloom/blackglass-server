@@ -10,6 +10,9 @@ pub(crate) const MAX_WS_CONNECTIONS_LIMIT: usize = 16;
 pub(crate) const DEFAULT_MAX_WS_CONNECTIONS: usize = 16;
 pub(crate) const MAX_CONCURRENT_UPLOADS_LIMIT: usize = 4;
 pub(crate) const MAX_PER_FILE_BYTES: u64 = 900 * 1024 * 1024;
+const DEFAULT_UPLOAD_IDLE_TIMEOUT_SECONDS: u64 = 300;
+const MIN_UPLOAD_IDLE_TIMEOUT_SECONDS: u64 = 5;
+const MAX_UPLOAD_IDLE_TIMEOUT_SECONDS: u64 = 60 * 60;
 // Bundled SQLite keeps the upstream 1,000,000,000-byte SQLITE_MAX_LENGTH.
 // Leave substantial room for encryption and record/header overhead instead of
 // advertising an upload which can be staged completely but never committed.
@@ -28,6 +31,7 @@ pub struct Config {
     pub display_name: String,
     pub per_file_max: u64,
     pub session_ttl: Duration,
+    pub upload_idle_timeout: Duration,
     pub allowed_origins: Vec<String>,
     pub max_concurrent_uploads: usize,
     pub max_ws_connections: usize,
@@ -87,6 +91,11 @@ impl Config {
         if !(300..=365 * 24 * 60 * 60).contains(&session_ttl_seconds) {
             bail!("SELFHOST_SESSION_TTL_SECONDS must be between 300 seconds and 365 days");
         }
+        let upload_idle_timeout_seconds = number(
+            "SELFHOST_UPLOAD_IDLE_TIMEOUT_SECONDS",
+            DEFAULT_UPLOAD_IDLE_TIMEOUT_SECONDS,
+        )?;
+        validate_upload_idle_timeout(upload_idle_timeout_seconds)?;
         let max_concurrent_uploads = number("SELFHOST_MAX_CONCURRENT_UPLOADS", 4usize)?;
         validate_concurrent_uploads(max_concurrent_uploads)?;
         let max_ws_connections = number("SELFHOST_MAX_WS_CONNECTIONS", DEFAULT_MAX_WS_CONNECTIONS)?;
@@ -129,6 +138,7 @@ impl Config {
             display_name: value("SELFHOST_NAME").unwrap_or_else(|| "Blackglass user".into()),
             per_file_max,
             session_ttl: Duration::from_secs(session_ttl_seconds),
+            upload_idle_timeout: Duration::from_secs(upload_idle_timeout_seconds),
             allowed_origins,
             max_concurrent_uploads,
             max_ws_connections,
@@ -151,6 +161,7 @@ impl Config {
             display_name: "Test owner".into(),
             per_file_max: 8 * 1024 * 1024,
             session_ttl: Duration::from_secs(3600),
+            upload_idle_timeout: Duration::from_secs(DEFAULT_UPLOAD_IDLE_TIMEOUT_SECONDS),
             allowed_origins: vec!["app://obsidian.md".into()],
             max_concurrent_uploads: 2,
             max_ws_connections: DEFAULT_MAX_WS_CONNECTIONS,
@@ -201,6 +212,15 @@ fn validate_concurrent_uploads(value: usize) -> Result<()> {
     if !(1..=MAX_CONCURRENT_UPLOADS_LIMIT).contains(&value) {
         bail!(
             "SELFHOST_MAX_CONCURRENT_UPLOADS must be between 1 and {MAX_CONCURRENT_UPLOADS_LIMIT}"
+        )
+    }
+    Ok(())
+}
+
+fn validate_upload_idle_timeout(value: u64) -> Result<()> {
+    if !(MIN_UPLOAD_IDLE_TIMEOUT_SECONDS..=MAX_UPLOAD_IDLE_TIMEOUT_SECONDS).contains(&value) {
+        bail!(
+            "SELFHOST_UPLOAD_IDLE_TIMEOUT_SECONDS must be between {MIN_UPLOAD_IDLE_TIMEOUT_SECONDS} and {MAX_UPLOAD_IDLE_TIMEOUT_SECONDS} seconds"
         )
     }
     Ok(())
@@ -459,6 +479,27 @@ mod tests {
             assert!(
                 validate_concurrent_uploads(value).is_err(),
                 "passed: {value}"
+            );
+        }
+    }
+
+    #[test]
+    fn upload_idle_timeout_has_safe_operational_bounds() {
+        for value in [
+            MIN_UPLOAD_IDLE_TIMEOUT_SECONDS,
+            DEFAULT_UPLOAD_IDLE_TIMEOUT_SECONDS,
+            MAX_UPLOAD_IDLE_TIMEOUT_SECONDS,
+        ] {
+            validate_upload_idle_timeout(value).unwrap();
+        }
+        for value in [
+            0,
+            MIN_UPLOAD_IDLE_TIMEOUT_SECONDS - 1,
+            MAX_UPLOAD_IDLE_TIMEOUT_SECONDS + 1,
+        ] {
+            assert!(
+                validate_upload_idle_timeout(value).is_err(),
+                "unsafe upload idle timeout passed: {value}"
             );
         }
     }

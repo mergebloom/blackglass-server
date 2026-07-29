@@ -26,12 +26,13 @@ E2EE does not hide those facts.
 | Login guessing/CPU exhaustion | Uniform credential error, one bounded Argon2 check off the async reactor, an eight-waiter fair queue, a six-attempt/60-second per-source bucket that refunds successful owner sign-in, and forwarded addresses trusted only from one exact configured proxy |
 | Cross-origin control calls | Bounded exact renderer-origin allowlist, matched-origin preflight responses, bounded 64 KiB JSON bodies |
 | Memory/disk exhaustion | 2 MiB frames, 16 default/maximum WebSockets, four unauthenticated sockets per source, declared-size/piece validation, per-file cap, upload/response/database semaphores, private staging files, and external disk monitoring |
-| Partial uploads/crashes | Unique mode-0600 staging files, commit only after exact byte/piece match and fsync, cleanup on every commit result, and startup cleanup |
+| Partial uploads/crashes | Unique mode-0600 staging files, a bounded progress deadline that releases capacity and removes idle partials, commit only after exact byte/piece match and fsync, cleanup on every commit result, and startup cleanup |
 | SQLite corruption or hostile schema | WAL with FULL synchronous commits, foreign keys, defensive/untrusted-schema connections, copy-first offline per-version migrations with transactional validation/rollback, graceful checkpoint, online backup API, exact schema/logical verification, and restore drills |
 | Endpoint rotation | Canonical data-host validation, startup equality gate across persisted vaults, and a verified-backup-first transactional rebind command |
 | Data leakage through logs | Structured events omit credentials, tokens, ciphertext paths/hashes/bodies, and managed vault recovery passwords |
 | Privilege escalation | Static unprivileged systemd user, empty capabilities, strict filesystem/device/kernel protections, syscall and address-family restrictions |
 | Client drift | Version-specific deterministic patch anchors, upstream/generated hashes, updates disabled in the copied profile, and official-client E2E qualification |
+| Dependency supply chain | Locked crates, a checksum-pinned advisory/license/source scanner, explicit license allowlist, Cargo plus native/runtime notices, digest-pinned build images, and commit-pinned CI actions |
 | Operations endpoint exposure | Health, readiness, and metrics remain loopback/private by default; the example public Caddy route returns 404 for them |
 
 ## Residual risk and exclusions

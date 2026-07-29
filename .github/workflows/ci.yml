@@ -19,6 +19,13 @@ jobs:
       - run: rustup toolchain install 1.92.0 --profile minimal --component rustfmt,clippy
       - run: rustup default 1.92.0
       - run: npm ci
+      - name: Install checksum-verified cargo-deny
+        run: ./ops/install-cargo-deny.sh "$RUNNER_TEMP/cargo-deny"
+      - name: Audit Rust dependencies and licenses
+        run: >-
+          "$RUNNER_TEMP/cargo-deny"
+          --manifest-path apps/server-rust/Cargo.toml
+          check advisories licenses sources
       - run: bun run check
       - run: ./ops/build-release.sh
       - run: bun run server:measure

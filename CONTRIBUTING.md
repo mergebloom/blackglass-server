@@ -21,3 +21,10 @@ affected, and an official-client qualification record in Blackglass Bridge.
 
 The Rust service is the production implementation. The Bun service is a
 loopback-only protocol oracle and must not be presented as production-ready.
+
+When `Cargo.toml`, `Cargo.lock`, `rust-toolchain.toml`, the release Dockerfile,
+or the audited native/runtime notice changes, install exactly `cargo-about
+0.9.1` with its `cli` feature, fetch the locked graph, and run `bun run
+licenses:generate`. The normal gate rejects notices whose dependency, feature,
+toolchain, builder, configuration, template, native-runtime, or output hash is
+stale.

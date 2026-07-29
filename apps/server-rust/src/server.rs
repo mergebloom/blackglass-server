@@ -36,7 +36,9 @@ use tokio::{
     io::AsyncWriteExt,
     net::TcpListener,
     sync::{Mutex as AsyncMutex, Semaphore, broadcast, watch},
-    time::{MissedTickBehavior, interval, timeout, timeout_at},
+    time::{
+        Instant as TokioInstant, MissedTickBehavior, interval, sleep_until, timeout, timeout_at,
+    },
 };
 use tracing::{info, warn};
 use uuid::Uuid;
@@ -83,6 +85,7 @@ pub struct Metrics {
     ws_connections: AtomicU64,
     uploads: AtomicU64,
     upload_bytes: AtomicU64,
+    upload_timeouts: AtomicU64,
     downloads: AtomicU64,
     errors: AtomicU64,
     control_rejections: AtomicU64,
@@ -439,7 +442,7 @@ async fn ready(State(s): State<AppState>) -> Response {
 async fn metrics(State(s): State<AppState>) -> Response {
     let m = &s.metrics;
     let body = format!(
-        "blackglass_control_requests_total {}\nblackglass_control_rejections_total {}\nblackglass_signins_total {}\nblackglass_auth_failures_total {}\nblackglass_ws_connections_total {}\nblackglass_uploads_total {}\nblackglass_upload_bytes_total {}\nblackglass_downloads_total {}\nblackglass_errors_total {}\nobsidian_sync_control_requests_total {}\nobsidian_sync_signins_total {}\nobsidian_sync_auth_failures_total {}\nobsidian_sync_ws_connections_total {}\nobsidian_sync_uploads_total {}\nobsidian_sync_upload_bytes_total {}\nobsidian_sync_downloads_total {}\nobsidian_sync_errors_total {}\n",
+        "blackglass_control_requests_total {}\nblackglass_control_rejections_total {}\nblackglass_signins_total {}\nblackglass_auth_failures_total {}\nblackglass_ws_connections_total {}\nblackglass_uploads_total {}\nblackglass_upload_bytes_total {}\nblackglass_upload_timeouts_total {}\nblackglass_downloads_total {}\nblackglass_errors_total {}\nobsidian_sync_control_requests_total {}\nobsidian_sync_signins_total {}\nobsidian_sync_auth_failures_total {}\nobsidian_sync_ws_connections_total {}\nobsidian_sync_uploads_total {}\nobsidian_sync_upload_bytes_total {}\nobsidian_sync_downloads_total {}\nobsidian_sync_errors_total {}\n",
         m.control.load(Ordering::Relaxed),
         m.control_rejections.load(Ordering::Relaxed),
         m.signins.load(Ordering::Relaxed),
@@ -447,6 +450,7 @@ async fn metrics(State(s): State<AppState>) -> Response {
         m.ws_connections.load(Ordering::Relaxed),
         m.uploads.load(Ordering::Relaxed),
         m.upload_bytes.load(Ordering::Relaxed),
+        m.upload_timeouts.load(Ordering::Relaxed),
         m.downloads.load(Ordering::Relaxed),
         m.errors.load(Ordering::Relaxed),
         m.control.load(Ordering::Relaxed),
@@ -911,6 +915,7 @@ struct Pending {
     file: tokio::fs::File,
     pieces: i64,
     bytes: i64,
+    idle_deadline: TokioInstant,
     _permit: tokio::sync::OwnedSemaphorePermit,
 }
 
@@ -937,6 +942,10 @@ async fn socket_loop(
     let mut session_revalidation = interval(SESSION_REVALIDATE_INTERVAL);
     session_revalidation.set_missed_tick_behavior(MissedTickBehavior::Skip);
     loop {
+        let pending_upload_deadline = session
+            .pending
+            .as_ref()
+            .map(|pending| pending.idle_deadline);
         tokio::select! {
             biased;
             _ = wait_for_shutdown(&mut shutdown) => {
@@ -953,6 +962,20 @@ async fn socket_loop(
                 let _ = socket_send(&mut tx, Message::Close(Some(CloseFrame {
                     code: 1008,
                     reason: "Authentication deadline exceeded".into(),
+                }))).await;
+                break
+            },
+            _ = async {
+                if let Some(deadline) = pending_upload_deadline {
+                    sleep_until(deadline).await;
+                }
+            }, if pending_upload_deadline.is_some() => {
+                s.metrics.upload_timeouts.fetch_add(1, Ordering::Relaxed);
+                warn!(event = "upload_idle_timeout");
+                discard_pending_upload(&s, &mut session, "idle_timeout").await;
+                let _ = socket_send(&mut tx, Message::Close(Some(CloseFrame {
+                    code: 1008,
+                    reason: "Upload idle timeout exceeded".into(),
                 }))).await;
                 break
             },
@@ -1018,9 +1041,28 @@ async fn socket_loop(
             }
         }
     }
-    if let Some(p) = session.pending {
-        drop(p.file);
-        let _ = tokio::fs::remove_file(p.path).await;
+    discard_pending_upload(&s, &mut session, "connection_closed").await;
+}
+
+async fn discard_pending_upload(s: &AppState, session: &mut Session, reason: &'static str) {
+    let Some(pending) = session.pending.take() else {
+        return;
+    };
+    let Pending {
+        path,
+        file,
+        _permit,
+        ..
+    } = pending;
+    drop(file);
+    drop(_permit);
+    match tokio::fs::remove_file(path).await {
+        Ok(()) => {}
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+        Err(error) => {
+            warn!(event = "staged_upload_cleanup_failed", reason, error = %error);
+            s.metrics.errors.fetch_add(1, Ordering::Relaxed);
+        }
     }
 }
 
@@ -1336,6 +1378,7 @@ async fn begin_push(
         file,
         pieces: 0,
         bytes: 0,
+        idle_deadline: TokioInstant::now() + s.config.upload_idle_timeout,
         _permit: permit,
     });
     send(tx, json!({"res":"next"})).await?;
@@ -1368,6 +1411,7 @@ async fn upload_chunk(
         };
         write_staged_piece(&mut p.file, bytes).await?;
     }
+    p.idle_deadline = TokioInstant::now() + s.config.upload_idle_timeout;
     if p.pieces < p.revision.pieces {
         send(tx, json!({"res":"next"})).await?;
         return Ok(());

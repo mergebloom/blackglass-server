@@ -3,6 +3,7 @@ name = "blackglass-server"
 version = "0.2.2"
 edition = "2024"
 license = "MIT"
+publish = false
 rust-version = "1.92"
 
 [dependencies]

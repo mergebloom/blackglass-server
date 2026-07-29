@@ -44,6 +44,8 @@ architecture, the release pipeline explicitly compares the executable's
 `--version` and `build-info` output with the manifest. The public verifier does
 not execute an untrusted download. The separately emitted raw executable is
 checksum-verified and must be byte-identical to the archive's executable. The
+archive also carries the project license and generated third-party notices;
+the same files are standalone GitHub release assets for raw-binary users. The
 final scratch image is then
 executed read-only, without Linux capabilities and with `no-new-privileges`, to
 verify its CLI entry point. A second smoke starts it as its non-root runtime
@@ -60,7 +62,11 @@ exit.
 The builder image is pinned by multi-platform manifest digest in
 `ops/Dockerfile.release`; its added Alpine package closure, the Dockerfile
 frontend, Buildx version, BuildKit driver image, and GitHub Actions are pinned
-as well. Cargo uses the locked dependency graph. Release
+as well. Cargo uses the locked dependency graph. CI rejects known RustSec
+advisories, unreviewed dependency licenses, and unknown dependency sources.
+The audit binary itself is version- and checksum-pinned. The committed notice
+is hash-bound to the Cargo graph and feature manifest plus the pinned Rust,
+musl, SQLite, and release-builder inventory. Release
 archives have sorted entries, normalized ownership and timestamps, and
 timestamp-free gzip output. `sourceRevision` is always the full lowercase
 40-character Git commit for the clean source checkout. Both native and Docker
@@ -108,9 +114,10 @@ authenticated.
 
 ## Safe container deployment
 
-The OCI image is intentionally a scratch image: it contains the server binary
-and an owned state directory, runs as numeric uid/gid 65532, and has no shell
-or package manager. Its writable state belongs at
+The OCI image is intentionally a scratch image: it contains the server binary,
+`/licenses/LICENSE`, `/licenses/THIRD_PARTY_NOTICES.md`, and an owned state
+directory, runs as numeric uid/gid 65532, and has no shell or package manager.
+Its writable state belongs at
 `/var/lib/blackglass-server`.
 
 The native binary and OCI image retain the safe loopback default. The qualified
@@ -168,8 +175,8 @@ runners. A manual dispatch produces retained workflow artifacts. A tag that
 exactly equals `v` plus the Cargo package version additionally:
 
 1. creates a verified GitHub release with both archives, both raw binaries,
-   their adjacent checksums, per-architecture resource reports, and
-   `SHA256SUMS`;
+   their adjacent checksums, per-architecture resource reports, license
+   notices, and `SHA256SUMS`;
 2. publishes a multi-architecture image to GitHub Container Registry;
 3. attaches signed build-provenance attestations to archives, raw binaries,
    resource reports, and the OCI digest.

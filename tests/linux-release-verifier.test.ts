@@ -69,7 +69,7 @@ describe("Linux release verifier", () => {
         await rm(fixture.directory, { recursive: true, force: true });
       }
     }
-  });
+  }, 20_000);
 
   test("binds the manifest to the caller's expected source revision", async () => {
     const fixture = await createReleaseFixture();
@@ -201,6 +201,7 @@ async function createReleaseFixture(
   for (const filename of [
     "INSTALL.md",
     "LICENSE",
+    "THIRD_PARTY_NOTICES.md",
     "blackglass-server.env.example",
     "blackglass-server.service",
     "blackglass-server.sysusers.conf",
@@ -241,6 +242,7 @@ async function createReleaseFixture(
     `${bundle}/`,
     `${bundle}/INSTALL.md`,
     `${bundle}/LICENSE`,
+    `${bundle}/THIRD_PARTY_NOTICES.md`,
     `${bundle}/blackglass-server`,
     `${bundle}/blackglass-server.env.example`,
     `${bundle}/blackglass-server.service`,

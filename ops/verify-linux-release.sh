@@ -90,6 +90,7 @@ expected=$(printf '%s\n' \
     "$bundle/" \
     "$bundle/INSTALL.md" \
     "$bundle/LICENSE" \
+    "$bundle/THIRD_PARTY_NOTICES.md" \
     "$bundle/blackglass-server" \
     "$bundle/blackglass-server.env.example" \
     "$bundle/blackglass-server.service" \
@@ -117,6 +118,7 @@ test ! -L "$bundle_directory"
 for relative_path in \
     INSTALL.md \
     LICENSE \
+    THIRD_PARTY_NOTICES.md \
     blackglass-server \
     blackglass-server.env.example \
     blackglass-server.service \

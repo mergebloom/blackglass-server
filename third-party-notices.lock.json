@@ -1,0 +1,15 @@
+{
+  "schemaVersion": 2,
+  "cargoAboutVersion": "0.9.1",
+  "cargoLockSha256": "5e2b6b96cf0507b8ad7277ff27f05a6317e7b1f37942c9174c2241375e6709e3",
+  "cargoManifestSha256": "5dee1caaaa21a54416872182a0cd3e407e3e861390f31344b8baa0bc4586222b",
+  "configSha256": "8784b8b858938847f5e01287a7f92ac43bddc27e2dc5f20803673d9ca67c2c13",
+  "generatorSha256": "7429ee1d4a476955b426ad5c3f474ea4fe96ca890c9bb6a74fd5901394164732",
+  "nativeRuntimeNoticesSha256": "ebc360ab7dbc3c4ae4b05da0f4d63c78cac0d55b8b8318ad65c4a4be2a6e8877",
+  "releaseDockerfileSha256": "4ca87c330606751dd0036304c089ec68b8265035846b7aea5dd310da94ccbbcf",
+  "rustToolchainSha256": "5ae1b674936687995ad335ac0caa1c1f702645d9b7a1071ca0cfecaf31dfac8b",
+  "templateSha256": "418de0de962ab9d7a4318ee7dd805638ae0503e3546409e58ec2f73ffec0e484",
+  "noticesSha256": "d8dd1ba1946b39381d720d341442362da521e0b8120713f33394e74f1af6206b",
+  "noticedPackages": 129,
+  "licenseTexts": 42
+}

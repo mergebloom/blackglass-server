@@ -16,6 +16,8 @@
     "build:linux:amd64": "./ops/build-linux-release.sh linux-amd64",
     "build:linux:arm64": "./ops/build-linux-release.sh linux-arm64",
     "build:release": "./ops/build-release.sh",
+    "licenses:check": "bun run tools/third-party-notices.ts",
+    "licenses:generate": "bun run tools/third-party-notices.ts --write",
     "server": "cargo run --release --manifest-path apps/server-rust/Cargo.toml -- serve",
     "server:bun-oracle": "bun run apps/server/src/index.ts",
     "server:check": "cargo check --manifest-path apps/server-rust/Cargo.toml",
@@ -23,7 +25,7 @@
     "server:measure": "bun run tools/measure-rust-server.ts",
     "test:integration": "bun test tests/server.integration.test.ts",
     "verify:release-metadata": "./ops/verify-release-metadata.sh",
-    "check": "bun run verify:release-metadata && bun run typecheck && cargo fmt --manifest-path apps/server-rust/Cargo.toml -- --check && cargo clippy --locked --manifest-path apps/server-rust/Cargo.toml --all-targets -- -D warnings && bun run server:test && bun test",
+    "check": "bun run verify:release-metadata && bun run licenses:check && bun run typecheck && cargo fmt --manifest-path apps/server-rust/Cargo.toml -- --check && cargo clippy --locked --manifest-path apps/server-rust/Cargo.toml --all-targets -- -D warnings && bun run server:test && bun test",
     "test": "bun test",
     "typecheck": "tsc --noEmit"
   },

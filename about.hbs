@@ -1,0 +1,20 @@
+# Blackglass Server third-party notices
+
+The Cargo sections are generated from the locked Rust dependency graph by
+cargo-about. The final file also appends an audited native/runtime section for
+statically linked code outside Cargo metadata. Dependency, feature, toolchain,
+and release-builder inputs are hash-bound by `third-party-notices.lock.json`.
+
+{{#each licenses}}
+## {{{name}}}
+
+Used by:
+{{#each used_by}}
+- {{{crate.name}}} {{{crate.version}}}{{#if crate.repository}} — {{{crate.repository}}}{{/if}}
+{{/each}}
+
+----- BEGIN LICENSE TEXT -----
+{{{text}}}
+----- END LICENSE TEXT -----
+
+{{/each}}

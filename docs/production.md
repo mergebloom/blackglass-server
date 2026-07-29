@@ -125,6 +125,8 @@ Keep all three endpoints behind the control hostname's normal network policy.
 Alert on readiness failures, restarts, sign-in failures/rate limits, WebSocket
 errors, and backup failures. Disk-free-space monitoring is mandatory because
 SQLite and in-progress staging files share the state volume by default.
+Alert on `blackglass_upload_timeouts_total`; it indicates a client or network
+that stopped making progress during an upload.
 
 ## Backup and recovery
 
@@ -269,7 +271,11 @@ the newly generated local build. The server URL does not need to change.
 Each active upload holds at most one WebSocket frame (2 MiB) plus small
 metadata in memory and one ciphertext staging file on disk. Upload concurrency
 defaults to four and can be reduced, but cannot exceed the qualified limit of
-four. WebSocket admission defaults to 16 and cannot exceed 16. One bounded
+four. A pending upload must finish staging a complete piece within 300 seconds
+by default. `SELFHOST_UPLOAD_IDLE_TIMEOUT_SECONDS` can be set from 5 through
+3600 seconds; every complete staged piece refreshes that deadline, while expiry
+releases the upload slot, removes the partial file, and closes the connection.
+WebSocket admission defaults to 16 and cannot exceed 16. One bounded
 Argon2 check, an eight-request wait queue, 2 MiB frames, bounded reconnect
 pages, a single large JSON response, and bounded database workers stay inside
 the supplied 256 MiB service cap under the release workload.

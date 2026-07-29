@@ -26,6 +26,13 @@ jobs:
       - run: rustup toolchain install 1.92.0 --profile minimal --component rustfmt,clippy
       - run: rustup default 1.92.0
       - run: npm ci
+      - name: Install checksum-verified cargo-deny
+        run: ./ops/install-cargo-deny.sh "$RUNNER_TEMP/cargo-deny"
+      - name: Audit Rust dependencies and licenses
+        run: >-
+          "$RUNNER_TEMP/cargo-deny"
+          --manifest-path apps/server-rust/Cargo.toml
+          check advisories licenses sources
       - run: bun run check
       - run: ./ops/build-release.sh
       - run: bun run server:measure
@@ -157,6 +164,7 @@ jobs:
           blackglass_is_supported_release_version "$version"
           test "$GITHUB_REF_NAME" = "v$version"
           mkdir release-assets
+          cp LICENSE THIRD_PARTY_NOTICES.md release-assets/
           for architecture in amd64 arm64; do
             base="blackglass-server-v${version}-linux-${architecture}"
             for filename in \
@@ -182,7 +190,7 @@ jobs:
           test "$(find release-assets -type f -name '*.tar.gz.sha256' | wc -l)" -eq 2
           test "$(find release-assets -type f -name '*.resource-report.json' | wc -l)" -eq 2
           cd release-assets
-          sha256sum ./*.tar.gz ./blackglass-server-v*-linux-amd64 ./blackglass-server-v*-linux-arm64 ./*.resource-report.json > SHA256SUMS
+          sha256sum ./LICENSE ./THIRD_PARTY_NOTICES.md ./*.tar.gz ./blackglass-server-v*-linux-amd64 ./blackglass-server-v*-linux-arm64 ./*.resource-report.json > SHA256SUMS
           sha256sum -c ./*.tar.gz.sha256
           sha256sum -c ./blackglass-server-v*-linux-*.sha256
           printf 'VERSION=%s\n' "$version" >> "$GITHUB_ENV"
@@ -223,7 +231,7 @@ jobs:
           mapfile -d '' -t release_files < <(
             find release-assets -maxdepth 1 -type f -print0 | sort -z
           )
-          test "${#release_files[@]}" -eq 11
+          test "${#release_files[@]}" -eq 13
           bash ops/publish-release.sh \
             "$GITHUB_REF_NAME" \
             "Blackglass Server $VERSION" \

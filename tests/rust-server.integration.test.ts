@@ -942,6 +942,69 @@ describe("production Rust server", () => {
     await waitForDirectoryEmpty(join(directory, "uploads"), 2_000);
   });
 
+  test("expires stalled uploads, removes staging, and restores upload capacity", async () => {
+    const timeoutDirectory = await mkdtemp(join(tmpdir(), "blackglass-upload-timeout-"));
+    const [timeoutControlPort, timeoutDataPort] = await Promise.all([freePort(), freePort()]);
+    const child = spawnRustServer(timeoutDirectory, timeoutControlPort, timeoutDataPort, {
+      SELFHOST_MAX_CONCURRENT_UPLOADS: "1",
+      SELFHOST_UPLOAD_IDLE_TIMEOUT_SECONDS: "5",
+    });
+    try {
+      await waitForHealthAt(timeoutControlPort, child);
+      const signin = await postAt(timeoutControlPort, "/user/signin", {
+        email: "owner@example.test",
+        password: "test-password",
+      });
+      const timeoutVault = await postAt(timeoutControlPort, "/vault/create", {
+        token: signin.token,
+        name: "Upload timeout vault",
+        keyhash: "upload-timeout-keyhash",
+        salt: "upload-timeout-salt",
+        region: "selfhost",
+        encryption_version: 3,
+      });
+      const stalled = await Probe.connect(`ws://127.0.0.1:${timeoutDataPort}`);
+      const retrying = await Probe.connect(`ws://127.0.0.1:${timeoutDataPort}`);
+      await initializeFor(stalled, signin.token, timeoutVault, "Stalled upload", 0, true);
+      await initializeFor(retrying, signin.token, timeoutVault, "Capacity retry", 0, true);
+
+      stalled.json(push("stalled-upload", "stalled-upload-hash", 32, 1));
+      expect(await stalled.nextJson()).toEqual({ res: "next" });
+      expect(await stagedParts(join(timeoutDirectory, "uploads"))).toHaveLength(1);
+
+      retrying.json(push("recovered-upload", "recovered-upload-hash", 32, 1));
+      expect(await retrying.nextJson()).toEqual({
+        err: "Server upload capacity reached; retry shortly",
+      });
+
+      const stalledClose = await waitForClose(stalled, 8_000);
+      expect(stalledClose.code).toBe(1008);
+      expect(stalledClose.reason).toBe("Upload idle timeout exceeded");
+      await waitForDirectoryEmpty(join(timeoutDirectory, "uploads"), 2_000);
+
+      const payload = new Uint8Array(32).fill(7);
+      retrying.json(push("recovered-upload", "recovered-upload-hash", payload.byteLength, 1));
+      expect(await retrying.nextJson()).toEqual({ res: "next" });
+      retrying.socket.send(payload);
+      expect(await retrying.nextJson()).toMatchObject({
+        op: "push",
+        path: "recovered-upload",
+        hash: "recovered-upload-hash",
+      });
+      expect(await retrying.nextJson()).toEqual({ res: "ok" });
+      expect(await stagedParts(join(timeoutDirectory, "uploads"))).toEqual([]);
+
+      const metrics = await (await fetch(
+        `http://127.0.0.1:${timeoutControlPort}/metrics`,
+      )).text();
+      expect(metricValue(metrics, "blackglass_upload_timeouts_total")).toBe(1);
+      retrying.socket.close();
+    } finally {
+      if (child.exitCode === null) child.kill("SIGTERM");
+      await child.exited;
+    }
+  }, 25_000);
+
   test("purge retains a compact tombstone for offline-client convergence", async () => {
     const writer = await Probe.connect(`ws://127.0.0.1:${dataPort}`);
     const start = databaseVersion(join(directory, "server.sqlite"), vault.id);

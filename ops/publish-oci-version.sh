@@ -84,6 +84,8 @@ verify_published_child() {
   local inspect_json="$work/image-inspect-${architecture}.json"
   local container_json="$work/container-inspect-${architecture}.json"
   local copied_binary="$work/image-binary-${architecture}"
+  local copied_license="$work/image-license-${architecture}"
+  local copied_notices="$work/image-notices-${architecture}"
   local container
 
   for _attempt in 1 2 3 4 5 6 7 8 9 10; do
@@ -134,7 +136,11 @@ verify_published_child() {
     'length == 1 and .[0].State.Status == "created" and .[0].State.Running == false' \
     "$container_json" >/dev/null
   docker cp "${container}:/usr/local/bin/blackglass-server" "$copied_binary"
+  docker cp "${container}:/licenses/LICENSE" "$copied_license"
+  docker cp "${container}:/licenses/THIRD_PARTY_NOTICES.md" "$copied_notices"
   cmp -- "$raw_binary" "$copied_binary"
+  cmp -- "$release_assets/LICENSE" "$copied_license"
+  cmp -- "$release_assets/THIRD_PARTY_NOTICES.md" "$copied_notices"
   docker rm --volumes "$container" >/dev/null
 }
 
@@ -151,10 +157,14 @@ for architecture in amd64 arm64; do
   context="$work/context-${architecture}"
   mkdir -p "$context/state"
   cp "$raw_binary" "$context/blackglass-server"
+  cp "$release_assets/LICENSE" "$context/LICENSE"
+  cp "$release_assets/THIRD_PARTY_NOTICES.md" "$context/THIRD_PARTY_NOTICES.md"
   chmod 0555 "$context/blackglass-server"
   touch "$context/state/.blackglass-state"
   touch -d "@${source_date_epoch}" \
     "$context/blackglass-server" \
+    "$context/LICENSE" \
+    "$context/THIRD_PARTY_NOTICES.md" \
     "$context/state" \
     "$context/state/.blackglass-state"
 

@@ -76,8 +76,9 @@ Plaintext credentials and transport are for loopback development only.
 
 Tagged releases produce checksummed static-musl archives and separately
 downloadable raw binaries for `linux-amd64` and `linux-arm64`, plus a minimal
-non-root multi-architecture OCI image. Start with
-[distribution](docs/distribution.md) to select and verify an artifact, then use
+non-root multi-architecture OCI image. Archives, raw-binary release assets, and
+the image include the applicable project and third-party license notices. Start
+with [distribution](docs/distribution.md) to select and verify an artifact, then use
 [production operations](docs/production.md) for TLS, systemd, backups,
 monitoring, upgrades, and recovery.
 
