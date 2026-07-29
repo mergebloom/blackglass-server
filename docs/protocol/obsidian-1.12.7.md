@@ -104,6 +104,18 @@ Observed operations:
 - `size`
 - `usernames`
 
+`size` returns the current live account and selected-vault sizes plus the exact
+configured retained-ciphertext limit:
+
+```json
+{ "res": "ok", "size": 1024, "limit": 1099511627776, "vault_size": 1024 }
+```
+
+The quota itself counts every retained non-empty revision, not only live heads.
+Uploads and restores that would exceed it receive the bounded
+`{"err":"Storage limit reached"}` response; metadata-only deletions remain
+available so the owner can purge history and recover capacity.
+
 ### Push and pull
 
 A file push begins with encrypted metadata:

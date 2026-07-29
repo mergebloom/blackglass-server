@@ -45,8 +45,8 @@ The server runs one Rust process with separate HTTP control and WebSocket Sync
 listeners. Native installs and the OCI image default to loopback. The supported
 Linux Docker deployment uses host networking so host Caddy can reach those
 listeners without publishing plaintext ports. Caddy is the only public
-listener. SQLite
-stores opaque ciphertext and protocol state. Blackglass Bridge owns the small,
+listener. SQLite stores opaque ciphertext and protocol state behind an atomic
+retained-history quota. Blackglass Bridge owns the small,
 release-specific client endpoint adapter.
 
 See [architecture](docs/architecture.md) for the component and trust boundaries.

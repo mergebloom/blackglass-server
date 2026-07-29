@@ -810,6 +810,91 @@ describe("production Rust server", () => {
     overBoundary.socket.close();
   }, 30_000);
 
+  test("enforces the stored-ciphertext quota across uploads and restores", async () => {
+    const quotaDirectory = await mkdtemp(join(tmpdir(), "blackglass-storage-quota-"));
+    const [quotaControlPort, quotaDataPort] = await Promise.all([freePort(), freePort()]);
+    const storageQuota = 64;
+    const child = spawnRustServer(quotaDirectory, quotaControlPort, quotaDataPort, {
+      SELFHOST_PER_FILE_MAX: String(storageQuota - aesGcmWireOverhead),
+      SELFHOST_STORAGE_QUOTA_BYTES: String(storageQuota),
+    });
+    try {
+      await waitForHealthAt(quotaControlPort, child);
+      const signin = await postAt(quotaControlPort, "/user/signin", {
+        email: "owner@example.test",
+        password: "test-password",
+      });
+      const quotaVault = await postAt(quotaControlPort, "/vault/create", {
+        token: signin.token,
+        name: "Storage quota vault",
+        keyhash: "storage-quota-keyhash",
+        salt: "storage-quota-salt",
+        region: "selfhost",
+        encryption_version: 3,
+      });
+      const probe = await Probe.connect(`ws://127.0.0.1:${quotaDataPort}`);
+      await initializeFor(probe, signin.token, quotaVault, "Quota writer", 0, true);
+
+      probe.json({ op: "size" });
+      expect(await probe.nextJson()).toEqual({
+        res: "ok",
+        size: 0,
+        limit: storageQuota,
+        vault_size: 0,
+      });
+      const payload = new Uint8Array(32).fill(0x5a);
+      const source = await uploadOpaqueCiphertext(
+        probe,
+        "quota-path",
+        "quota-source",
+        payload.byteLength,
+      );
+      probe.json({ op: "restore", uid: source.uid });
+      const restored = await probe.nextJson();
+      expect(restored).toMatchObject({ op: "push", path: "quota-path", size: 32 });
+      expect(await probe.nextJson()).toEqual({ res: "ok" });
+
+      probe.json({ op: "size" });
+      expect(await probe.nextJson()).toEqual({
+        res: "ok",
+        size: payload.byteLength,
+        limit: storageQuota,
+        vault_size: payload.byteLength,
+      });
+      probe.json({ op: "restore", uid: source.uid });
+      expect(await probe.nextJson()).toEqual({ err: "Storage limit reached" });
+
+      probe.json(push("quota-overflow", "quota-overflow", payload.byteLength, 1));
+      expect(await probe.nextJson()).toEqual({ res: "next" });
+      probe.socket.send(payload);
+      expect(await probe.nextJson()).toEqual({ err: "Storage limit reached" });
+      await waitForDirectoryEmpty(join(quotaDirectory, "uploads"), 2_000);
+
+      const database = new Database(join(quotaDirectory, "server.sqlite"), { readonly: true });
+      try {
+        expect(
+          database.query("SELECT COALESCE(SUM(size),0) AS size FROM revisions").get(),
+        ).toEqual({ size: storageQuota });
+      } finally {
+        database.close();
+      }
+
+      await metadata(probe, "quota-path", "", { deleted: true });
+      probe.json({ op: "purge" });
+      expect(await probe.nextJson()).toEqual({ res: "ok" });
+      await uploadOpaqueCiphertext(probe, "quota-after-purge", "quota-recovered", 32);
+      const metrics = await (
+        await fetch(`http://127.0.0.1:${quotaControlPort}/metrics`)
+      ).text();
+      expect(metricValue(metrics, "blackglass_storage_quota_bytes")).toBe(storageQuota);
+      expect(metricValue(metrics, "blackglass_storage_quota_rejections_total")).toBe(2);
+      probe.socket.close();
+    } finally {
+      if (child.exitCode === null) child.kill("SIGTERM");
+      await child.exited;
+    }
+  }, 20_000);
+
   test("broadcasts revisions and preserves snapshot/resume semantics", async () => {
     const writer = await Probe.connect(`ws://127.0.0.1:${dataPort}`);
     const reader = await Probe.connect(`ws://127.0.0.1:${dataPort}`);

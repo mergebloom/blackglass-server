@@ -1,6 +1,6 @@
 use crate::{
     auth,
-    config::{Config, MAX_WS_CONNECTIONS_LIMIT},
+    config::{AES_GCM_WIRE_OVERHEAD_BYTES, Config, MAX_WS_CONNECTIONS_LIMIT},
     db::{Db, MAX_JS_SAFE_INTEGER},
     model::*,
 };
@@ -44,7 +44,6 @@ use tracing::{info, warn};
 use uuid::Uuid;
 
 const PIECE_SIZE: i64 = 2 * 1024 * 1024;
-const AES_GCM_WIRE_OVERHEAD: u64 = 12 + 16;
 const REPLAY_PAGE_SIZE: i64 = 16;
 pub(crate) const MAX_REPLAY_PAGE_BYTES: usize = REPLAY_PAGE_SIZE as usize * MAX_EVENT_BYTES;
 pub(crate) const MAX_REPLAY_PAGES_BYTES: usize = MAX_REPLAY_PAGE_BYTES * MAX_WS_CONNECTIONS_LIMIT;
@@ -76,6 +75,8 @@ const STAGING_MARKER: &str = ".blackglass-staging-v1";
 const STAGING_MARKER_CONTENT: &str = "blackglass-server staging v1\n";
 const ADMIN_MANAGED_ACCOUNT_ERROR: &str =
     "Accounts are managed by the Blackglass Server administrator";
+const STORAGE_QUOTA_CLIENT_ERROR: &str = "Storage limit reached";
+const _: () = assert!(STORAGE_QUOTA_CLIENT_ERROR.len() <= 64);
 
 #[derive(Default)]
 pub struct Metrics {
@@ -86,6 +87,7 @@ pub struct Metrics {
     uploads: AtomicU64,
     upload_bytes: AtomicU64,
     upload_timeouts: AtomicU64,
+    storage_quota_rejections: AtomicU64,
     downloads: AtomicU64,
     errors: AtomicU64,
     control_rejections: AtomicU64,
@@ -442,7 +444,7 @@ async fn ready(State(s): State<AppState>) -> Response {
 async fn metrics(State(s): State<AppState>) -> Response {
     let m = &s.metrics;
     let body = format!(
-        "blackglass_control_requests_total {}\nblackglass_control_rejections_total {}\nblackglass_signins_total {}\nblackglass_auth_failures_total {}\nblackglass_ws_connections_total {}\nblackglass_uploads_total {}\nblackglass_upload_bytes_total {}\nblackglass_upload_timeouts_total {}\nblackglass_downloads_total {}\nblackglass_errors_total {}\nobsidian_sync_control_requests_total {}\nobsidian_sync_signins_total {}\nobsidian_sync_auth_failures_total {}\nobsidian_sync_ws_connections_total {}\nobsidian_sync_uploads_total {}\nobsidian_sync_upload_bytes_total {}\nobsidian_sync_downloads_total {}\nobsidian_sync_errors_total {}\n",
+        "blackglass_control_requests_total {}\nblackglass_control_rejections_total {}\nblackglass_signins_total {}\nblackglass_auth_failures_total {}\nblackglass_ws_connections_total {}\nblackglass_uploads_total {}\nblackglass_upload_bytes_total {}\nblackglass_upload_timeouts_total {}\nblackglass_storage_quota_bytes {}\nblackglass_storage_quota_rejections_total {}\nblackglass_downloads_total {}\nblackglass_errors_total {}\nobsidian_sync_control_requests_total {}\nobsidian_sync_signins_total {}\nobsidian_sync_auth_failures_total {}\nobsidian_sync_ws_connections_total {}\nobsidian_sync_uploads_total {}\nobsidian_sync_upload_bytes_total {}\nobsidian_sync_downloads_total {}\nobsidian_sync_errors_total {}\n",
         m.control.load(Ordering::Relaxed),
         m.control_rejections.load(Ordering::Relaxed),
         m.signins.load(Ordering::Relaxed),
@@ -451,6 +453,8 @@ async fn metrics(State(s): State<AppState>) -> Response {
         m.uploads.load(Ordering::Relaxed),
         m.upload_bytes.load(Ordering::Relaxed),
         m.upload_timeouts.load(Ordering::Relaxed),
+        s.config.storage_quota_bytes,
+        m.storage_quota_rejections.load(Ordering::Relaxed),
         m.downloads.load(Ordering::Relaxed),
         m.errors.load(Ordering::Relaxed),
         m.control.load(Ordering::Relaxed),
@@ -1105,7 +1109,7 @@ async fn handle_message(
                     let (size, vault_size) =
                         db_task(s, move |db| Ok((db.total_size()?, db.vault_size(&vault)?)))
                             .await?;
-                    send(tx,json!({"res":"ok","size":size,"limit":1099511627776i64,"vault_size":vault_size})).await?
+                    send(tx,json!({"res":"ok","size":size,"limit":s.config.storage_quota_bytes,"vault_size":vault_size})).await?
                 }
                 "usernames" => send(tx, json!({"1":s.config.display_name})).await?,
                 "push" => begin_push(s, session, events, tx, v).await?,
@@ -1350,7 +1354,20 @@ async fn begin_push(
     if revision.folder || revision.deleted || pieces == 0 {
         let notice = {
             let _commit = s.commit_order.lock().await;
-            let stored = db_task(s, move |db| db.add_empty_revision(&revision)).await?;
+            let storage_quota_bytes = s.config.storage_quota_bytes;
+            let stored = match db_task(s, move |db| {
+                db.add_empty_revision(&revision, storage_quota_bytes)
+            })
+            .await
+            {
+                Ok(stored) => stored,
+                Err(error) if crate::db::is_storage_quota_exceeded(&error) => {
+                    drop(_commit);
+                    reject_storage_quota(s, tx).await?;
+                    return Ok(());
+                }
+                Err(error) => return Err(error),
+            };
             publish_committed(s, stored)?
         };
         acknowledge_commit(s, session, events, tx, notice).await?;
@@ -1424,14 +1441,17 @@ async fn upload_chunk(
     drop(pending.file);
     let revision = pending.revision.clone();
     let path = pending.path.clone();
+    let storage_quota_bytes = s.config.storage_quota_bytes;
     let commit_result = {
         let _commit = s.commit_order.lock().await;
-        db_task(s, move |db| db.add_file_revision(&revision, &path))
-            .await
-            .and_then(|stored| {
-                let stored_size = stored.size;
-                Ok((publish_committed(s, stored)?, stored_size))
-            })
+        db_task(s, move |db| {
+            db.add_file_revision(&revision, &path, storage_quota_bytes)
+        })
+        .await
+        .and_then(|stored| {
+            let stored_size = stored.size;
+            Ok((publish_committed(s, stored)?, stored_size))
+        })
     };
     if let Err(error) = tokio::fs::remove_file(&pending.path).await {
         warn!(event = "staged_upload_cleanup_failed", error = %error);
@@ -1439,7 +1459,14 @@ async fn upload_chunk(
             return Err(error.into());
         }
     }
-    let (notice, stored_size) = commit_result?;
+    let (notice, stored_size) = match commit_result {
+        Ok(committed) => committed,
+        Err(error) if crate::db::is_storage_quota_exceeded(&error) => {
+            reject_storage_quota(s, tx).await?;
+            return Ok(());
+        }
+        Err(error) => return Err(error),
+    };
     s.metrics.uploads.fetch_add(1, Ordering::Relaxed);
     s.metrics
         .upload_bytes
@@ -1692,7 +1719,12 @@ async fn restore(
         let _commit = s.commit_order.lock().await;
         let vault = session.vault.clone().unwrap();
         let device = session.device.clone();
-        match db_task(s, move |db| db.restore(&vault, uid, &device)).await {
+        let storage_quota_bytes = s.config.storage_quota_bytes;
+        match db_task(s, move |db| {
+            db.restore(&vault, uid, &device, storage_quota_bytes)
+        })
+        .await
+        {
             Ok(revision) => revision
                 .map(|revision| publish_committed(s, revision))
                 .transpose()?,
@@ -1703,6 +1735,11 @@ async fn restore(
             {
                 drop(_commit);
                 send(tx, json!({"err":"Restore metadata is too large"})).await?;
+                return Ok(());
+            }
+            Err(error) if crate::db::is_storage_quota_exceeded(&error) => {
+                drop(_commit);
+                reject_storage_quota(s, tx).await?;
                 return Ok(());
             }
             Err(error) => return Err(error),
@@ -1730,6 +1767,17 @@ fn publish_committed(s: &AppState, r: Revision) -> Result<Event> {
     };
     let _ = s.events.send(event.clone());
     Ok(event)
+}
+
+async fn reject_storage_quota(s: &AppState, tx: &mut SplitSink<WebSocket, Message>) -> Result<()> {
+    s.metrics
+        .storage_quota_rejections
+        .fetch_add(1, Ordering::Relaxed);
+    warn!(
+        event = "storage_quota_rejected",
+        storage_quota_bytes = s.config.storage_quota_bytes
+    );
+    send(tx, json!({"err":STORAGE_QUOTA_CLIENT_ERROR})).await
 }
 
 fn serialized_notice_size(revision: &NewRevision) -> Result<usize> {
@@ -1856,7 +1904,9 @@ fn js_safe_nonnegative(value: i64) -> bool {
     (0..=MAX_JS_SAFE_INTEGER).contains(&value)
 }
 fn max_ciphertext_size(config: &Config) -> i64 {
-    config.per_file_max.saturating_add(AES_GCM_WIRE_OVERHEAD) as i64
+    config
+        .per_file_max
+        .saturating_add(AES_GCM_WIRE_OVERHEAD_BYTES) as i64
 }
 fn internal(e: impl std::fmt::Display) -> String {
     warn!(event="internal_error",error=%e);

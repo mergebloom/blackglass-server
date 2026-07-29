@@ -1,3 +1,4 @@
+use crate::db::MAX_JS_SAFE_INTEGER;
 use anyhow::{Context, Result, bail};
 use std::{
     env,
@@ -10,6 +11,8 @@ pub(crate) const MAX_WS_CONNECTIONS_LIMIT: usize = 16;
 pub(crate) const DEFAULT_MAX_WS_CONNECTIONS: usize = 16;
 pub(crate) const MAX_CONCURRENT_UPLOADS_LIMIT: usize = 4;
 pub(crate) const MAX_PER_FILE_BYTES: u64 = 900 * 1024 * 1024;
+pub(crate) const AES_GCM_WIRE_OVERHEAD_BYTES: u64 = 12 + 16;
+pub(crate) const DEFAULT_STORAGE_QUOTA_BYTES: i64 = 1024 * 1024 * 1024 * 1024;
 const DEFAULT_UPLOAD_IDLE_TIMEOUT_SECONDS: u64 = 300;
 const MIN_UPLOAD_IDLE_TIMEOUT_SECONDS: u64 = 5;
 const MAX_UPLOAD_IDLE_TIMEOUT_SECONDS: u64 = 60 * 60;
@@ -30,6 +33,7 @@ pub struct Config {
     pub password_hash: String,
     pub display_name: String,
     pub per_file_max: u64,
+    pub storage_quota_bytes: i64,
     pub session_ttl: Duration,
     pub upload_idle_timeout: Duration,
     pub allowed_origins: Vec<String>,
@@ -87,6 +91,9 @@ impl Config {
         }
         let per_file_max = number("SELFHOST_PER_FILE_MAX", 200 * 1024 * 1024u64)?;
         validate_per_file_max(per_file_max)?;
+        let storage_quota_bytes =
+            number("SELFHOST_STORAGE_QUOTA_BYTES", DEFAULT_STORAGE_QUOTA_BYTES)?;
+        validate_storage_quota(storage_quota_bytes, per_file_max)?;
         let session_ttl_seconds = number("SELFHOST_SESSION_TTL_SECONDS", 30 * 24 * 60 * 60u64)?;
         if !(300..=365 * 24 * 60 * 60).contains(&session_ttl_seconds) {
             bail!("SELFHOST_SESSION_TTL_SECONDS must be between 300 seconds and 365 days");
@@ -137,6 +144,7 @@ impl Config {
             password_hash,
             display_name: value("SELFHOST_NAME").unwrap_or_else(|| "Blackglass user".into()),
             per_file_max,
+            storage_quota_bytes,
             session_ttl: Duration::from_secs(session_ttl_seconds),
             upload_idle_timeout: Duration::from_secs(upload_idle_timeout_seconds),
             allowed_origins,
@@ -160,6 +168,7 @@ impl Config {
             password_hash: crate::auth::hash_password("test-password")?,
             display_name: "Test owner".into(),
             per_file_max: 8 * 1024 * 1024,
+            storage_quota_bytes: DEFAULT_STORAGE_QUOTA_BYTES,
             session_ttl: Duration::from_secs(3600),
             upload_idle_timeout: Duration::from_secs(DEFAULT_UPLOAD_IDLE_TIMEOUT_SECONDS),
             allowed_origins: vec!["app://obsidian.md".into()],
@@ -230,6 +239,17 @@ fn validate_per_file_max(value: u64) -> Result<()> {
     if !(1..=MAX_PER_FILE_BYTES).contains(&value) {
         bail!(
             "SELFHOST_PER_FILE_MAX must be between 1 byte and {MAX_PER_FILE_BYTES} bytes (900 MiB SQLite-safe ceiling)"
+        )
+    }
+    Ok(())
+}
+
+fn validate_storage_quota(value: i64, per_file_max: u64) -> Result<()> {
+    let minimum = i64::try_from(per_file_max.saturating_add(AES_GCM_WIRE_OVERHEAD_BYTES))
+        .context("SELFHOST_PER_FILE_MAX cannot be represented by SQLite")?;
+    if !(minimum..=MAX_JS_SAFE_INTEGER).contains(&value) {
+        bail!(
+            "SELFHOST_STORAGE_QUOTA_BYTES must be between {minimum} bytes (one maximum-size encrypted file) and {MAX_JS_SAFE_INTEGER} bytes"
         )
     }
     Ok(())
@@ -513,6 +533,25 @@ mod tests {
                 "unsafe per-file maximum passed: {value}"
             );
         }
+    }
+
+    #[test]
+    fn storage_quota_is_wire_safe_and_can_hold_one_maximum_file() {
+        let per_file_max = 200 * 1024 * 1024u64;
+        let minimum = (per_file_max + AES_GCM_WIRE_OVERHEAD_BYTES) as i64;
+        validate_storage_quota(minimum, per_file_max).unwrap();
+        validate_storage_quota(DEFAULT_STORAGE_QUOTA_BYTES, per_file_max).unwrap();
+        validate_storage_quota(MAX_JS_SAFE_INTEGER, per_file_max).unwrap();
+        for value in [0, minimum - 1, MAX_JS_SAFE_INTEGER + 1] {
+            assert!(
+                validate_storage_quota(value, per_file_max).is_err(),
+                "unsafe storage quota passed: {value}"
+            );
+        }
+        assert_eq!(
+            DEFAULT_STORAGE_QUOTA_BYTES, 1_099_511_627_776,
+            "the compatibility default must preserve the previously advertised 1 TiB limit"
+        );
     }
 
     #[test]

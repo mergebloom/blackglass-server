@@ -108,7 +108,8 @@ is constrained to 1..16 by the qualified memory envelope.
 
 - `GET /health` is process liveness.
 - `GET /ready` includes a SQLite query and is readiness.
-- `GET /metrics` emits counters in Prometheus text format.
+- `GET /metrics` emits counters and the configured storage-quota gauge in
+  Prometheus text format.
 - JSON logs contain operation/security events but never bearer tokens,
   ciphertext paths, hashes, file contents, passwords, or vault keys.
 
@@ -127,6 +128,9 @@ errors, and backup failures. Disk-free-space monitoring is mandatory because
 SQLite and in-progress staging files share the state volume by default.
 Alert on `blackglass_upload_timeouts_total`; it indicates a client or network
 that stopped making progress during an upload.
+Alert on `blackglass_storage_quota_rejections_total` and record
+`blackglass_storage_quota_bytes` alongside host disk capacity. A quota
+rejection is an expected bounded client error, not a server fault.
 
 ## Backup and recovery
 
@@ -285,6 +289,23 @@ limit of two concurrent frames and admission released between pieces. This
 keeps memory bounded by concurrency, not vault or attachment size. SQLite is
 the correct database while the deployment remains a single writer node; do
 not place its files on a network filesystem.
+
+`SELFHOST_STORAGE_QUOTA_BYTES` is a hard, account-wide limit on retained
+ciphertext bodies across every vault and historical revision, including copies
+created by `restore`. The commit-time check and revision insertion share one
+SQLite transaction, so concurrent uploads cannot oversubscribe it. Zero-byte
+tombstones remain writable while full; `purge` and vault deletion release
+logical quota. If an existing database is already over a newly lowered limit,
+the server remains available for reads and cleanup but rejects new non-empty
+revisions.
+
+The compatibility default is the previously advertised 1 TiB
+(`1099511627776`). Production operators should set it deliberately below the
+state volume's usable capacity. Reserve additional space for up to
+`SELFHOST_MAX_CONCURRENT_UPLOADS` staging files, SQLite pages/WAL and filesystem
+overhead, logs, and any local backups. Purging makes database pages reusable but
+does not necessarily shrink the SQLite file; the quota is a stored-ciphertext
+guard, not a replacement for disk-free-space monitoring.
 
 Each Linux package job runs its exact exported native binary as UID 65532 in a
 server-only cgroup with a 256 MiB memory maximum and swap disabled. The host
