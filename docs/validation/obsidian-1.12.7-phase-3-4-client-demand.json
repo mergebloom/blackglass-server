@@ -101,6 +101,25 @@
     "userIdUsedByHideMyChanges": true,
     "roleFieldPresent": false
   },
+  "blackglassPolicyImplications": {
+    "immediateExistingAccountMembership": true,
+    "boundedOwnerAccountExistenceDisclosureAccepted": true,
+    "inviteAbuseBudgetsRequiredBeforeLookup": [
+      "source",
+      "authenticated-user",
+      "distinct-target",
+      "deployment-global"
+    ],
+    "sharedSizeAdmissionOwnerGoverned": true,
+    "sharedSizeAggregateOwnerCapacityDisclosure": true,
+    "shareUidAuthorityTuple": [
+      "vault_uid",
+      "share_uid",
+      "authenticated_user_id"
+    ],
+    "shareUidNeverReusedWithinRecoveryEpoch": true,
+    "staleBackupRotatesAllVaultUids": true
+  },
   "evidence": {
     "staticOfficialArtifactInspection": "passed",
     "existingSingleOwnerProtocolTests": "passed-before-this-validation",
@@ -111,6 +130,7 @@
   "dataHandling": {
     "rendererSourceCommitted": false,
     "rendererSourceRedistributed": false,
+    "temporaryArtifactDirectoryMode": "0700",
     "temporaryArtifactMode": "0600",
     "secretsCaptured": false
   }

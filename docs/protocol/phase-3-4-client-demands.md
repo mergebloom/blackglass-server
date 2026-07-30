@@ -78,6 +78,10 @@ The stock UI exposes create, delete, rename, and sharing management for entries 
 
 There is no `/vault/share/accept` call in the 1.12.7 renderer. The client can display `accepted: false`, but acceptance is not performed through a renderer API call. For Blackglass's first collaboration release, inviting an already-provisioned local account and returning `accepted: true` is the smallest complete behavior. Inviting an unknown address should fail clearly until an email-backed invitation/acceptance system exists; a permanently pending row is not a functional invitation.
 
+That Blackglass policy has an unavoidable disclosure: immediate success for an existing active account versus failure for an unknown account tells an authenticated vault owner whether the address is provisioned. Stable error text does not remove the oracle. Phase 4.1 accepts only this bounded owner-only disclosure and requires per-source, per-user, distinct-target, and deployment-global invite budgets before account lookup. A future invitation/acceptance design is required to remove the disclosure rather than merely relabel it.
+
+The observed client never submits `share_uid` alone: removal/leave always includes the session token and `vault_uid`. Static evidence therefore establishes a `(vault_uid, share_uid, authenticated user)` authorization tuple, not a global bearer capability. Blackglass still forbids numeric reuse within an active recovery epoch; tenant-safe stale-backup recovery rotates every vault UID and clears memberships before any numeric ID can be reissued.
+
 The client does not send a vault role or fine-grained permission in any sharing request. Phase 4 should therefore implement the observed owner/collaborator model, not invent a UI-invisible role system:
 
 - Owner: owns the remote vault and manages its membership and lifecycle.
@@ -180,6 +184,6 @@ Use an isolated test environment with the exact qualified client artifact to pro
 9. Owner removal and collaborator self-leave terminate active access, abort staged transfers, and reject subsequent control and data operations.
 10. Rename, migration, and delete preserve owner-only lifecycle rules and leave clients in an understandable state.
 11. A third, unrelated user cannot infer vault or membership existence through statuses, error payloads, timing, counters, events, or admin projections.
-12. Restart, migration, session expiry, password reset, user disablement, and membership changes preserve the same boundaries.
+12. Restart, migration, session expiry, offline operator password replacement followed by client re-login, user disablement, and membership changes preserve the same boundaries; every observed client-facing password-reset route remains explicitly unsupported.
 
 Phase-scoped production deployment is allowed only after the applicable gate above passes against a disposable database and temporary vaults.

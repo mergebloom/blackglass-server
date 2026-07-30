@@ -30,9 +30,9 @@ The phases are separate production releases. Phase 4 cannot begin implementation
 
 ## Workstream 0 — Turn client observations into executable contracts
 
-Repository: `blackglass-bridge`
-
 ### Task 0.1 — Extend the protocol inventory
+
+Repository: `blackglass-bridge`.
 
 Update:
 
@@ -54,11 +54,10 @@ Do not store or redistribute renderer source. Generated evidence may contain rou
 
 ### Task 0.2 — Add protocol types and synthetic fixtures
 
-Update:
+Merge in this order so the observed Bridge contract is the source for the server fixture:
 
-- `blackglass-server/packages/protocol/src/control.ts`
-- `blackglass-server/packages/protocol/src/sync.ts`
-- relevant Bridge fixture types/tests
+1. In `blackglass-bridge`, extend `tests/client-adapter.test.ts` and `tools/analyze-release.ts` with scrubbed shape assertions.
+2. In `blackglass-server`, update `packages/protocol/src/control.ts`, `packages/protocol/src/sync.ts`, and add the matching cases to `tests/client-contract.integration.test.ts`.
 
 Add typed fixtures for:
 
@@ -105,8 +104,8 @@ Email canonicalization is fixed for these phases: trim surrounding ASCII whitesp
 
 - `sessions.user_id` becomes a required foreign key to `users.id`.
 - `vaults.owner_user_id` becomes a required foreign key to `users.id`.
-- `revisions.user` becomes the authenticated author's required foreign key.
-- retired-vault/tombstone state gains owner scope so an ID retired by one tenant cannot affect another tenant's inventory or disclose existence.
+- `revisions.user_id` becomes the authenticated author's required foreign key; `user` remains only the client wire field.
+- retired-vault/tombstone state gains `owner_user_id` plus an optional internal replacement-vault reference for bounded lifecycle accounting. WebSocket `init` authenticates an active session before consulting vault state: invalid tokens always receive the generic authentication failure, while a valid session receives the same `Vault not found` contract for unknown, unauthorized, or retired IDs. Token shape or tombstone presence alone never changes the response.
 - transfer staging remains ephemeral, but each staged transfer is bound to the authenticated connection and authorized vault.
 
 Keep server-wide revision UIDs and per-vault ordering. The client does not require per-user UID spaces, and changing UID semantics adds unnecessary migration and replay risk.
@@ -117,8 +116,10 @@ Update:
 
 - `apps/server-rust/src/db.rs`
 - `apps/server-rust/src/main.rs`
+- `apps/server-rust/src/config.rs`
 - `tests/database-migration.integration.test.ts`
 - `docs/production.md`
+- `ops/blackglass-server.env.example`
 
 Requirements:
 
@@ -128,13 +129,13 @@ Requirements:
 4. Every existing revision is attributed to user `1`.
 5. Existing sessions are deliberately invalidated once; this is documented as a required re-login.
 6. Foreign keys, schema history, WAL/checkpoint state, row counts, retained bytes, and integrity checks are verified before cutover.
-7. Migration input reads the legacy owner password hash without placing it in process arguments or output.
+7. `blackglass-server migrate <source> <destination>` reads the legacy owner email, display name, and password hash from the existing protected `SELFHOST_*` environment, applies the same bounded email/name validation used at runtime, and fails closed when any value is missing or invalid. None of those values is placed in process arguments or output.
 8. Re-running migration into an existing destination fails closed.
 9. A round-trip test proves the old database remains usable by the previous exact binary.
 
 After schema v5 cutover, the database is the sole runtime authority for users and password hashes. The legacy `SELFHOST_EMAIL`, `SELFHOST_NAME`, and `SELFHOST_PASSWORD_HASH` settings may be read by the explicit offline migration path, but Phase 3 serving must never silently fall back to them or auto-bootstrap a missing user. The plaintext test-only `SELFHOST_PASSWORD` path must remain unavailable outside its existing loopback test constraint and must not be accepted by migration. Keep the old production values only in protected rollback material until the Phase 3 rollback window closes, then retire them deliberately.
 
-Stale-backup disaster recovery needs a separate tenant-safe mode; a normal schema migration must not resurrect accounts or sharing authorization from an old restore point. While every listener and edge route is detached, the current binary writes a new recovered destination that:
+Update `restore_database` and `rotate_recovery_epoch` for schemas v5/v6 and add a separate tenant-safe stale-backup mode; a normal schema migration must not resurrect accounts or sharing authorization from an old restore point. While every listener and edge route is detached, the current binary writes a new recovered destination that:
 
 - clears all sessions;
 - marks every user disabled while preserving IDs, ownership, and historical attribution;
@@ -142,7 +143,7 @@ Stale-backup disaster recovery needs a separate tenant-safe mode; a normal schem
 - rotates the recovery epoch and all remote vault identities using the existing fresh-client recovery contract;
 - verifies the recovered database before replacement.
 
-The operator then reviews the bounded offline user list, sets a new password, and explicitly re-enables each intended account before reconnecting the edge. Owners re-invite intended collaborators after recovery. No old membership, account-active flag, session, or client cursor is trusted merely because it existed in the restored backup. Add a stale-backup test that disables a user and removes a collaborator after the backup, restores the older copy, and proves neither access path returns before deliberate re-enrollment.
+The restore must preserve durable user IDs, owner foreign keys, revision author IDs, retained ciphertext, and logical counts while deliberately clearing memberships and sessions and disabling users. It creates no token-shape or recovery-token exception: old clients follow the documented fresh-profile recovery path. The operator then reviews the bounded offline user list, sets a new password, and explicitly re-enables each intended account before reconnecting the edge. Owners re-invite intended collaborators after recovery. No old membership, account-active flag, session, or client cursor is trusted merely because it existed in the restored backup. Add a stale-backup test that disables a user and removes a collaborator after the backup, restores the older copy, and proves neither access path returns before deliberate re-enrollment.
 
 Gate: independently review migration code and test a byte-for-byte preserved source database plus verified logical counts in the destination.
 
@@ -169,6 +170,8 @@ Do not implement destructive user deletion in Phase 3 or Phase 4. A user who own
 
 Every `user` command, including `list`, must acquire the same OS path ownership lock that the serving process holds for its entire lifetime (the existing `acquire_database_lock` mechanism), then open the database. If the service is running, the CLI fails without reading or mutating account state; the operator must stop the service first, which also closes every socket and discards staging. A SQLite transaction or busy lock alone is not sufficient. Do not pass passwords or password hashes in arguments. Do not add write actions to the Phase 1 browser console as part of this work.
 
+Add a process-level `P3-CLI-LOCK` test that starts the server, proves every `user` command refuses while the ownership lock is held, stops the server, performs `user set-password`, restarts, and proves the old session token fails on both control and data paths before the client can re-login with the replacement password.
+
 ### Task 3.3 — Make authentication return an `AuthContext`
 
 Update:
@@ -194,7 +197,13 @@ Disabling an owner disables only that user's account and sessions; it does not s
 
 ### Task 3.4 — Scope every control-plane operation
 
-Update the control handlers in `apps/server-rust/src/server.rs` and their database methods.
+Update:
+
+- `apps/server-rust/src/server.rs`
+- `apps/server-rust/src/db.rs`
+- `apps/server-rust/src/model.rs`
+- `packages/protocol/src/control.ts`
+- `tests/tenant-isolation.integration.test.ts`
 
 Required behavior:
 
@@ -210,6 +219,14 @@ Required behavior:
 Centralize ownership checks in database authorization helpers. Do not duplicate ad hoc `WHERE owner_user_id = ?` logic across handlers without a single tested policy boundary.
 
 ### Task 3.5 — Scope every data-plane operation
+
+Update:
+
+- `apps/server-rust/src/server.rs`
+- `apps/server-rust/src/db.rs`
+- `apps/server-rust/src/model.rs`
+- `packages/protocol/src/sync.ts`
+- `tests/tenant-isolation.integration.test.ts`
 
 At WebSocket initialization:
 
@@ -238,13 +255,25 @@ Audit all operations:
 - ping/session revalidation;
 - disconnect and shutdown cleanup.
 
-Every query must be scoped by the authorized vault. A user must not learn another user's vault existence from an event, UID, path, total, error, timing branch, or transfer response.
+Every query must be scoped by the authorized vault. Except for the explicitly documented aggregate capacity of a shared resource below, a user must not learn another user's vault existence from an event, UID, path, total, error, timing branch, or transfer response.
+
+Replace the current global retired-marker pruning with two uniform bounds: at most 512 markers per owner and 8,192 globally. Prune only the same owner's oldest markers when that owner reaches its bound. If an insertion would exceed the global bound because of other owners, fail the delete/migrate/recovery operation before changing the vault instead of evicting another owner's marker. Preflight bulk recovery rotation against both bounds. Test that one owner cannot evict or alter another owner's retained markers and that invalid token shape does not expose marker existence.
 
 Password changes, user disablement, and explicit per-user session revocation must also publish a bounded internal invalidation event that immediately closes matching sockets and discards their staged transfers. Periodic session revalidation remains defense in depth, not the primary revocation mechanism.
 
-The close signal is not the authorization boundary. Every database mutation must re-check the session user and ownership predicate inside the same SQLite transaction that commits the mutation; serialized transaction order decides a revoke-versus-write race. Replay and binary streaming must check an in-memory connection authorization generation between bounded sends and stop when invalidated. A process crash drops all sockets, so no connection survives loss of the in-memory signal.
+The close signal is not the authorization boundary. Every database mutation must re-check the session user and ownership predicate inside the same SQLite transaction that commits the mutation; serialized transaction order decides a revoke-versus-write race. Give each connection an out-of-band cancellation handle owned by the live-connection registry rather than relying on the outer socket event receiver. Revocation triggers that handle directly. Replay checks it before and after every bounded database wait and page send; pull checks before every binary frame; upload checks while reading each chunk and again in the final commit transaction; every socket write races cancellation. A handler must never remain authorized merely because the outer loop is awaiting it and cannot poll a broadcast receiver. A process crash drops all sockets, so no connection survives loss of the in-memory signal.
 
 ### Task 3.6 — Define quota and size ownership
+
+Update:
+
+- `apps/server-rust/src/config.rs`
+- `apps/server-rust/src/db.rs`
+- `apps/server-rust/src/server.rs`
+- `apps/server-rust/src/model.rs`
+- `ops/blackglass-server.env.example`
+- `docs/security.md`
+- `tests/tenant-isolation.integration.test.ts`
 
 Use uniform deployment configuration rather than per-user quota columns in these phases:
 
@@ -256,12 +285,12 @@ Use uniform deployment configuration rather than per-user quota columns in these
 - add `SELFHOST_MAX_CONCURRENT_UPLOADS_PER_USER`, defaulting to `min(2, SELFHOST_MAX_CONCURRENT_UPLOADS)` and never allowed above the global limit;
 - keep the existing per-source connection/request limits as a separate abuse boundary;
 - retain storage charging to the vault owner;
-- `size.size` is the authenticated user's owned retained usage, even while connected as a collaborator;
-- `size.limit` is `SELFHOST_STORAGE_QUOTA_BYTES_PER_OWNER`;
+- for both owned and shared connections, `size.size` is the selected vault owner's total retained usage because that is the account whose quota governs writes;
+- `size.limit` is that owner's uniform `SELFHOST_STORAGE_QUOTA_BYTES_PER_OWNER` value;
 - `size.vault_size` is the selected owned or shared vault's current live logical size;
 - the global storage/resource ceilings are never exposed as the user's quota.
 
-Do not count the same shared bytes against every collaborator in Phase 4. Keep size fields numeric and compatible with 1.12.7.
+Do not count the same shared bytes against every collaborator in Phase 4. An authorized collaborator therefore sees only the owning account's aggregate used/quota numbers needed to explain shared-vault admission; no other vault count, name, identity, or per-vault breakdown is exposed. Record this bounded shared-resource capacity disclosure explicitly in the security documentation and exact-client fixture. Keep size fields numeric and compatible with 1.12.7.
 
 When a collaborator writes in Phase 4, quota admission is charged atomically to the vault owner and the global deployment ceiling, never to the acting collaborator. Concurrent writers must not oversubscribe either bound.
 
@@ -283,7 +312,7 @@ Add bounded, redacted projections for:
 - active/disabled user counts;
 - owned vault counts per user using bounded operator-readable identity;
 - session and connection user attribution;
-- authorization-denial counters with bounded reason/operation labels;
+- authorization-denial, SQLite-busy/deadline, and invitation-budget counters with bounded reason/operation labels only;
 - per-owner usage summaries with visible/total/truncated counts.
 
 Never expose password/session/admin hashes, tokens, key material, encrypted paths, or client payloads. Keep snapshot queries on the dedicated read-only connection and within existing busy/deadline/single-flight bounds.
@@ -304,10 +333,10 @@ For every control and data operation, test:
 - concurrent pushes do not deliver cross-vault events;
 - disablement/session revocation closes active sockets;
 - a revoked or expired connection cannot finish a staged upload;
-- account sizes, limits, diagnostics, and admin projections do not include hidden tenants;
+- account sizes, limits, diagnostics, and admin projections do not include hidden tenants except for the explicit aggregate owner capacity returned inside an authorized shared-vault `size` response;
 - restart and migration preserve ownership and boundaries.
 
-Include identifier fuzzing, malformed JSON, duplicate email canonicalization, transaction rollback, busy SQLite, replay gaps, interrupted transfer, and resource-bound cases.
+Include identifier fuzzing, malformed JSON, duplicate email canonicalization, transaction rollback, busy SQLite, replay gaps, interrupted transfer, and resource-bound cases. `P3-AUTH` must assert that every observed client-facing signup/password-reset route remains explicitly unsupported. `P3-ENUMERATION` must cover active, retired, unauthorized, and random vault IDs with valid, invalid, expired, and merely token-shaped credentials.
 
 ### Task 3.9 — Phase 3 exact-client E2E
 
@@ -318,7 +347,7 @@ Using two copied Obsidian profiles and two temporary vaults:
 3. create/connect one remote vault per account;
 4. synchronize text, binary, rename, delete, history, restore, and reconnect independently;
 5. prove neither profile lists or connects to the other's vault;
-6. sign out, expire, disable, reset password, restart the server, and reconnect;
+6. sign out and expire normally, then stop the test server, run offline operator `user set-password`/`user set-status`, restart, prove old tokens fail, and re-login through the client;
 7. verify browser console/client logs contain no protocol errors or secrets;
 8. save only scrubbed manifests and synthetic checksums.
 
@@ -332,21 +361,23 @@ Gate: Phase 3 is releasable only after static analysis, Rust tests, Bun/integrat
 4. Verify integrity, counts, size, schema history, owner mapping, and file permissions. Clone the migrated candidate, add synthetic accounts only to that disposable clone, and exercise Phase 3 isolation with the candidate binary on isolated loopback test ports. Discard the clone; do not add qualification-only users to the production candidate and do not let a real client write to it yet.
 5. **Pre-activation rollback boundary:** before reconnecting the production edge or allowing any client request, rollback may restore the untouched v4 database plus old exact binary. This has RPO 0 and a target RTO of 15 minutes. Never run the old binary against schema v5.
 6. Activate Phase 3, verify listeners, readiness, admin isolation, monitoring, and alerts, then allow the legacy owner to re-login. The first accepted client write permanently closes the old-database rollback path.
-7. Verify the legacy owner path and observe through an explicit soak window before Phase 4 starts. New real users are provisioned only during a later explicit maintenance window with the offline user CLI.
-8. **Post-activation recovery is roll-forward only:** preserve the current v5 database, deploy a fixed v5-compatible binary, or use the tenant-safe stale-backup recovery mode above with a current binary and new recovery epoch. Do not restore v4 beneath client profiles whose revision cursors may be ahead. If database loss requires PBS recovery, the accepted bound is the verified 24-hour RPO/four-hour RTO above; all restored accounts remain disabled until password reset/re-enrollment, and every client follows the documented fresh-client recovery procedure.
+7. Verify the legacy owner path and complete a 24-hour Phase 3 soak before Phase 4 starts. New real users are provisioned only during a later explicit maintenance window with the offline user CLI.
+8. **Post-activation recovery is roll-forward only:** preserve the current v5 database, deploy a fixed v5-compatible binary, or use the tenant-safe stale-backup recovery mode above with a current binary and new recovery epoch. Do not restore v4 beneath client profiles whose revision cursors may be ahead. If database loss requires PBS recovery, the accepted bound is the verified 24-hour RPO/four-hour RTO above; all restored accounts remain disabled until offline password replacement and re-enrollment, and every client follows the documented fresh-client recovery procedure.
+
+Record the exact Prometheus job selector and both monitoring backends in the release manifest. During the entire Phase 3 soak require `up == 1` on both backends, zero firing Blackglass alerts, zero unplanned service restarts, `increase(blackglass_errors_total[24h]) == 0`, and no unexpected increase in upload-timeout, quota-rejection, or authorization-denial counters. Run the exact-client owner sync/history/restore probe at the start and end. Any cross-tenant success, client protocol error, integrity failure, persistent SQLite-busy symptom, critical alert, or unexplained restart aborts expansion: detach the edge, preserve the current database and logs, and repair forward on schema v5.
 
 ## Phase 4 — Shared-vault collaboration
 
 ### Phase 4 data model
 
-Add schema version 6 with a membership table, for example:
+Add schema version 6 with a membership table:
 
-- stable numeric `id` used as protocol `share_uid`;
+- `id INTEGER PRIMARY KEY AUTOINCREMENT` used as protocol `share_uid`; reject insertion before it exceeds JavaScript's maximum safe integer, never reset `sqlite_sequence`, and never reuse an ID within the active database/recovery epoch;
 - `vault_id` foreign key;
 - collaborator `user_id` foreign key;
 - `invited_by_user_id` foreign key;
-- accepted/created timestamps;
-- uniqueness on `(vault_id, user_id)`.
+- accepted/created timestamps plus nullable `revoked_at`;
+- a partial unique index on `(vault_id, user_id)` where `revoked_at IS NULL`.
 
 Use foreign-key actions deliberately: deleting a vault must remove its collaborator rows in the same transaction, while a user who owns vaults must not be destructively removed by user-lifecycle tooling. Index owner and membership lookup paths used on every request.
 
@@ -359,7 +390,27 @@ There are exactly two authorization relationships:
 
 Do not add dormant role columns without a client-visible product and policy design.
 
+### Task 4.0 — Build an explicit v5-to-v6 migration
+
+Update:
+
+- `apps/server-rust/src/db.rs`
+- `apps/server-rust/src/main.rs`
+- `tests/database-migration.integration.test.ts`
+- `docs/production.md`
+
+The offline migration writes a new destination and refuses an existing destination. Preserve the untouched v5 source and exact Phase 3 binary. The destination starts with zero memberships, deliberately invalidates v5 sessions for one documented re-login, and preserves user IDs/status, vault ownership, revision authors, retained bytes, and all Phase 3 limits. Verify schema history, foreign keys, partial uniqueness, `sqlite_sequence`, row counts, permissions, WAL/checkpoint state, and SQLite integrity. Prove the untouched source still opens with the exact Phase 3 binary. A failed rehearsal or pre-activation cutover returns to the untouched v5 source; after the first accepted v6 write, recovery is roll-forward only.
+
+Gate: `P4-MIGRATE-V6` passes from a copied production-shaped v5 database before any Phase 4 authorization implementation merges.
+
 ### Task 4.1 — Centralize `VaultAccess`
+
+Update:
+
+- `apps/server-rust/src/db.rs`
+- `apps/server-rust/src/model.rs`
+- `apps/server-rust/src/server.rs`
+- `tests/collaboration.integration.test.ts`
 
 Add one tested authorization result used by control, data, transfer, event, and admin code:
 
@@ -389,9 +440,18 @@ Collaborator-only self-service:
 
 - leave by submitting their own `share_uid` to `/vault/share/remove`.
 
-Reject cross-vault share IDs, owner self-removal, member removal of another member, duplicate membership, self-invite, disabled users, and unknown users without revealing unrelated account/vault existence.
+Reject cross-vault share IDs, owner self-removal, member removal of another member, duplicate active membership rows, self-invite, disabled users, and unknown users with the stable contracts below. Vault existence remains non-enumerating; immediate invitation of an existing account has a separately documented, bounded account-existence disclosure.
 
 ### Task 4.2 — Implement the observed sharing API
+
+Update:
+
+- `apps/server-rust/src/server.rs`
+- `apps/server-rust/src/db.rs`
+- `apps/server-rust/src/config.rs`
+- `apps/server-rust/src/model.rs`
+- `ops/blackglass-server.env.example`
+- `tests/collaboration.integration.test.ts`
 
 Implement exactly:
 
@@ -405,14 +465,30 @@ Rules:
 - canonical email lookup finds an existing active local account;
 - first release creates `accepted: true` membership;
 - response items contain bounded `uid`, `email`, optional `name`, and `accepted`;
-- enforce a maximum of 20 collaborators per vault;
+- enforce a maximum of 20 active collaborators per vault;
 - re-inviting the same accepted collaborator is an idempotent success and never creates a second row or share UID;
-- after removal, a later re-invitation creates a new never-reused `share_uid`; the stale removed ID cannot leave or remove the new membership;
-- self-invite, unknown email, and disabled account all return the same stable `User unavailable for sharing` error so the route does not become a general account-enumeration oracle.
+- after removal, a later re-invitation creates a new `share_uid` not previously used in the current recovery epoch; the stale removed ID cannot leave or remove the new membership;
+- self-invite, unknown email, and disabled account all return the same stable `User unavailable for sharing` error.
+
+Canonicalization and structural validation happen first. Before any account lookup, enforce uniform rolling-hour budgets of 60 invite attempts per source, 30 per authenticated user, 20 distinct canonical target digests per authenticated user, and 300 deployment-wide. Successful, failed, duplicate, and rotating-address attempts all consume the applicable attempt budgets; metrics use only bounded outcome labels and never email or user labels. Return one stable bounded rate-limit error when any budget is exhausted. These defaults may be lowered by deployment configuration but not disabled.
+
+Within one `BEGIN IMMEDIATE` transaction, re-check the active session, active owner, vault ownership, target active status, self-invite rule, existing active membership, active `COUNT(*) < 20`, and the final membership insert. Check an existing active membership before the count so an idempotent re-invite still succeeds at the limit. A removal sets `revoked_at`; re-invitation inserts a fresh AUTOINCREMENT row. This serialized transaction is the only collaborator-count authority.
+
+Immediate success for an existing active account versus failure for an unknown account inherently reveals bounded account existence to an already-authenticated vault owner. Phase 4.1 accepts that narrow disclosure because the stock client has no pending invitation/acceptance route; the attempt, source, distinct-target, and global budgets are mandatory abuse controls. Do not describe stable errors alone as preventing the oracle.
+
+Every share lookup and mutation binds the full `(vault_uid, share_uid, authenticated user_id)` tuple; `share_uid` is never a global bearer capability. Tenant-safe stale-backup recovery may rewind the restored SQLite sequence, so its mandatory recovery-epoch rotation gives every vault a new `vault_uid` before access is re-enabled and old memberships remain cleared. Thus an old `(vault_uid, share_uid)` pair never becomes valid again even if a numeric share ID is later reissued in the new epoch. Add a recovery test that forces numeric reuse from an older backup and proves the old vault/share pair and old user token remain invalid.
 
 Do not claim email delivery or pending acceptance in Phase 4.1.
 
 ### Task 4.3 — Return owned and shared vault inventories
+
+Update:
+
+- `apps/server-rust/src/server.rs`
+- `apps/server-rust/src/db.rs`
+- `apps/server-rust/src/model.rs`
+- `packages/protocol/src/control.ts`
+- `tests/collaboration.integration.test.ts`
 
 `/vault/list` must return:
 
@@ -426,6 +502,14 @@ Test both custom E2EE and server-managed encryption. For custom E2EE, no passwor
 
 ### Task 4.4 — Attribute revisions and usernames
 
+Update:
+
+- `apps/server-rust/src/db.rs`
+- `apps/server-rust/src/server.rs`
+- `apps/server-rust/src/model.rs`
+- `packages/protocol/src/sync.ts`
+- `tests/collaboration.integration.test.ts`
+
 Use the authenticated writer's numeric user ID on push and restore. Preserve it through replay, history, deleted entries, and server-pushed revisions.
 
 `usernames` must return only the bounded mapping needed for revision attribution in the authorized vault. It may include a removed collaborator's current bounded display name when their historical revisions remain, but must not enumerate all server users or expose email addresses.
@@ -433,6 +517,12 @@ Use the authenticated writer's numeric user ID on push and restore. Preserve it 
 Attribution follows the current account display name: revisions retain the durable numeric author ID, and renaming a user changes the name returned for old and new revisions. Users are never destructively deleted in these phases, so historical author IDs remain resolvable. Obsidian 1.12.7 caches the username map for the connected changes view, so a rename is only required to appear after reconnect/reload; Blackglass does not invent an unsupported live username-invalidation message. Test rename and removed-collaborator history after reconnect explicitly.
 
 ### Task 4.5 — Make membership revocation immediate
+
+Update:
+
+- `apps/server-rust/src/db.rs`
+- `apps/server-rust/src/server.rs`
+- `tests/collaboration.integration.test.ts`
 
 On owner removal, collaborator self-leave, user disablement, password/session revocation, vault deletion, or ownership-affecting migration:
 
@@ -445,9 +535,14 @@ On owner removal, collaborator self-leave, user disablement, password/session re
 
 Periodic session validation remains defense in depth, not the primary revocation mechanism.
 
-The invalidation notification is only the fast close path. All mutating SQL must re-check active session/user status and current owner/membership authorization in the same transaction that writes. If the mutation transaction wins first, it commits before revocation; if revocation wins first, the mutation affects zero rows and returns the generic authorization failure. Long replay/pull/upload flows capture a connection authorization generation and re-check it between bounded sends and at final commit, so a dropped or delayed notification cannot authorize work.
+The invalidation notification is only the fast close path. All mutating SQL must re-check active session/user status and current owner/membership authorization in the same transaction that writes. If the mutation transaction wins first, it commits before revocation; if revocation wins first, the mutation affects zero rows and returns the generic authorization failure. Reuse the Phase 3 out-of-band per-connection cancellation handle for replay, pull, upload, database waits, and every socket write, and still re-check the authorization generation at final commit so a dropped or delayed notification cannot authorize work.
 
 ### Task 4.6 — Preserve event isolation
+
+Update:
+
+- `apps/server-rust/src/server.rs`
+- `tests/collaboration.integration.test.ts`
 
 Every outbound live event must carry enough internal scope to select only connections that are currently authorized for that vault. Membership-change events must be targetable to the affected user/connection without disconnecting unrelated collaborators.
 
@@ -457,8 +552,11 @@ Add race tests for:
 - revoke between push metadata and binary body;
 - revoke concurrent with pull;
 - revoke while replay is in progress;
-- leave and re-invite;
+- leave and re-invite, including delayed use of the removed `share_uid` after a new membership exists;
 - concurrent duplicate invite and remove/re-invite ordering;
+- start with 19 active members, concurrently invite two distinct active users, and assert exactly one succeeds and the final active count is 20;
+- rotating unknown-email attempts exhaust the per-user distinct-target budget before lookup and never place addresses in metrics/logs;
+- allocation at the JavaScript-safe `share_uid` boundary fails closed without reusing an ID;
 - vault delete/migrate with multiple live collaborators;
 - delayed event queued before revocation.
 
@@ -501,9 +599,12 @@ Gate: Phase 4 is not releasable until every API, race, adversarial isolation, an
 
 ## Qualification traceability and commands
 
+Every authorization slice is test-first. Before changing a schema, handler, query, replay path, transfer path, event audience, or revocation path, add the focused named test and record its expected RED result against the prior implementation; then implement only that slice, make the focused test pass, and run `bun run check` before moving to the next surface. Tasks 3.8 and 4.7 consolidate the already-green slices into the final adversarial matrix rather than postponing security coverage.
+
 Create these named suites rather than extending one undifferentiated integration file:
 
 - `tests/tenant-isolation.integration.test.ts`: `P3-AUTH`, `P3-CONTROL`, `P3-DATA`, `P3-REVOKE`, `P3-QUOTA`, and `P3-ENUMERATION`.
+- `tests/user-lifecycle.process.test.ts`: `P3-CLI-LOCK`, including refusal while the serving process owns the database and old-token failure after offline mutation/restart.
 - `tests/collaboration.integration.test.ts`: `P4-SHARE`, `P4-INVENTORY`, `P4-ATTRIBUTION`, `P4-DATA`, `P4-REVOKE`, `P4-RACES`, and `P4-MIGRATE`.
 - `tests/database-migration.integration.test.ts`: `P3-MIGRATE-V5`, `P4-MIGRATE-V6`, source preservation, pre-activation rollback, and post-activation roll-forward fixtures.
 - Rust unit tests beside `auth.rs`, `db.rs`, and `server.rs`: email canonicalization, password/session lifecycle, `VaultAccess`, SQL scoping, foreign-key invariants, quota transactions, event audiences, and invalidation races.
@@ -512,12 +613,12 @@ Create these named suites rather than extending one undifferentiated integration
 
 Each requirement has one release-blocking owner:
 
-- sign-in/info/signout, user-bound sessions, password reset, and disablement → `P3-AUTH` plus `E2E-P3-TENANCY`;
+- sign-in/info/signout, user-bound sessions, offline operator password replacement, disablement, and continued rejection of every observed client-facing password-reset route → `P3-AUTH`, `P3-CLI-LOCK`, and `E2E-P3-TENANCY`;
 - owned inventory, create/access/rename/migrate/delete isolation, vault limits, and retired IDs → `P3-CONTROL`, `P3-ENUMERATION`, and `P3-MIGRATE-V5`;
 - init/replay/pull/push/history/deleted/restore/purge/size/usernames isolation → `P3-DATA` and `E2E-P3-TENANCY`;
 - immediate user/session invalidation and staged-transfer cleanup → `P3-REVOKE`;
-- owner share list/invite/remove and member self-leave → `P4-SHARE` and both Phase 4 E2E scenarios;
-- `vaults` versus `shared`, `share_uid`, owned limit, and connection metadata → `P4-INVENTORY` and both Phase 4 E2E scenarios;
+- owner share list/invite/remove, bounded existing-account disclosure, invite budgets, 20-member race, and member self-leave → `P4-SHARE`, `P4-RACES`, and both Phase 4 E2E scenarios;
+- `vaults` versus `shared`, `share_uid`, owned limit, owner-governed shared `size` capacity, and connection metadata → `P4-INVENTORY` and both Phase 4 E2E scenarios;
 - `init.userId`, revision `user`, usernames, rename, removed-author history, and **hide my changes** → `P4-ATTRIBUTION` and both Phase 4 E2E scenarios;
 - collaborator content operations and server-pushed convergence → `P4-DATA` and both Phase 4 E2E scenarios;
 - removal/leave/disable/delete/migrate races and delayed events → `P4-REVOKE` plus `P4-RACES`;
@@ -530,6 +631,7 @@ Minimum automated commands from `blackglass-server`:
 bun run check
 bun test tests/database-migration.integration.test.ts
 bun test tests/tenant-isolation.integration.test.ts
+bun test tests/user-lifecycle.process.test.ts
 bun test tests/collaboration.integration.test.ts
 git diff --check
 ```
@@ -560,10 +662,12 @@ Every result records scenario ID, exact server revision/artifact digest, exact c
 1. Ship Phase 4 as a separate exact-source release after the Phase 3 soak.
 2. Confirm a successful whole-LXC/PBS backup no older than 24 hours and the same maximum 24-hour RPO/four-hour RTO, then copy-migrate schema v5 to v6 offline. Preserve the untouched v5 database and Phase 3 binary only as pre-activation rollback material.
 3. Clone the migrated candidate and exercise owner/member/outsider sharing on that disposable clone using isolated loopback test ports. Discard the clone. Verify the real candidate still has no memberships or qualification-only users and no client writes. Before activation, restoring untouched v5 plus the Phase 3 binary is an RPO-0, 15-minute-target rollback.
-4. Activate Phase 4 with no memberships and prove single-owner behavior is unchanged. The first accepted client write permanently closes the v5 rollback path.
-5. Enable the first real shared vault only after single-owner monitoring remains clear; its owner/member accounts and stock-client flow must have already passed the disposable-clone and exact-client qualification gates.
+4. Activate Phase 4 with no memberships, prove single-owner behavior is unchanged, and hold an owner-only one-hour gate with both monitoring backends healthy and no Blackglass alert/error increase. The first accepted client write permanently closes the v5 rollback path.
+5. Enable one real shared-vault canary only after that gate. Its owner/member accounts and stock-client flow must have already passed the disposable-clone and exact-client qualification gates. Hold the canary for 24 hours before adding another shared vault.
 6. Verify primary and recovery Prometheus targets plus all related alerts after each step.
-7. After activation, recover forward on schema v6 with a fixed v6-compatible binary or the tenant-safe stale-backup recovery mode. Any restored memberships are cleared and accounts remain disabled until deliberate password reset/re-enrollment. Never restore v5 beneath advanced clients and never run a schema-incompatible binary.
+7. After activation, recover forward on schema v6 with a fixed v6-compatible binary or the tenant-safe stale-backup recovery mode. Any restored memberships are cleared and accounts remain disabled until deliberate offline password replacement and re-enrollment. Never restore v5 beneath advanced clients and never run a schema-incompatible binary.
+
+During the canary require `up == 1` on both monitoring backends, zero firing Blackglass alerts, zero unplanned restarts, no unexplained `blackglass_errors_total`, upload-timeout, quota-rejection, invitation-rate-limit, authorization-denial, or SQLite-busy increase, and successful owner↔collaborator text/binary sync at the start and end. Re-run removal, old-token/share-UID denial, and reconnect checks before expansion. Any unauthorized operation, post-revocation delivery, protocol error, integrity failure, or critical alert stops expansion; detach the sharing path or edge as needed, preserve the v6 database/evidence, and repair forward.
 
 ## Required review gates
 
@@ -588,11 +692,12 @@ A reviewer should return only PASS or concrete file-and-line findings. No phase 
 4. Implement Phase 3 data-plane scoping, attribution, and revocation.
 5. Add Phase 3 admin/metrics projections and adversarial tests.
 6. Run exact-client Phase 3 E2E, review, release, migrate, and soak.
-7. Implement Phase 4 membership schema and centralized access policy.
-8. Implement sharing routes and owned/shared inventory.
-9. Implement collaborator attribution, event filtering, and immediate revocation.
-10. Run Phase 4 race, adversarial, and exact-client collaboration suites.
-11. Review, release, migrate, canary one shared vault, verify monitoring, and expand deliberately.
+7. Implement and qualify the Phase 4 v5-to-v6 migration.
+8. Implement the Phase 4 membership schema and centralized access policy.
+9. Implement sharing routes and owned/shared inventory.
+10. Implement collaborator attribution, event filtering, and immediate revocation.
+11. Run Phase 4 race, adversarial, and exact-client collaboration suites.
+12. Review, release, migrate, canary one shared vault, verify monitoring, and expand deliberately.
 
 ## Definition of done
 
