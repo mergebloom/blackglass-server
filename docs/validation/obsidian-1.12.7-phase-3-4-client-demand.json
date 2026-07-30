@@ -1,0 +1,117 @@
+{
+  "schemaVersion": 1,
+  "validatedAt": "2026-07-30",
+  "client": {
+    "product": "Obsidian",
+    "packageVersion": "1.12.7",
+    "officialAsset": "obsidian-1.12.7.asar.gz",
+    "officialAssetUrl": "https://github.com/obsidianmd/obsidian-releases/releases/download/v1.12.7/obsidian-1.12.7.asar.gz",
+    "compressedSha256": "75dd34f14c9db558fbad19e80f0b201bc9805b51b7388370277e0f91a38bd850",
+    "decompressedAsarSha256": "2b2483b2e1246772e0d25367ec055cbc5047ea2f0091b667c35656678f86d712",
+    "bridgePatchAnchorsReady": true,
+    "bridgePatchAnchorCount": 6
+  },
+  "controlPlane": {
+    "vaultList": {
+      "route": "/vault/list",
+      "requestKeys": [
+        "token",
+        "supported_encryption_version"
+      ],
+      "supportedEncryptionVersion": 3,
+      "responseKeysConsumed": [
+        "vaults",
+        "shared",
+        "limit"
+      ],
+      "sharedVaultAdditionalKeysConsumed": [
+        "share_uid"
+      ]
+    },
+    "shareList": {
+      "route": "/vault/share/list",
+      "requestKeys": [
+        "token",
+        "vault_uid"
+      ],
+      "responseKeysConsumed": [
+        "shares"
+      ],
+      "shareItemKeysConsumed": [
+        "uid",
+        "email",
+        "name",
+        "accepted"
+      ]
+    },
+    "shareInvite": {
+      "route": "/vault/share/invite",
+      "requestKeys": [
+        "token",
+        "vault_uid",
+        "email"
+      ]
+    },
+    "shareRemove": {
+      "route": "/vault/share/remove",
+      "requestKeys": [
+        "token",
+        "vault_uid",
+        "share_uid"
+      ],
+      "ownerRemovesCollaborator": true,
+      "collaboratorLeavesWithOwnShareUid": true
+    },
+    "rendererShareAcceptRoutePresent": false,
+    "rendererVaultRoleFieldPresent": false,
+    "ownedVaultUiCapabilities": [
+      "connect",
+      "disconnect",
+      "create",
+      "rename",
+      "delete",
+      "manage-sharing"
+    ],
+    "sharedVaultUiCapabilities": [
+      "connect",
+      "disconnect",
+      "leave"
+    ]
+  },
+  "dataPlane": {
+    "operations": [
+      "init",
+      "ping",
+      "pull",
+      "push",
+      "history",
+      "deleted",
+      "restore",
+      "purge",
+      "size",
+      "usernames"
+    ],
+    "identityFieldsConsumed": [
+      "init.userId",
+      "revision.user",
+      "usernames"
+    ],
+    "numericUserIdentityRequired": true,
+    "usernameMapUsedForAttribution": true,
+    "userIdUsedByHideMyChanges": true,
+    "roleFieldPresent": false
+  },
+  "evidence": {
+    "staticOfficialArtifactInspection": "passed",
+    "existingSingleOwnerProtocolTests": "passed-before-this-validation",
+    "existingSingleOwnerExactClientE2e": "historical-baseline-only-current-release-repeat-required",
+    "multiAccountExactClientE2e": "required-before-phase-3-release",
+    "sharedVaultExactClientE2e": "required-before-phase-4-release"
+  },
+  "dataHandling": {
+    "rendererSourceCommitted": false,
+    "rendererSourceRedistributed": false,
+    "temporaryArtifactMode": "0600",
+    "secretsCaptured": false
+  }
+}

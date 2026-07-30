@@ -163,7 +163,7 @@ device name, and account identity.
 | destructive encryption upgrade (`/vault/migrate`) | Atomic empty-v3 replacement, old-history removal, old-socket invalidation, and managed/custom recovery tested |
 | registration/recovery/business account UI | Explicit administrator-managed JSON errors; no public account lifecycle |
 | two-device convergence | Bidirectional byte-identical E2E pass |
-| multi-user sharing | Deliberately unsupported |
+| multi-user sharing | Deliberately unsupported in `0.2.2`; the validated client contract and staged design are documented in [`phase-3-4-client-demands.md`](phase-3-4-client-demands.md) and [`../plans/2026-07-30-phase-3-4-implementation.md`](../plans/2026-07-30-phase-3-4-implementation.md) |
 
 ### History response contracts
 
