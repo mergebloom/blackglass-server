@@ -308,9 +308,12 @@ pub async fn run(config: Config) -> Result<()> {
         let router = crate::admin::router(state.clone());
         let mut stop = state.shutdown.clone();
         tokio::spawn(async move {
-            axum::serve(listener, router)
-                .with_graceful_shutdown(async move { wait_for_shutdown(&mut stop).await })
-                .await
+            axum::serve(
+                listener,
+                router.into_make_service_with_connect_info::<SocketAddr>(),
+            )
+            .with_graceful_shutdown(async move { wait_for_shutdown(&mut stop).await })
+            .await
         })
     });
     let listener_result = supervise_listeners(
@@ -1134,7 +1137,7 @@ async fn handle_message(
             };
             let op = v.get("op").and_then(Value::as_str).unwrap_or("");
             if let Some(live) = &session.live {
-                live.protocol_activity(op);
+                live.protocol_activity(live_protocol_state(op));
             }
             if !session.authenticated {
                 if op != "init" {
@@ -1192,6 +1195,21 @@ async fn handle_message(
         }
         Message::Pong(_) if session.authenticated => Ok(()),
         Message::Pong(_) => close(tx, 1008, "Authentication required").await,
+    }
+}
+
+fn live_protocol_state(operation: &str) -> &'static str {
+    match operation {
+        "ping" => "ping",
+        "size" => "size",
+        "usernames" => "usernames",
+        "push" => "push",
+        "pull" => "pull",
+        "deleted" => "deleted",
+        "history" => "history",
+        "restore" => "restore",
+        "purge" => "purge",
+        _ => "unsupported",
     }
 }
 
@@ -2378,18 +2396,22 @@ mod tests {
     use super::*;
     use axum::{
         body::Body,
+        extract::ConnectInfo,
         http::{Request, StatusCode, header},
     };
     use sha2::{Digest, Sha256};
     use tower::ServiceExt;
 
-    fn admin_test_state(directory: &std::path::Path) -> (AppState, String, String) {
+    fn admin_test_state(
+        directory: &std::path::Path,
+        admin_port: u16,
+    ) -> (AppState, String, String) {
         let mut config = Config::test(directory, 3000, 3003).unwrap();
         prepare_staging(&config.staging_dir).unwrap();
-        let admin_token = "independent-admin-http-test-token".to_owned();
+        let admin_token = "0123456789abcdef".repeat(4);
         config.admin = Some(crate::admin::AdminConfig {
             bind_host: "127.0.0.1".parse().unwrap(),
-            port: 3010,
+            port: admin_port,
             token_hash: hex::encode(Sha256::digest(admin_token.as_bytes())),
         });
         let max_connections = config.max_ws_connections;
@@ -2425,15 +2447,35 @@ mod tests {
         )
     }
 
+    fn admin_request(
+        uri: &str,
+        host: &str,
+        authorization: Option<&str>,
+        source: IpAddr,
+    ) -> Request<Body> {
+        let mut request = Request::get(uri)
+            .header(header::HOST, host)
+            .extension(ConnectInfo(SocketAddr::new(source, 49152)));
+        if let Some(authorization) = authorization {
+            request = request.header(header::AUTHORIZATION, authorization);
+        }
+        request.body(Body::empty()).unwrap()
+    }
+
     #[tokio::test]
     async fn admin_http_routes_are_isolated_authenticated_and_hardened() {
         let directory = tempfile::tempdir().unwrap();
-        let (state, admin_token, sync_token) = admin_test_state(directory.path());
+        let (state, admin_token, sync_token) = admin_test_state(directory.path(), 3010);
         let admin = crate::admin::router(state.clone());
 
         let shell = admin
             .clone()
-            .oneshot(Request::get("/admin").body(Body::empty()).unwrap())
+            .oneshot(admin_request(
+                "/admin",
+                "127.0.0.1:3010",
+                None,
+                IpAddr::from([127, 0, 0, 1]),
+            ))
             .await
             .unwrap();
         assert_eq!(shell.status(), StatusCode::OK);
@@ -2445,34 +2487,107 @@ mod tests {
         assert_eq!(shell.headers()["x-content-type-options"], "nosniff");
         assert_eq!(shell.headers()["referrer-policy"], "no-referrer");
 
+        for host in ["attacker.invalid:3010", "127.0.0.1:3011"] {
+            let response = admin
+                .clone()
+                .oneshot(admin_request(
+                    "/admin",
+                    host,
+                    None,
+                    IpAddr::from([127, 0, 0, 1]),
+                ))
+                .await
+                .unwrap();
+            assert_eq!(response.status(), StatusCode::MISDIRECTED_REQUEST);
+            assert_eq!(response.headers()[header::CACHE_CONTROL], "no-store");
+        }
+        let missing_host = admin
+            .clone()
+            .oneshot(Request::get("/admin").body(Body::empty()).unwrap())
+            .await
+            .unwrap();
+        assert_eq!(missing_host.status(), StatusCode::MISDIRECTED_REQUEST);
+
         for authorization in [
             None,
             Some("Bearer wrong".to_owned()),
             Some(format!("Bearer {sync_token}")),
         ] {
-            let mut request = Request::get("/admin/api/snapshot");
-            if let Some(value) = authorization {
-                request = request.header(header::AUTHORIZATION, value);
-            }
             let response = admin
                 .clone()
-                .oneshot(request.body(Body::empty()).unwrap())
+                .oneshot(admin_request(
+                    "/admin/api/snapshot",
+                    "127.0.0.1:3010",
+                    authorization.as_deref(),
+                    IpAddr::from([127, 0, 0, 1]),
+                ))
                 .await
                 .unwrap();
             assert_eq!(response.status(), StatusCode::UNAUTHORIZED);
         }
 
         let authorized = admin
-            .oneshot(
-                Request::get("/admin/api/snapshot?fresh=1")
-                    .header(header::AUTHORIZATION, format!("Bearer {admin_token}"))
-                    .body(Body::empty())
-                    .unwrap(),
-            )
+            .clone()
+            .oneshot(admin_request(
+                "/admin/api/snapshot?fresh=1",
+                "127.0.0.1:3010",
+                Some(&format!("Bearer {admin_token}")),
+                IpAddr::from([127, 0, 0, 1]),
+            ))
             .await
             .unwrap();
         assert_eq!(authorized.status(), StatusCode::OK);
         assert_eq!(authorized.headers()[header::CACHE_CONTROL], "no-store");
+
+        let wrong_token = format!("Bearer {}", "f".repeat(64));
+        for _ in 0..crate::admin::ADMIN_AUTH_FAILURES_PER_SOURCE {
+            let response = admin
+                .clone()
+                .oneshot(admin_request(
+                    "/admin/api/snapshot",
+                    "127.0.0.1:3010",
+                    Some(&wrong_token),
+                    IpAddr::from([127, 0, 0, 1]),
+                ))
+                .await
+                .unwrap();
+            assert_eq!(response.status(), StatusCode::UNAUTHORIZED);
+        }
+        let limited = admin
+            .clone()
+            .oneshot(admin_request(
+                "/admin/api/snapshot",
+                "127.0.0.1:3010",
+                Some(&wrong_token),
+                IpAddr::from([127, 0, 0, 1]),
+            ))
+            .await
+            .unwrap();
+        assert_eq!(limited.status(), StatusCode::TOO_MANY_REQUESTS);
+        assert!(limited.headers().contains_key(header::RETRY_AFTER));
+
+        let valid_after_failures = admin
+            .clone()
+            .oneshot(admin_request(
+                "/admin/api/snapshot",
+                "127.0.0.1:3010",
+                Some(&format!("Bearer {admin_token}")),
+                IpAddr::from([127, 0, 0, 1]),
+            ))
+            .await
+            .unwrap();
+        assert_eq!(valid_after_failures.status(), StatusCode::OK);
+        let cleared = admin
+            .clone()
+            .oneshot(admin_request(
+                "/admin/api/snapshot",
+                "127.0.0.1:3010",
+                Some(&wrong_token),
+                IpAddr::from([127, 0, 0, 1]),
+            ))
+            .await
+            .unwrap();
+        assert_eq!(cleared.status(), StatusCode::UNAUTHORIZED);
 
         for public in [control_router(state.clone()), data_router(state)] {
             let response = public
@@ -2480,6 +2595,92 @@ mod tests {
                 .await
                 .unwrap();
             assert_eq!(response.status(), StatusCode::NOT_FOUND);
+        }
+    }
+
+    async fn raw_http_status(address: SocketAddr, request: &str) -> StatusCode {
+        use tokio::io::AsyncReadExt;
+
+        let mut stream = tokio::net::TcpStream::connect(address).await.unwrap();
+        stream.write_all(request.as_bytes()).await.unwrap();
+        let mut response = Vec::new();
+        stream.read_to_end(&mut response).await.unwrap();
+        let status = std::str::from_utf8(&response)
+            .unwrap()
+            .lines()
+            .next()
+            .unwrap()
+            .split_ascii_whitespace()
+            .nth(1)
+            .unwrap();
+        StatusCode::from_bytes(status.as_bytes()).unwrap()
+    }
+
+    #[tokio::test]
+    async fn admin_listener_supplies_peer_info_and_rejects_foreign_authorities() {
+        let listener = TcpListener::bind(("127.0.0.1", 0)).await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let directory = tempfile::tempdir().unwrap();
+        let (state, admin_token, _) = admin_test_state(directory.path(), address.port());
+        let task = tokio::spawn(async move {
+            axum::serve(
+                listener,
+                crate::admin::router(state).into_make_service_with_connect_info::<SocketAddr>(),
+            )
+            .await
+        });
+
+        let rejected = raw_http_status(
+            address,
+            &format!(
+                "GET /admin HTTP/1.1\r\nHost: attacker.invalid:{}\r\nConnection: close\r\n\r\n",
+                address.port()
+            ),
+        )
+        .await;
+        assert_eq!(rejected, StatusCode::MISDIRECTED_REQUEST);
+
+        let rejected_unknown_path = raw_http_status(
+            address,
+            &format!(
+                "GET /unknown HTTP/1.1\r\nHost: attacker.invalid:{}\r\nConnection: close\r\n\r\n",
+                address.port()
+            ),
+        )
+        .await;
+        assert_eq!(rejected_unknown_path, StatusCode::MISDIRECTED_REQUEST);
+
+        let accepted = raw_http_status(
+            address,
+            &format!(
+                "GET /admin/api/snapshot HTTP/1.1\r\nHost: 127.0.0.1:{}\r\nAuthorization: Bearer {admin_token}\r\nConnection: close\r\n\r\n",
+                address.port()
+            ),
+        )
+        .await;
+        assert_eq!(accepted, StatusCode::OK);
+
+        task.abort();
+        let _ = task.await;
+    }
+
+    #[test]
+    fn live_protocol_state_never_reflects_client_controlled_text() {
+        for operation in [
+            "ping",
+            "size",
+            "usernames",
+            "push",
+            "pull",
+            "deleted",
+            "history",
+            "restore",
+            "purge",
+        ] {
+            assert_eq!(live_protocol_state(operation), operation);
+        }
+        for operation in ["", "future-client-op", "<script>alert(1)</script>"] {
+            assert_eq!(live_protocol_state(operation), "unsupported");
         }
     }
 

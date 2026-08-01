@@ -5,8 +5,8 @@ use crate::{
 use anyhow::{Result, bail};
 use axum::{
     Json, Router,
-    extract::State,
-    http::{HeaderMap, HeaderValue, StatusCode, header},
+    extract::{ConnectInfo, State},
+    http::{HeaderMap, HeaderValue, StatusCode, header, uri::Authority},
     middleware::{self, Next},
     response::{Html, IntoResponse, Response},
     routing::get,
@@ -15,14 +15,18 @@ use serde::Serialize;
 use sha2::{Digest, Sha256};
 use std::{
     collections::HashMap,
-    net::IpAddr,
+    net::{IpAddr, SocketAddr},
     sync::{Arc, Mutex},
-    time::{SystemTime, UNIX_EPOCH},
+    time::{Duration, Instant, SystemTime, UNIX_EPOCH},
 };
 use uuid::Uuid;
 
 pub(crate) const CSP: &str = "default-src 'none'; script-src 'self'; style-src 'self'; connect-src 'self'; frame-ancestors 'none'; base-uri 'none'; form-action 'none'";
 const MAX_DEVICE_BYTES: usize = 128;
+pub(crate) const ADMIN_TOKEN_HEX_LENGTH: usize = 64;
+pub(crate) const ADMIN_AUTH_FAILURES_PER_SOURCE: u8 = 8;
+const ADMIN_AUTH_FAILURE_WINDOW: Duration = Duration::from_secs(60);
+const MAX_ADMIN_AUTH_SOURCES: usize = 8;
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub(crate) struct AdminConfig {
@@ -75,7 +79,7 @@ pub(crate) fn parse_admin_config(
 pub(crate) fn authorized(value: Option<&str>, expected_hex: &str) -> bool {
     let Some(token) = value
         .and_then(|v| v.strip_prefix("Bearer "))
-        .filter(|v| !v.is_empty())
+        .filter(|v| admin_token_has_valid_shape(v))
     else {
         return false;
     };
@@ -84,6 +88,12 @@ pub(crate) fn authorized(value: Option<&str>, expected_hex: &str) -> bool {
         return false;
     };
     constant_time_eq(actual.as_slice(), &expected)
+}
+fn admin_token_has_valid_shape(token: &str) -> bool {
+    token.len() == ADMIN_TOKEN_HEX_LENGTH
+        && token
+            .bytes()
+            .all(|b| b.is_ascii_digit() || (b'a'..=b'f').contains(&b))
 }
 fn constant_time_eq(a: &[u8], b: &[u8]) -> bool {
     let mut different = a.len() ^ b.len();
@@ -271,17 +281,98 @@ struct Diagnostics {
     transport_security: &'static str,
 }
 
+#[derive(Clone)]
+struct AdminRouterState {
+    app: AppState,
+    auth_failures: AdminAuthFailures,
+}
+
+#[derive(Clone, Default)]
+struct AdminAuthFailures {
+    inner: Arc<Mutex<HashMap<IpAddr, AdminAuthFailureBucket>>>,
+}
+
+struct AdminAuthFailureBucket {
+    window_started: Instant,
+    failures: u8,
+}
+
+impl AdminAuthFailures {
+    fn register(&self, source: IpAddr) -> Option<u64> {
+        self.register_at(source, Instant::now())
+    }
+
+    fn register_at(&self, source: IpAddr, now: Instant) -> Option<u64> {
+        let Ok(mut entries) = self.inner.lock() else {
+            return Some(ADMIN_AUTH_FAILURE_WINDOW.as_secs());
+        };
+        entries.retain(|_, entry| {
+            now.saturating_duration_since(entry.window_started) < ADMIN_AUTH_FAILURE_WINDOW
+        });
+        if !entries.contains_key(&source) && entries.len() >= MAX_ADMIN_AUTH_SOURCES {
+            let oldest = entries
+                .iter()
+                .min_by_key(|(_, entry)| entry.window_started)
+                .map(|(address, _)| *address);
+            if let Some(address) = oldest {
+                entries.remove(&address);
+            }
+        }
+        let entry = entries.entry(source).or_insert(AdminAuthFailureBucket {
+            window_started: now,
+            failures: 0,
+        });
+        entry.failures = entry.failures.saturating_add(1);
+        if entry.failures <= ADMIN_AUTH_FAILURES_PER_SOURCE {
+            return None;
+        }
+        Some(
+            ADMIN_AUTH_FAILURE_WINDOW
+                .saturating_sub(now.saturating_duration_since(entry.window_started))
+                .as_secs()
+                .max(1),
+        )
+    }
+
+    fn clear(&self, source: IpAddr) {
+        if let Ok(mut entries) = self.inner.lock() {
+            entries.remove(&source);
+        }
+    }
+}
+
 pub(crate) fn router(state: AppState) -> Router {
+    let state = AdminRouterState {
+        app: state,
+        auth_failures: AdminAuthFailures::default(),
+    };
     Router::new()
         .route("/admin", get(shell))
         .route("/admin/styles.css", get(styles))
         .route("/admin/app.js", get(script))
         .route("/admin/api/snapshot", get(snapshot))
-        .route_layer(middleware::from_fn(security_headers))
+        .layer(middleware::from_fn_with_state(
+            state.clone(),
+            security_headers,
+        ))
         .with_state(state)
 }
-async fn security_headers(request: axum::extract::Request, next: Next) -> Response {
-    let mut r = next.run(request).await;
+async fn security_headers(
+    State(state): State<AdminRouterState>,
+    request: axum::extract::Request,
+    next: Next,
+) -> Response {
+    let allowed = state
+        .app
+        .config
+        .admin
+        .as_ref()
+        .is_some_and(|admin| allowed_authority(request.headers().get(header::HOST), admin));
+    let mut r = if allowed {
+        next.run(request).await
+    } else {
+        StatusCode::MISDIRECTED_REQUEST.into_response()
+    };
     let h = r.headers_mut();
     h.insert("content-security-policy", HeaderValue::from_static(CSP));
     h.insert(
@@ -291,6 +382,26 @@ async fn security_headers(request: axum::extract::Request, next: Next) -> Respon
     h.insert("referrer-policy", HeaderValue::from_static("no-referrer"));
     h.insert(header::CACHE_CONTROL, HeaderValue::from_static("no-store"));
     r
+}
+fn allowed_authority(value: Option<&HeaderValue>, admin: &AdminConfig) -> bool {
+    let Some(value) = value.and_then(|value| value.to_str().ok()) else {
+        return false;
+    };
+    let Ok(authority) = value.parse::<Authority>() else {
+        return false;
+    };
+    if authority.port_u16().unwrap_or(80) != admin.port {
+        return false;
+    }
+    let host = authority
+        .host()
+        .strip_prefix('[')
+        .and_then(|host| host.strip_suffix(']'))
+        .unwrap_or_else(|| authority.host());
+    host.eq_ignore_ascii_case("localhost")
+        || host
+            .parse::<IpAddr>()
+            .is_ok_and(|address| address == admin.bind_host)
 }
 async fn shell() -> Html<&'static str> {
     Html(ADMIN_HTML)
@@ -307,7 +418,12 @@ async fn script() -> impl IntoResponse {
         ADMIN_JS,
     )
 }
-async fn snapshot(State(s): State<AppState>, headers: HeaderMap) -> Response {
+async fn snapshot(
+    State(state): State<AdminRouterState>,
+    ConnectInfo(peer): ConnectInfo<SocketAddr>,
+    headers: HeaderMap,
+) -> Response {
+    let s = &state.app;
     let Some(admin) = s.config.admin.as_ref() else {
         return StatusCode::NOT_FOUND.into_response();
     };
@@ -317,8 +433,20 @@ async fn snapshot(State(s): State<AppState>, headers: HeaderMap) -> Response {
             .and_then(|v| v.to_str().ok()),
         &admin.token_hash,
     ) {
-        return StatusCode::UNAUTHORIZED.into_response();
+        let Some(retry_after) = state.auth_failures.register(peer.ip()) else {
+            return StatusCode::UNAUTHORIZED.into_response();
+        };
+        let retry_after = HeaderValue::from_str(&retry_after.to_string())
+            .unwrap_or_else(|_| HeaderValue::from_static("60"));
+        return (
+            StatusCode::TOO_MANY_REQUESTS,
+            [(header::RETRY_AFTER, retry_after)],
+        )
+            .into_response();
     }
+    // A valid credential always bypasses and clears the failure budget, so a
+    // noisy local peer or private proxy cannot lock the owner out.
+    state.auth_failures.clear(peer.ip());
     let Ok(_permit) = s.admin_snapshots.clone().try_acquire_owned() else {
         return (StatusCode::TOO_MANY_REQUESTS, [(header::RETRY_AFTER, "30")]).into_response();
     };
@@ -328,7 +456,7 @@ async fn snapshot(State(s): State<AppState>, headers: HeaderMap) -> Response {
         Ok(Ok(v)) => v,
         _ => return StatusCode::SERVICE_UNAVAILABLE.into_response(),
     };
-    Json(build_snapshot(&s, data)).into_response()
+    Json(build_snapshot(s, data)).into_response()
 }
 fn build_snapshot(s: &AppState, data: AdminDatabaseSnapshot) -> Snapshot {
     let ready = s.db.ready();
@@ -428,9 +556,9 @@ fn staging_facts(path: &std::path::Path) -> StagingFacts {
     }
 }
 
-pub(crate) const ADMIN_HTML: &str = r#"<!doctype html><html lang="en"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"><title>Blackglass · Server admin</title><link rel="stylesheet" href="/admin/styles.css"><script defer src="/admin/app.js"></script></head><body><header><strong>Blackglass</strong><span>Server admin</span><span id="refreshed" aria-live="polite">Not connected</span></header><main><section id="login"><h1>Read-only server view</h1><form id="login-form"><label>Admin token <input id="token" type="password" autocomplete="off" required></label><button id="connect" type="submit">Connect</button><p id="login-error" role="alert"></p></form></section><div id="dashboard" hidden aria-busy="false"><div class="status"><h1 id="dashboard-title" tabindex="-1">Server dashboard</h1><strong id="health" role="status" aria-live="polite">Unknown</strong><span id="version"></span><button id="refresh">Refresh</button><button id="signout">Forget token</button></div><section><h2>Overview &amp; limits</h2><dl id="overview"></dl></section><section><h2 id="vault-title">Vaults</h2><div id="vaults" class="rows"></div></section><section><h2 id="connection-title">Live connections</h2><div id="connections" class="rows"></div></section><section><h2 id="activity-title">Recent activity</h2><div id="activity" class="rows"></div></section><section><h2 id="session-title">Sessions</h2><div id="sessions" class="rows"></div></section><section><h2>Storage &amp; history</h2><dl id="storage"></dl></section><section><h2>Diagnostics</h2><dl id="diagnostics"></dl></section></div></main></body></html>"#;
+pub(crate) const ADMIN_HTML: &str = r#"<!doctype html><html lang="en"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"><title>Blackglass · Server admin</title><link rel="stylesheet" href="/admin/styles.css"><script defer src="/admin/app.js"></script></head><body><header><strong>Blackglass</strong><span>Server admin</span><span id="refreshed" aria-live="polite">Not connected</span></header><main><section id="login"><h1>Read-only server view</h1><form id="login-form"><label>Admin token <input id="token" type="password" autocomplete="off" minlength="64" maxlength="64" pattern="[0-9a-f]{64}" required></label><button id="connect" type="submit">Connect</button><p id="login-error" role="alert"></p></form></section><div id="dashboard" hidden aria-busy="false"><div class="status"><h1 id="dashboard-title" tabindex="-1">Server dashboard</h1><strong id="health" role="status" aria-live="polite">Unknown</strong><span id="version"></span><button id="refresh">Refresh</button><button id="signout">Forget token</button></div><section><h2>Overview &amp; limits</h2><dl id="overview"></dl></section><section><h2 id="vault-title">Vaults</h2><div id="vaults" class="rows"></div></section><section><h2 id="connection-title">Live connections</h2><div id="connections" class="rows"></div></section><section><h2 id="activity-title">Recent activity</h2><div id="activity" class="rows"></div></section><section><h2 id="session-title">Sessions</h2><div id="sessions" class="rows"></div></section><section><h2>Storage &amp; history</h2><dl id="storage"></dl></section><section><h2>Diagnostics</h2><dl id="diagnostics"></dl></section></div></main></body></html>"#;
 pub(crate) const ADMIN_CSS: &str = r#":root{color-scheme:light;--ink:#18201d;--muted:#66706b;--line:#d8dedb;--accent:#276b57}*{box-sizing:border-box}body{margin:0;color:var(--ink);background:#f8faf9;font:15px system-ui,sans-serif;overflow-wrap:anywhere}header{display:flex;gap:1rem;align-items:baseline;padding:1rem max(1rem,calc((100% - 70rem)/2));border-bottom:1px solid var(--line)}header #refreshed{margin-left:auto;color:var(--muted)}main{max-width:70rem;margin:auto;padding:1rem;min-width:0}section{padding:1rem 0;border-bottom:1px solid var(--line)}h1,h2{font-weight:600}h2{font-size:1rem;text-transform:uppercase;letter-spacing:.06em}button,input{min-height:44px;border:1px solid var(--line);border-radius:3px;padding:.6rem;background:white;color:inherit}button{cursor:pointer}button:disabled{cursor:wait;opacity:.55}button:focus,input:focus{outline:3px solid #8ec6b4;outline-offset:2px}.status{display:flex;gap:.75rem;align-items:center}.status button:first-of-type{margin-left:auto}.rows>article{display:grid;grid-template-columns:minmax(10rem,1fr) 2fr;gap:.5rem;padding:.7rem 0;border-top:1px solid var(--line);min-width:0}.fields{display:grid;grid-template-columns:repeat(auto-fit,minmax(10rem,1fr));gap:.35rem}.field{min-width:0}.label{display:block;color:var(--muted);font-size:.8rem}.value{display:block;font-family:ui-monospace,monospace}dl{display:grid;grid-template-columns:minmax(12rem,1fr) 2fr;gap:.5rem}dt{color:var(--muted)}dd{margin:0;font-family:ui-monospace,monospace}#login-error{color:#8a2d25}@media(max-width:600px){header{flex-wrap:wrap}.status{flex-wrap:wrap}.status button{flex:1}.rows>article,dl{grid-template-columns:1fr}header #refreshed{width:100%;margin:0}}"#;
-pub(crate) const ADMIN_JS: &str = r#"'use strict';const $=id=>document.getElementById(id);let pending=null,generation=0;const token=()=>sessionStorage.getItem('blackglass-admin-token');const label=k=>k.replace(/[A-Z]/g,m=>' '+m.toLowerCase());const bytes=v=>v==null?'Unavailable':(()=>{let n=Number(v),u=['B','KiB','MiB','GiB','TiB'],i=0;while(Math.abs(n)>=1024&&i<4){n/=1024;i++}return `${n.toFixed(i?1:0)} ${u[i]}`})();const time=v=>v==null?'Unavailable':new Date(v).toLocaleString();const duration=v=>v==null?'Unavailable':v<60?`${v} s`:v<3600?`${Math.round(v/60)} min`:v<86400?`${Math.round(v/3600)} h`:`${Math.round(v/86400)} d`;const display=(k,v)=>k.match(/bytes|size/i)?bytes(v):k.match(/at$|timestamp|created|expires|revoked/i)&&typeof v==='number'?time(v):k.match(/seconds/i)?duration(v):typeof v==='boolean'?(v?'Yes':'No'):(v??'Unavailable');function dl(id,obj){const e=$(id);e.replaceChildren();for(const[k,v]of Object.entries(obj)){const dt=document.createElement('dt'),dd=document.createElement('dd');dt.textContent=label(k);dd.textContent=display(k,v);e.append(dt,dd)}}function rows(id,items,empty){const e=$(id);e.replaceChildren();if(!items.length){const p=document.createElement('p');p.textContent=empty;e.append(p);return}for(const item of items){const a=document.createElement('article'),b=document.createElement('strong'),d=document.createElement('div');d.className='fields';b.textContent=String(item.name||item.device||item.eventType||'Session');for(const[k,v]of Object.entries(item)){if(['name','device','eventType'].includes(k))continue;const f=document.createElement('span'),l=document.createElement('span'),x=document.createElement('span');f.className='field';l.className='label';x.className='value';l.textContent=label(k);x.textContent=display(k,v);f.append(l,x);d.append(f)}a.append(b,d);e.append(a)}}function busy(on){$('connect').disabled=on;$('refresh').disabled=on;$('refresh').textContent=on?'Refreshing…':'Refresh';$('dashboard').setAttribute('aria-busy',String(on));if(on)$('refreshed').textContent='Refreshing dashboard…'}function forget(message=''){generation++;if(pending)pending.controller.abort();pending=null;busy(false);sessionStorage.removeItem('blackglass-admin-token');$('dashboard').hidden=true;$('login').hidden=false;$('token').value='';$('refreshed').textContent='Not connected';$('login-error').textContent=message;$('token').focus()}async function load(manual=false){if(pending)return pending.promise;const requestGeneration=++generation,controller=new AbortController(),wasHidden=$('dashboard').hidden;const promise=(async()=>{busy(true);$('login-error').textContent='';try{const r=await fetch('/admin/api/snapshot',{headers:{Authorization:`Bearer ${token()||''}`},cache:'no-store',signal:controller.signal});if(requestGeneration!==generation)return;if(r.status===401){forget('Invalid admin token.');return}if(!r.ok)throw Error(r.status===429?'Snapshot already in progress; retry shortly.':'Snapshot unavailable.');const x=await r.json();if(requestGeneration!==generation||!token())return;$('login').hidden=true;$('dashboard').hidden=false;$('health').textContent=x.overview.healthy?'Healthy':'Degraded';$('version').textContent=`Version ${x.overview.version}`;$('refreshed').textContent=`Refreshed ${time(x.generatedAt)}`;dl('overview',{...x.overview,perFileLimitBytes:x.limits.perFileBytes,retainedStorageLimitBytes:x.limits.retainedStorageBytes,sessionLimit:x.limits.maxSessions,connectionLimit:x.limits.maxConnections,uploadLimit:x.limits.maxUploads});$('vault-title').textContent=`Vaults — ${x.counts.vaultsVisible} visible / ${x.counts.vaultsTotal} total`;$('connection-title').textContent=`Live connections — ${x.liveConnections.length} active`;$('activity-title').textContent=`Recent activity — ${x.counts.activityVisible} visible / ${x.counts.activityTotal} total`;$('session-title').textContent=`Sessions — ${x.sessions.active} active / ${x.sessions.total} total (${x.counts.sessionsVisible} visible)`;rows('vaults',x.vaults,'No vaults have been created.');rows('connections',x.liveConnections,'No active Sync connections.');rows('activity',x.recentActivity,'No revision activity recorded.');rows('sessions',x.sessions.items,'No sessions recorded.');dl('storage',x.storage);dl('diagnostics',x.diagnostics);if(wasHidden)$('dashboard-title').focus()}catch(e){if(e.name==='AbortError'||requestGeneration!==generation)return;const m=e instanceof Error?e.message:'Snapshot unavailable.';if($('dashboard').hidden)$('login-error').textContent=m;else $('refreshed').textContent=m;if(manual&&!$('dashboard').hidden)$('refresh').focus()}finally{if(requestGeneration===generation){busy(false);pending=null}}})();pending={promise,controller};return promise}$('login-form').addEventListener('submit',e=>{e.preventDefault();sessionStorage.setItem('blackglass-admin-token',$('token').value);load(true)});$('refresh').onclick=()=>load(true);$('signout').onclick=()=>forget();if(token())load();setInterval(()=>{if(token())load()},30000);"#;
+pub(crate) const ADMIN_JS: &str = r#"'use strict';const $=id=>document.getElementById(id);let pending=null,generation=0;const token=()=>sessionStorage.getItem('blackglass-admin-token');const label=k=>k.replace(/[A-Z]/g,m=>' '+m.toLowerCase());const bytes=v=>v==null?'Unavailable':(()=>{let n=Number(v),u=['B','KiB','MiB','GiB','TiB'],i=0;while(Math.abs(n)>=1024&&i<4){n/=1024;i++}return `${n.toFixed(i?1:0)} ${u[i]}`})();const time=v=>v==null?'Unavailable':new Date(v).toLocaleString();const duration=v=>v==null?'Unavailable':v<60?`${v} s`:v<3600?`${Math.round(v/60)} min`:v<86400?`${Math.round(v/3600)} h`:`${Math.round(v/86400)} d`;const display=(k,v)=>k.match(/bytes|size/i)?bytes(v):k.match(/at$|timestamp|created|expires|revoked/i)&&typeof v==='number'?time(v):k.match(/seconds/i)?duration(v):typeof v==='boolean'?(v?'Yes':'No'):(v??'Unavailable');function dl(id,obj){const e=$(id);e.replaceChildren();for(const[k,v]of Object.entries(obj)){const dt=document.createElement('dt'),dd=document.createElement('dd');dt.textContent=label(k);dd.textContent=display(k,v);e.append(dt,dd)}}function rows(id,items,empty){const e=$(id);e.replaceChildren();if(!items.length){const p=document.createElement('p');p.textContent=empty;e.append(p);return}for(const item of items){const a=document.createElement('article'),b=document.createElement('strong'),d=document.createElement('div');d.className='fields';b.textContent=String(item.name||item.device||item.eventType||'Session');for(const[k,v]of Object.entries(item)){if(['name','device','eventType'].includes(k))continue;const f=document.createElement('span'),l=document.createElement('span'),x=document.createElement('span');f.className='field';l.className='label';x.className='value';l.textContent=label(k);x.textContent=display(k,v);f.append(l,x);d.append(f)}a.append(b,d);e.append(a)}}function busy(on){$('connect').disabled=on;$('refresh').disabled=on;$('refresh').textContent=on?'Refreshing…':'Refresh';$('dashboard').setAttribute('aria-busy',String(on));if(on)$('refreshed').textContent='Refreshing dashboard…'}function forget(message=''){generation++;if(pending)pending.controller.abort();pending=null;busy(false);sessionStorage.removeItem('blackglass-admin-token');$('dashboard').hidden=true;$('login').hidden=false;$('token').value='';$('refreshed').textContent='Not connected';$('login-error').textContent=message;$('token').focus()}async function load(manual=false){if(pending)return pending.promise;const requestGeneration=++generation,controller=new AbortController(),wasHidden=$('dashboard').hidden;const promise=(async()=>{busy(true);$('login-error').textContent='';try{const r=await fetch('/admin/api/snapshot',{headers:{Authorization:`Bearer ${token()||''}`},cache:'no-store',signal:controller.signal});if(requestGeneration!==generation)return;if(r.status===401){forget('Invalid admin token.');return}if(!r.ok)throw Error(r.status===429?'Request rate limited; retry shortly.':'Snapshot unavailable.');const x=await r.json();if(requestGeneration!==generation||!token())return;$('login').hidden=true;$('dashboard').hidden=false;$('health').textContent=x.overview.healthy?'Healthy':'Degraded';$('version').textContent=`Version ${x.overview.version}`;$('refreshed').textContent=`Refreshed ${time(x.generatedAt)}`;dl('overview',{...x.overview,perFileLimitBytes:x.limits.perFileBytes,retainedStorageLimitBytes:x.limits.retainedStorageBytes,sessionLimit:x.limits.maxSessions,connectionLimit:x.limits.maxConnections,uploadLimit:x.limits.maxUploads});$('vault-title').textContent=`Vaults — ${x.counts.vaultsVisible} visible / ${x.counts.vaultsTotal} total`;$('connection-title').textContent=`Live connections — ${x.liveConnections.length} active`;$('activity-title').textContent=`Recent activity — ${x.counts.activityVisible} visible / ${x.counts.activityTotal} total`;$('session-title').textContent=`Sessions — ${x.sessions.active} active / ${x.sessions.total} total (${x.counts.sessionsVisible} visible)`;rows('vaults',x.vaults,'No vaults have been created.');rows('connections',x.liveConnections,'No active Sync connections.');rows('activity',x.recentActivity,'No revision activity recorded.');rows('sessions',x.sessions.items,'No sessions recorded.');dl('storage',x.storage);dl('diagnostics',x.diagnostics);if(wasHidden)$('dashboard-title').focus()}catch(e){if(e.name==='AbortError'||requestGeneration!==generation)return;const m=e instanceof Error?e.message:'Snapshot unavailable.';if($('dashboard').hidden)$('login-error').textContent=m;else $('refreshed').textContent=m;if(manual&&!$('dashboard').hidden)$('refresh').focus()}finally{if(requestGeneration===generation){busy(false);pending=null}}})();pending={promise,controller};return promise}$('login-form').addEventListener('submit',e=>{e.preventDefault();sessionStorage.setItem('blackglass-admin-token',$('token').value);load(true)});$('refresh').onclick=()=>load(true);$('signout').onclick=()=>forget();if(token())load();setInterval(()=>{if(token())load()},30000);"#;
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -472,12 +600,83 @@ mod tests {
     }
     #[test]
     fn bearer_auth_is_exact_and_hash_based() {
-        let t = "independent-admin-token";
+        let t = "0123456789abcdef".repeat(4);
         let h = hex::encode(Sha256::digest(t.as_bytes()));
         assert!(authorized(Some(&format!("Bearer {t}")), &h));
         assert!(!authorized(None, &h));
         assert!(!authorized(Some("Bearer ordinary-sync-token"), &h));
-        assert!(!authorized(Some(&format!("bearer {t}")), &h))
+        assert!(!authorized(Some(&format!("bearer {t}")), &h));
+        assert!(!authorized(
+            Some(&format!("Bearer {}", t.to_uppercase())),
+            &h
+        ));
+        assert!(!authorized(Some(&format!("Bearer {t}0")), &h));
+    }
+    #[test]
+    fn admin_authority_is_exact_loopback_or_localhost() {
+        let admin = AdminConfig {
+            bind_host: "127.0.0.1".parse().unwrap(),
+            port: 3010,
+            token_hash: "ab".repeat(32),
+        };
+        for value in ["127.0.0.1:3010", "localhost:3010", "LOCALHOST:3010"] {
+            assert!(allowed_authority(
+                Some(&HeaderValue::from_str(value).unwrap()),
+                &admin
+            ));
+        }
+        for value in [
+            "attacker.invalid:3010",
+            "127.0.0.2:3010",
+            "127.0.0.1:3011",
+            "127.0.0.1",
+        ] {
+            assert!(!allowed_authority(
+                Some(&HeaderValue::from_str(value).unwrap()),
+                &admin
+            ));
+        }
+        assert!(!allowed_authority(None, &admin));
+
+        let ipv6 = AdminConfig {
+            bind_host: "::1".parse().unwrap(),
+            port: 3010,
+            token_hash: "ab".repeat(32),
+        };
+        for value in ["[::1]:3010", "localhost:3010"] {
+            assert!(allowed_authority(
+                Some(&HeaderValue::from_str(value).unwrap()),
+                &ipv6
+            ));
+        }
+        for value in ["[::1]:3011", "[::ffff:127.0.0.1]:3010"] {
+            assert!(!allowed_authority(
+                Some(&HeaderValue::from_str(value).unwrap()),
+                &ipv6
+            ));
+        }
+    }
+    #[test]
+    fn admin_failure_budget_expires_and_is_bounded() {
+        let failures = AdminAuthFailures::default();
+        let now = Instant::now();
+        let source = "127.0.0.1".parse().unwrap();
+        for _ in 0..ADMIN_AUTH_FAILURES_PER_SOURCE {
+            assert_eq!(failures.register_at(source, now), None);
+        }
+        assert_eq!(
+            failures.register_at(source, now),
+            Some(ADMIN_AUTH_FAILURE_WINDOW.as_secs())
+        );
+        assert_eq!(
+            failures.register_at(source, now + ADMIN_AUTH_FAILURE_WINDOW),
+            None
+        );
+        for last in 1..=MAX_ADMIN_AUTH_SOURCES + 1 {
+            let source = IpAddr::from([127, 0, 0, last as u8]);
+            failures.register_at(source, now);
+        }
+        assert!(failures.inner.lock().unwrap().len() <= MAX_ADMIN_AUTH_SOURCES);
     }
     #[test]
     fn embedded_assets_are_data_free_responsive_and_secure() {
@@ -492,13 +691,21 @@ mod tests {
         assert!(!ADMIN_HTML.contains("token_hash"));
         assert!(ADMIN_CSS.contains("@media"));
         assert!(ADMIN_CSS.contains("min-height:44px"));
-        for marker in ["sessionStorage", "Authorization", "30000"] {
+        for marker in [
+            "sessionStorage",
+            "Authorization",
+            "30000",
+            "Request rate limited; retry shortly.",
+        ] {
             assert!(ADMIN_JS.contains(marker))
         }
         assert!(!ADMIN_JS.contains("localStorage"));
         for marker in [
             "aria-busy=\"false\"",
             "tabindex=\"-1\"",
+            "minlength=\"64\"",
+            "maxlength=\"64\"",
+            "pattern=\"[0-9a-f]{64}\"",
             "new AbortController()",
             "pending.controller.abort()",
             "requestGeneration!==generation",

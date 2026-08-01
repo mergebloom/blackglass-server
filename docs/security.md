@@ -34,7 +34,7 @@ E2EE does not hide those facts.
 | Client drift | Version-specific deterministic patch anchors, upstream/generated hashes, updates disabled in the copied profile, and official-client E2E qualification |
 | Dependency supply chain | Locked crates, a checksum-pinned advisory/license/source scanner, explicit license allowlist, Cargo plus native/runtime notices, digest-pinned build images, and commit-pinned CI actions |
 | Operations endpoint exposure | Health, readiness, and metrics remain loopback/private by default; the example public Caddy route returns 404 for them |
-| Admin console exposure | Disabled by default on a distinct listener; loopback by default; independent hash-only bearer authentication for bounded API projections; restrictive CSP and no-store responses; no admin routes on Sync listeners |
+| Admin console exposure | Disabled by default on a distinct loopback listener; exact loopback HTTP authority; independent fixed-shape, hash-only bearer authentication with a bounded per-source failure budget that never blocks valid credentials; bounded API projections; restrictive CSP and no-store responses; no admin routes on Sync listeners |
 
 ## Residual risk and exclusions
 

@@ -110,17 +110,24 @@ The optional Phase 1 admin console is observation-only: it has no mutation,
 backup, configuration, revocation, deletion, purge, or restore controls. Enable
 it only by setting `SELFHOST_ADMIN_BIND_HOST`, `SELFHOST_ADMIN_PORT`, and
 `SELFHOST_ADMIN_TOKEN_HASH` together. The hash is exactly 64 lowercase SHA-256
-hex characters; never put the plaintext admin token in the environment. Use a
-random token independent from all Sync sessions.
+hex characters; never put the plaintext admin token in the environment. The
+plaintext token must itself be exactly 64 lowercase hexadecimal characters;
+generate it with `openssl rand -hex 32` and keep it independent from all Sync
+sessions.
 
 The admin bind is strictly loopback-only; unspecified addresses are rejected even when external Sync binding is acknowledged. Keep the listener on `127.0.0.1` (for example port `3010`). TLS remains the
-responsibility of a private reverse proxy. A safe remote shape is a tailnet-only
-hostname whose proxy route forwards `/admin` to `127.0.0.1:3010` and is not
-present in public DNS or the public Caddy site. Do not proxy the admin listener
+responsibility of a private reverse proxy. The listener rejects every HTTP
+authority except its configured loopback address (or `localhost`) and port. A
+safe remote shape is a tailnet-only hostname whose proxy route forwards
+`/admin` to `127.0.0.1:3010`, rewrites the upstream `Host` header to
+`127.0.0.1:3010`, and is not present in public DNS or the public Caddy site. Do
+not proxy the admin listener
 from the public control/data virtual hosts. The shell assets contain no server
 data; every `/admin/api/*` request requires `Authorization: Bearer <admin-token>`.
-The browser stores it in `sessionStorage`, polls no faster than 30 seconds, and
-can forget it with **Forget token**.
+Invalid credentials have a bounded per-source failure budget; a valid token
+always bypasses and clears that budget, so failed attempts cannot lock the owner
+out. The browser stores the token in `sessionStorage`, polls no faster than 30
+seconds, and can forget it with **Forget token**.
 
 The console exposes bounded, explicit projections: readiness/version/schema,
 configured limits, vault metadata and encryption mode, recent revision metadata
