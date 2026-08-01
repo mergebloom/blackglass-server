@@ -21,6 +21,14 @@ export type DiagnosticCollectionOptions = {
   perSourceTimeoutMs?: number;
 };
 
+export type ExitKernelReadOptions<T> = {
+  read: () => string | Promise<string>;
+  parse: (value: string) => T;
+  isDisappeared: (error: unknown) => boolean;
+  waitBeforeRetry: () => void | Promise<void>;
+  retries?: number;
+};
+
 export const defaultWorkFailureGraceMs = 100;
 export const defaultDiagnosticSourceTimeoutMs = 2_000;
 
@@ -42,6 +50,31 @@ export async function withMeasurementPhase<T>(
     const message = error instanceof Error ? error.message : String(error);
     throw new Error(`${phase} failed: ${message}`, { cause: error });
   }
+}
+
+// procfs files can remain open for a brief exit transition while their memory
+// fields are already gone. Retry a bounded number of times so a subsequent
+// valid snapshot is retained or a subsequent ENOENT/ESRCH is treated exactly
+// like the disappeared path. A persistently malformed live snapshot remains a
+// hard qualification failure.
+export async function readExitKernelValue<T>(
+  options: ExitKernelReadOptions<T>,
+): Promise<T | null> {
+  const retries = options.retries ?? 2;
+  if (!Number.isSafeInteger(retries) || retries < 0) {
+    throw new Error("exit kernel read retries must be a non-negative safe integer");
+  }
+  let lastError: unknown;
+  for (let attempt = 0; attempt <= retries; attempt += 1) {
+    try {
+      return options.parse(await options.read());
+    } catch (error) {
+      if (options.isDisappeared(error)) return null;
+      lastError = error;
+      if (attempt < retries) await options.waitBeforeRetry();
+    }
+  }
+  throw lastError;
 }
 
 export async function observeWorkWithSamples<T>(

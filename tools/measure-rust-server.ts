@@ -32,6 +32,7 @@ import {
 import {
   collectFailureDiagnostics,
   observeWorkWithSamples,
+  readExitKernelValue,
   rethrowWithDiagnostics,
   withMeasurementPhase,
 } from "./resource-harness.ts";
@@ -1159,10 +1160,13 @@ async function readCgroupSnapshot(
 
 async function readLinuxPeakRssDuringExit(pid: number): Promise<number | null> {
   try {
-    const status = await readFile(`/proc/${pid}/status`, "utf8");
-    return parseLinuxRssKiBDuringExit(status, "VmHWM");
+    return await readExitKernelValue({
+      read: () => readFile(`/proc/${pid}/status`, "utf8"),
+      parse: (status) => parseLinuxRssKiBDuringExit(status, "VmHWM"),
+      isDisappeared: isDisappearedKernelPath,
+      waitBeforeRetry: () => Bun.sleep(1),
+    });
   } catch (error) {
-    if (isDisappearedKernelPath(error)) return null;
     const message = error instanceof Error ? error.message : String(error);
     throw new Error(`terminal process memory snapshot failed: ${message}`, {
       cause: error,

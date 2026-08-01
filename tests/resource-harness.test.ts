@@ -2,11 +2,80 @@ import { describe, expect, test } from "bun:test";
 import {
   collectFailureDiagnostics,
   observeWorkWithSamples,
+  readExitKernelValue,
   rethrowWithDiagnostics,
   withMeasurementPhase,
 } from "../tools/resource-harness.ts";
 
+function parseVmHwm(value: string): number {
+  const match = /^VmHWM:\s+(\d+) kB$/m.exec(value);
+  if (!match?.[1]) throw new Error("missing VmHWM");
+  return Number(match[1]);
+}
+
 describe("release resource harness failure handling", () => {
+  test("accepts a partial procfs exit snapshot only when the path then disappears", async () => {
+    const reads: Array<string | Error> = [
+      "Name:\tblackglass\nState:\tS (sleeping)\n",
+      Object.assign(new Error("gone"), { code: "ENOENT" }),
+    ];
+    const waits: number[] = [];
+    const result = await readExitKernelValue({
+      read: () => {
+        const value = reads.shift();
+        if (value instanceof Error) throw value;
+        return value ?? "";
+      },
+      parse: parseVmHwm,
+      isDisappeared: (error) => (error as { code?: string }).code === "ENOENT",
+      waitBeforeRetry: () => {
+        waits.push(1);
+      },
+    });
+    expect(result).toBeNull();
+    expect(waits).toEqual([1]);
+  });
+
+  test("retains a valid retry and rejects a persistently malformed exit snapshot", async () => {
+    let attempts = 0;
+    await expect(
+      readExitKernelValue({
+        read: () => (++attempts === 1 ? "State:\tS (sleeping)\n" : "VmHWM:\t42 kB\n"),
+        parse: parseVmHwm,
+        isDisappeared: () => false,
+        waitBeforeRetry: () => {},
+      }),
+    ).resolves.toBe(42);
+    expect(attempts).toBe(2);
+
+    let malformedAttempts = 0;
+    await expect(
+      readExitKernelValue({
+        read: () => {
+          malformedAttempts += 1;
+          return "State:\tS (sleeping)\n";
+        },
+        parse: parseVmHwm,
+        isDisappeared: () => false,
+        waitBeforeRetry: () => {},
+        retries: 2,
+      }),
+    ).rejects.toThrow("missing VmHWM");
+    expect(malformedAttempts).toBe(3);
+
+    for (const retries of [-1, 1.5]) {
+      await expect(
+        readExitKernelValue({
+          read: () => "VmHWM:\t42 kB\n",
+          parse: parseVmHwm,
+          isDisappeared: () => false,
+          waitBeforeRetry: () => {},
+          retries,
+        }),
+      ).rejects.toThrow("non-negative safe integer");
+    }
+  });
+
   test("adds the exact measurement phase while preserving the sampling cause", async () => {
     const cause = new Error("Linux process status has no valid VmHWM value");
     try {
