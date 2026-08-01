@@ -21,7 +21,7 @@ import {
   parseCgroupEvents,
   parseCgroupPidList,
   parseCgroupScalar,
-  parseLinuxRssKiB,
+  parseLinuxProcessMemoryKiB,
   parseLinuxRssKiBDuringExit,
   parseUnifiedCgroupPath,
   qualifyNativeLinuxTarget,
@@ -33,6 +33,7 @@ import {
   collectFailureDiagnostics,
   observeWorkWithSamples,
   rethrowWithDiagnostics,
+  withMeasurementPhase,
 } from "./resource-harness.ts";
 
 const pieceBytes = 2 * 1024 * 1024;
@@ -82,6 +83,11 @@ type CgroupContext = {
   hostPlatform: string;
   hostArchitecture: string;
   elfDescription: string;
+};
+
+type ProcessMemorySnapshot = {
+  rssKiB: number;
+  linuxPeakRssKiB: number | null;
 };
 
 class Probe {
@@ -269,10 +275,27 @@ try {
   }
   await Bun.sleep(100);
 
-  const baselineRssKiB = await rss();
+  const baselineMemory = await readActiveProcessMemorySnapshot("baseline");
+  const baselineRssKiB = baselineMemory.rssKiB;
   const workloadStartedAt = performance.now();
-  let peakRssKiB = baselineRssKiB;
+  let linuxPeakRssKiB = baselineMemory.linuxPeakRssKiB;
+  let peakRssKiB = Math.max(
+    baselineRssKiB,
+    baselineMemory.linuxPeakRssKiB ?? baselineRssKiB,
+  );
   const rssSamplesKiB: number[] = [];
+  const sampleActiveRss = async (phase: string): Promise<number> => {
+    const sample = await readActiveProcessMemorySnapshot(phase);
+    peakRssKiB = Math.max(
+      peakRssKiB,
+      sample.rssKiB,
+      sample.linuxPeakRssKiB ?? sample.rssKiB,
+    );
+    if (sample.linuxPeakRssKiB !== null) {
+      linuxPeakRssKiB = Math.max(linuxPeakRssKiB ?? 0, sample.linuxPeakRssKiB);
+    }
+    return sample.rssKiB;
+  };
   const sharedUploadPiece = new Uint8Array(randomBytes(pieceBytes));
   const uploadWork = uploadProbes.map((probe, index) =>
     upload(
@@ -302,10 +325,9 @@ try {
   const [uploadResults, downloadSizes, historyResponse, signinResponses] =
     await observeWorkWithSamples(
       work,
-      rss,
+      () => sampleActiveRss("concurrent workload"),
       (sample) => {
         rssSamplesKiB.push(sample);
-        peakRssKiB = Math.max(peakRssKiB, sample);
       },
       () => Bun.sleep(25),
     );
@@ -344,10 +366,9 @@ try {
   const reservedSyncPullWork = download(sourceProbes[1]!, uploaded.uid);
   const [standaloneArgonResponse, reservedSyncPullBytes] = await observeWorkWithSamples(
     Promise.all([standaloneArgonWork, reservedSyncPullWork]),
-    rss,
+    () => sampleActiveRss("reserved Sync and Argon2 workload"),
     (sample) => {
       rssSamplesKiB.push(sample);
-      peakRssKiB = Math.max(peakRssKiB, sample);
     },
     () => Bun.sleep(25),
   );
@@ -367,9 +388,7 @@ try {
   const argon2CompletedChecks = concurrentArgon2CompletedChecks + 1;
   const durationMs = Math.round(performance.now() - workloadStartedAt);
 
-  peakRssKiB = Math.max(peakRssKiB, await rss());
-  const linuxPeakRssKiB = await linuxPeakRss();
-  if (linuxPeakRssKiB !== null) peakRssKiB = Math.max(peakRssKiB, linuxPeakRssKiB);
+  await sampleActiveRss("post-work");
 
   const binarySha256 = await sha256Path(binary);
   const largeResponseBytes = Buffer.byteLength(JSON.stringify(historyResponse));
@@ -453,39 +472,86 @@ try {
     for (const probe of probes) probe.socket.close();
     await Bun.sleep(100);
 
-    // Docker removes the process and its cgroup after a successful stop. Keep
-    // the last valid kernel snapshots while the graceful drain runs so the
-    // release report includes shutdown allocations and non-killing OOM events,
-    // not only the steady-state workload.
-    const captureShutdownMeasurements = async (processExitMayBeInProgress = false) => {
-      const cgroupSnapshot = await readCgroupSnapshot(cgroupDirectory, context.eventsPath);
-      if (cgroupSnapshot) {
-        memoryPeakBytes = Math.max(memoryPeakBytes, cgroupSnapshot.memoryPeakBytes);
-        memoryEvents = cgroupSnapshot.memoryEvents;
-        const shutdownPeakRssKiB = await readLinuxPeakRssForPid(
-          context.hostPid,
-          processExitMayBeInProgress,
-        );
-        if (shutdownPeakRssKiB !== null) {
-          peakRssKiB = Math.max(peakRssKiB, shutdownPeakRssKiB);
-        }
+    const retainCgroupSnapshot = (snapshot: {
+      memoryPeakBytes: number;
+      memoryEvents: CgroupEvents;
+    }) => {
+      memoryPeakBytes = Math.max(memoryPeakBytes, snapshot.memoryPeakBytes);
+      memoryEvents = snapshot.memoryEvents;
+    };
+    const retainProcessMemory = (snapshot: ProcessMemorySnapshot) => {
+      peakRssKiB = Math.max(
+        peakRssKiB,
+        snapshot.rssKiB,
+        snapshot.linuxPeakRssKiB ?? snapshot.rssKiB,
+      );
+      if (snapshot.linuxPeakRssKiB !== null) {
+        linuxPeakRssKiB = Math.max(linuxPeakRssKiB ?? 0, snapshot.linuxPeakRssKiB);
       }
     };
-    await captureShutdownMeasurements();
+
+    // The active pre-stop snapshot is strict. A missing procfs/cgroup field or
+    // changed container identity before we request shutdown is a qualification
+    // failure, never an exit transition.
+    const preStopCgroupSnapshot = await withMeasurementPhase(
+      "active cgroup memory snapshot (pre-stop)",
+      async () => {
+        const snapshot = await readCgroupSnapshot(cgroupDirectory, context.eventsPath);
+        if (snapshot === null) throw new Error("cgroup disappeared before stop");
+        return snapshot;
+      },
+    );
+    retainCgroupSnapshot(preStopCgroupSnapshot);
+    retainProcessMemory(
+      await readActiveProcessMemorySnapshotForPid(context.hostPid, "pre-stop"),
+    );
+    const preStopInspection = dockerInspect(context.container);
+    const preStopCgroupPids = await withMeasurementPhase(
+      "active cgroup identity snapshot (pre-stop)",
+      async () =>
+        parseCgroupPidList(await readFile(join(cgroupDirectory, "cgroup.procs"), "utf8")),
+    );
+    if (
+      preStopInspection.State.Running !== true ||
+      Number(preStopInspection.State.Pid) !== context.hostPid ||
+      preStopCgroupPids.length !== 1 ||
+      preStopCgroupPids[0] !== context.hostPid
+    ) {
+      throw new Error("server process identity changed before requested stop");
+    }
+
     const stopProcess = Bun.spawn(["docker", "stop", "--time", "30", context.container], {
       stdout: "pipe",
       stderr: "pipe",
     });
+    // Docker removes the process and its cgroup after a successful stop. Keep
+    // the last valid kernel snapshots while the graceful drain runs so the
+    // release report includes shutdown allocations and non-killing OOM events,
+    // not only the steady-state workload. Terminal tolerance is reachable only
+    // after the stop command has been spawned.
+    const captureShutdownMeasurements = async () => {
+      const cgroupSnapshot = await withMeasurementPhase(
+        "terminal cgroup memory snapshot",
+        () => readCgroupSnapshot(cgroupDirectory, context.eventsPath),
+      );
+      if (cgroupSnapshot === null) return;
+      retainCgroupSnapshot(cgroupSnapshot);
+      const shutdownPeakRssKiB = await readLinuxPeakRssDuringExit(context.hostPid);
+      if (shutdownPeakRssKiB !== null) {
+        peakRssKiB = Math.max(peakRssKiB, shutdownPeakRssKiB);
+        linuxPeakRssKiB = Math.max(linuxPeakRssKiB ?? 0, shutdownPeakRssKiB);
+      }
+    };
     let stopSettled = false;
     const stopCompletion = stopProcess.exited.finally(() => {
       stopSettled = true;
     });
     while (!stopSettled) {
-      await captureShutdownMeasurements(true);
+      await captureShutdownMeasurements();
       await Bun.sleep(10);
     }
     const stopExitCode = await stopCompletion;
-    await captureShutdownMeasurements(true);
+    await captureShutdownMeasurements();
     if (stopExitCode !== 0) {
       throw new Error(
         `docker stop failed: ${await new Response(stopProcess.stderr).text()}`,
@@ -1091,18 +1157,16 @@ async function readCgroupSnapshot(
   }
 }
 
-async function readLinuxPeakRssForPid(
-  pid: number,
-  processExitMayBeInProgress = false,
-): Promise<number | null> {
+async function readLinuxPeakRssDuringExit(pid: number): Promise<number | null> {
   try {
     const status = await readFile(`/proc/${pid}/status`, "utf8");
-    return processExitMayBeInProgress
-      ? parseLinuxRssKiBDuringExit(status, "VmHWM")
-      : parseLinuxRssKiB(status, "VmHWM");
+    return parseLinuxRssKiBDuringExit(status, "VmHWM");
   } catch (error) {
     if (isDisappearedKernelPath(error)) return null;
-    throw error;
+    const message = error instanceof Error ? error.message : String(error);
+    throw new Error(`terminal process memory snapshot failed: ${message}`, {
+      cause: error,
+    });
   }
 }
 
@@ -1219,25 +1283,42 @@ function metadataPush(path: string, hash: string) {
   };
 }
 
-async function rss(): Promise<number> {
+async function readActiveProcessMemorySnapshot(
+  phase: string,
+): Promise<ProcessMemorySnapshot> {
   const pid = child?.pid ?? cgroup?.hostPid;
-  if (pid === undefined) throw new Error("server process is unavailable");
+  return withMeasurementPhase(`active process memory snapshot (${phase})`, async () => {
+    if (pid === undefined) throw new Error("server process is unavailable");
+    return readProcessMemorySnapshotForPid(pid);
+  });
+}
+
+async function readActiveProcessMemorySnapshotForPid(
+  pid: number,
+  phase: string,
+): Promise<ProcessMemorySnapshot> {
+  return withMeasurementPhase(`active process memory snapshot (${phase})`, () =>
+    readProcessMemorySnapshotForPid(pid),
+  );
+}
+
+async function readProcessMemorySnapshotForPid(pid: number): Promise<ProcessMemorySnapshot> {
   if (process.platform === "linux") {
-    return parseLinuxRssKiB(await readFile(`/proc/${pid}/status`, "utf8"), "VmRSS");
+    const parsed = parseLinuxProcessMemoryKiB(
+      await readFile(`/proc/${pid}/status`, "utf8"),
+    );
+    return { rssKiB: parsed.rssKiB, linuxPeakRssKiB: parsed.peakRssKiB };
   }
   const result = Bun.spawnSync(["ps", "-o", "rss=", "-p", String(pid)], {
     stdout: "pipe",
     stderr: "pipe",
   });
   if (result.exitCode !== 0) throw new Error(result.stderr.toString());
-  return Number(result.stdout.toString().trim());
-}
-
-async function linuxPeakRss(): Promise<number | null> {
-  if (process.platform !== "linux") return null;
-  const pid = child?.pid ?? cgroup?.hostPid;
-  if (pid === undefined) throw new Error("server process is unavailable");
-  return parseLinuxRssKiB(await readFile(`/proc/${pid}/status`, "utf8"), "VmHWM");
+  const rssKiB = Number(result.stdout.toString().trim());
+  if (!Number.isFinite(rssKiB) || rssKiB < 0) {
+    throw new Error("ps returned an invalid RSS value");
+  }
+  return { rssKiB, linuxPeakRssKiB: null };
 }
 
 async function post(

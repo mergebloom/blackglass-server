@@ -6,6 +6,7 @@ import {
   parseCgroupEvents,
   parseCgroupPidList,
   parseCgroupScalar,
+  parseLinuxProcessMemoryKiB,
   parseLinuxRssKiB,
   parseLinuxRssKiBDuringExit,
   parseUnifiedCgroupPath,
@@ -46,8 +47,17 @@ describe("release resource gate", () => {
 
   test("parses Linux kernel high-water RSS and rejects ambiguous status", () => {
     const status = "Name:\tserver\nVmRSS:\t42 kB\nVmHWM:\t189068 kB\n";
+    expect(parseLinuxProcessMemoryKiB(status)).toEqual({
+      rssKiB: 42,
+      peakRssKiB: 189_068,
+    });
     expect(parseLinuxRssKiB(status, "VmRSS")).toBe(42);
     expect(parseLinuxRssKiB(status, "VmHWM")).toBe(189_068);
+    expect(() => parseLinuxProcessMemoryKiB("VmRSS:\t42 kB\n")).toThrow("VmHWM");
+    expect(() => parseLinuxProcessMemoryKiB("VmHWM:\t42 kB\n")).toThrow("VmRSS");
+    expect(() =>
+      parseLinuxProcessMemoryKiB("VmRSS:\t42 kB\nVmHWM:\tunknown kB\n"),
+    ).toThrow("VmHWM");
     expect(() => parseLinuxRssKiB("VmRSS:\t42 kB\n", "VmHWM")).toThrow("VmHWM");
     expect(() => parseLinuxRssKiB("VmHWM:\tunknown kB\n", "VmHWM")).toThrow("VmHWM");
   });
@@ -59,6 +69,7 @@ describe("release resource gate", () => {
     expect(parseLinuxRssKiBDuringExit(live, "VmHWM")).toBe(189_068);
     expect(parseLinuxRssKiBDuringExit(zombie, "VmHWM")).toBeNull();
     expect(parseLinuxRssKiBDuringExit(dead, "VmHWM")).toBeNull();
+    expect(() => parseLinuxProcessMemoryKiB(zombie)).toThrow("VmRSS");
     expect(() => parseLinuxRssKiB(zombie, "VmHWM")).toThrow("VmHWM");
     expect(() =>
       parseLinuxRssKiBDuringExit("State:\tS (sleeping)\n", "VmHWM"),

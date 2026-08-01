@@ -32,6 +32,18 @@ type WorkOutcome<T> =
   | { status: "fulfilled"; value: T }
   | { status: "rejected"; error: unknown };
 
+export async function withMeasurementPhase<T>(
+  phase: string,
+  read: () => T | Promise<T>,
+): Promise<T> {
+  try {
+    return await read();
+  } catch (error) {
+    const message = error instanceof Error ? error.message : String(error);
+    throw new Error(`${phase} failed: ${message}`, { cause: error });
+  }
+}
+
 export async function observeWorkWithSamples<T>(
   work: Promise<T>,
   sample: () => Promise<number>,

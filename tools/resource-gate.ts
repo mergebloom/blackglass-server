@@ -20,6 +20,11 @@ export type CgroupEvents = {
   oomGroupKill: number;
 };
 
+export type LinuxProcessMemoryKiB = {
+  rssKiB: number;
+  peakRssKiB: number;
+};
+
 export function evaluateResourceGate(
   workloadPassed: boolean,
   baselineRssKiB: number,
@@ -87,6 +92,16 @@ export function parseLinuxRssKiB(status: string, field: "VmRSS" | "VmHWM"): numb
   const match = status.match(new RegExp(`^${field}:\\s+(\\d+)\\s+kB$`, "m"));
   if (!match?.[1]) throw new Error(`Linux process status has no valid ${field} value`);
   return Number(match[1]);
+}
+
+// Parse both active-process fields from the same procfs snapshot. Reading the
+// fields through separate opens introduces a race where VmRSS can come from a
+// live process and VmHWM from the process's subsequent terminal status.
+export function parseLinuxProcessMemoryKiB(status: string): LinuxProcessMemoryKiB {
+  return {
+    rssKiB: parseLinuxRssKiB(status, "VmRSS"),
+    peakRssKiB: parseLinuxRssKiB(status, "VmHWM"),
+  };
 }
 
 // Linux omits the memory fields from /proc/<pid>/status after a process has

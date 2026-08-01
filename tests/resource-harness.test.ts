@@ -3,9 +3,30 @@ import {
   collectFailureDiagnostics,
   observeWorkWithSamples,
   rethrowWithDiagnostics,
+  withMeasurementPhase,
 } from "../tools/resource-harness.ts";
 
 describe("release resource harness failure handling", () => {
+  test("adds the exact measurement phase while preserving the sampling cause", async () => {
+    const cause = new Error("Linux process status has no valid VmHWM value");
+    try {
+      await withMeasurementPhase("active process memory snapshot (post-work)", () => {
+        throw cause;
+      });
+      throw new Error("expected measurement failure");
+    } catch (error) {
+      expect(error).toBeInstanceOf(Error);
+      expect((error as Error).message).toBe(
+        "active process memory snapshot (post-work) failed: " + cause.message,
+      );
+      expect((error as Error).cause).toBe(cause);
+    }
+  });
+
+  test("returns successful phase measurements unchanged", async () => {
+    await expect(withMeasurementPhase("baseline", () => 42)).resolves.toBe(42);
+  });
+
   test("preserves a workload rejection when the concurrent RSS sample also fails", async () => {
     const workloadError = Object.assign(new Error("socket closed"), { code: "ECONNRESET" });
     const samplingError = new Error("Linux process status has no valid VmRSS value");
