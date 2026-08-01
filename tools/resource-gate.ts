@@ -89,6 +89,22 @@ export function parseLinuxRssKiB(status: string, field: "VmRSS" | "VmHWM"): numb
   return Number(match[1]);
 }
 
+// Linux omits the memory fields from /proc/<pid>/status after a process has
+// entered a terminal zombie/dead state. Callers may use this parser only after
+// initiating a confirmed process exit, when retaining an earlier valid
+// high-water sample is correct. A present but malformed field remains a hard
+// failure.
+export function parseLinuxRssKiBDuringExit(
+  status: string,
+  field: "VmRSS" | "VmHWM",
+): number | null {
+  if (!new RegExp(`^${field}(?=[:\\s])`, "m").test(status)) {
+    if (/^State:\s+(?:Z|X)(?:\s|$)/m.test(status)) return null;
+    return parseLinuxRssKiB(status, field);
+  }
+  return parseLinuxRssKiB(status, field);
+}
+
 export function parseCgroupScalar(raw: string, field: string): number {
   const value = raw.trim();
   if (!/^\d+$/.test(value)) throw new Error(`${field} is not a finite cgroup byte value`);

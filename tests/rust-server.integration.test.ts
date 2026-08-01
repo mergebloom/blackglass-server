@@ -843,12 +843,49 @@ describe("production Rust server", () => {
         vault_size: 0,
       });
       const payload = new Uint8Array(32).fill(0x5a);
+      const emptySource = await metadata(probe, "quota-empty", "quota-empty");
+
+      const fullPending = await Probe.connect(`ws://127.0.0.1:${quotaDataPort}`);
+      await initializeFor(
+        fullPending,
+        signin.token,
+        quotaVault,
+        "Full quota reservation",
+        0,
+        true,
+      );
+      fullPending.json(push("quota-full-pending", "quota-full-pending", storageQuota, 1));
+      expect(await fullPending.nextJson()).toEqual({ res: "next" });
+      probe.json(push("quota-concurrent", "quota-concurrent", 1, 1));
+      expect(await probe.nextJson()).toEqual({ err: "Storage limit reached" });
+      probe.json({ op: "restore", uid: emptySource.uid });
+      expect(await probe.nextJson()).toMatchObject({
+        op: "push",
+        path: "quota-empty",
+        size: 0,
+      });
+      expect(await probe.nextJson()).toEqual({ res: "ok" });
+      fullPending.socket.close();
+      await waitForClose(fullPending, 2_000);
+      await waitForDirectoryEmpty(join(quotaDirectory, "uploads"), 2_000);
+
       const source = await uploadOpaqueCiphertext(
         probe,
         "quota-path",
         "quota-source",
         payload.byteLength,
       );
+
+      const pending = await Probe.connect(`ws://127.0.0.1:${quotaDataPort}`);
+      await initializeFor(pending, signin.token, quotaVault, "Quota reservation", 0, true);
+      pending.json(push("quota-pending", "quota-pending", payload.byteLength, 1));
+      expect(await pending.nextJson()).toEqual({ res: "next" });
+      probe.json({ op: "restore", uid: source.uid });
+      expect(await probe.nextJson()).toEqual({ err: "Storage limit reached" });
+      pending.socket.close();
+      await waitForClose(pending, 2_000);
+      await waitForDirectoryEmpty(join(quotaDirectory, "uploads"), 2_000);
+
       probe.json({ op: "restore", uid: source.uid });
       const restored = await probe.nextJson();
       expect(restored).toMatchObject({ op: "push", path: "quota-path", size: 32 });
@@ -857,7 +894,7 @@ describe("production Rust server", () => {
       probe.json({ op: "size" });
       expect(await probe.nextJson()).toEqual({
         res: "ok",
-        size: payload.byteLength,
+        size: storageQuota,
         limit: storageQuota,
         vault_size: payload.byteLength,
       });
@@ -865,8 +902,6 @@ describe("production Rust server", () => {
       expect(await probe.nextJson()).toEqual({ err: "Storage limit reached" });
 
       probe.json(push("quota-overflow", "quota-overflow", payload.byteLength, 1));
-      expect(await probe.nextJson()).toEqual({ res: "next" });
-      probe.socket.send(payload);
       expect(await probe.nextJson()).toEqual({ err: "Storage limit reached" });
       await waitForDirectoryEmpty(join(quotaDirectory, "uploads"), 2_000);
 
@@ -887,7 +922,7 @@ describe("production Rust server", () => {
         await fetch(`http://127.0.0.1:${quotaControlPort}/metrics`)
       ).text();
       expect(metricValue(metrics, "blackglass_storage_quota_bytes")).toBe(storageQuota);
-      expect(metricValue(metrics, "blackglass_storage_quota_rejections_total")).toBe(2);
+      expect(metricValue(metrics, "blackglass_storage_quota_rejections_total")).toBe(4);
       probe.socket.close();
     } finally {
       if (child.exitCode === null) child.kill("SIGTERM");

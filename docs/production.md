@@ -322,12 +322,14 @@ not place its files on a network filesystem.
 
 `SELFHOST_STORAGE_QUOTA_BYTES` is a hard, account-wide limit on retained
 ciphertext bodies across every vault and historical revision, including copies
-created by `restore`. The commit-time check and revision insertion share one
-SQLite transaction, so concurrent uploads cannot oversubscribe it. Zero-byte
-tombstones remain writable while full; `purge` and vault deletion release
-logical quota. If an existing database is already over a newly lowered limit,
-the server remains available for reads and cleanup but rejects new non-empty
-revisions.
+created by `restore`. File capacity is reserved before the server accepts binary
+pieces, and reservations are released on commit, disconnect, timeout, or any
+error. Restores honor the same pending reservations. The final check and
+revision insertion still share one SQLite transaction, so concurrent work
+cannot oversubscribe the limit. Zero-byte tombstones remain writable while
+full; `purge` and vault deletion release logical quota. If an existing database
+is already over a newly lowered limit, the server remains available for reads
+and cleanup but rejects new non-empty revisions.
 
 The compatibility default is the previously advertised 1 TiB
 (`1099511627776`). Production operators should set it deliberately below the

@@ -104,17 +104,27 @@ Observed operations:
 - `size`
 - `usernames`
 
-`size` returns the current live account and selected-vault sizes plus the exact
-configured retained-ciphertext limit:
+`size` returns retained account ciphertext, the current live selected-vault
+size, and the exact configured retained-ciphertext limit:
 
 ```json
 { "res": "ok", "size": 1024, "limit": 1099511627776, "vault_size": 1024 }
 ```
 
-The quota itself counts every retained non-empty revision, not only live heads.
-Uploads and restores that would exceed it receive the bounded
-`{"err":"Storage limit reached"}` response; metadata-only deletions remain
-available so the owner can purge history and recover capacity.
+The quota counts every retained non-empty revision, not only live heads. A file
+upload reserves capacity while its metadata request is still using the client's
+checked JSON-response path, before the server returns `next` and accepts binary
+pieces. Concurrent uploads and restores share that accounting. Requests that
+would exceed the limit receive the bounded `{"err":"Storage limit reached"}`
+response; metadata-only deletions remain available so the owner can purge
+history and recover capacity.
+
+Obsidian 1.12.7 checks that JSON error only for the initial metadata request.
+After sending a binary piece it waits for a response but does not inspect a JSON
+body. The reservation makes a final transactional quota conflict unreachable
+in ordinary operation; if that invariant is ever violated, the server closes
+the WebSocket with code `1008` instead of sending JSON so the client must reject
+and retry rather than recording a false upload success.
 
 ### Push and pull
 

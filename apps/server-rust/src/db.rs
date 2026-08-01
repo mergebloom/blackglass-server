@@ -467,12 +467,6 @@ impl Db {
             )
         })
     }
-    pub fn total_size(&self) -> Result<i64> {
-        self.with(
-            |c| Ok(c.query_row("SELECT COALESCE(SUM(size),0) FROM vaults", [], |r| r.get(0))?),
-        )
-    }
-    #[cfg(test)]
     pub fn stored_ciphertext_size(&self) -> Result<i64> {
         self.with(|connection| stored_ciphertext_size(connection))
     }
@@ -844,13 +838,16 @@ fn initialize_runtime_storage_usage(c: &Connection) -> Result<()> {
 }
 
 fn enforce_storage_quota(c: &Connection, additional: i64, limit: i64) -> Result<()> {
-    if additional < 0 || limit <= 0 {
+    if additional < 0 || limit < 0 {
         bail!("invalid stored ciphertext quota accounting input")
     }
     // Zero-byte tombstones and folder metadata remain available while over
     // quota so an owner can delete and purge data to recover.
     if additional == 0 {
         return Ok(());
+    }
+    if limit == 0 {
+        return Err(StorageQuotaExceeded.into());
     }
     let used = stored_ciphertext_size(c)?;
     if used > limit || additional > limit - used {

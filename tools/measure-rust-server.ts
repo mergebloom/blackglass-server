@@ -22,6 +22,7 @@ import {
   parseCgroupPidList,
   parseCgroupScalar,
   parseLinuxRssKiB,
+  parseLinuxRssKiBDuringExit,
   parseUnifiedCgroupPath,
   qualifyNativeLinuxTarget,
   resourceLimits,
@@ -456,12 +457,15 @@ try {
     // the last valid kernel snapshots while the graceful drain runs so the
     // release report includes shutdown allocations and non-killing OOM events,
     // not only the steady-state workload.
-    const captureShutdownMeasurements = async () => {
+    const captureShutdownMeasurements = async (processExitMayBeInProgress = false) => {
       const cgroupSnapshot = await readCgroupSnapshot(cgroupDirectory, context.eventsPath);
       if (cgroupSnapshot) {
         memoryPeakBytes = Math.max(memoryPeakBytes, cgroupSnapshot.memoryPeakBytes);
         memoryEvents = cgroupSnapshot.memoryEvents;
-        const shutdownPeakRssKiB = await readLinuxPeakRssForPid(context.hostPid);
+        const shutdownPeakRssKiB = await readLinuxPeakRssForPid(
+          context.hostPid,
+          processExitMayBeInProgress,
+        );
         if (shutdownPeakRssKiB !== null) {
           peakRssKiB = Math.max(peakRssKiB, shutdownPeakRssKiB);
         }
@@ -477,11 +481,11 @@ try {
       stopSettled = true;
     });
     while (!stopSettled) {
-      await captureShutdownMeasurements();
+      await captureShutdownMeasurements(true);
       await Bun.sleep(10);
     }
     const stopExitCode = await stopCompletion;
-    await captureShutdownMeasurements();
+    await captureShutdownMeasurements(true);
     if (stopExitCode !== 0) {
       throw new Error(
         `docker stop failed: ${await new Response(stopProcess.stderr).text()}`,
@@ -1087,9 +1091,15 @@ async function readCgroupSnapshot(
   }
 }
 
-async function readLinuxPeakRssForPid(pid: number): Promise<number | null> {
+async function readLinuxPeakRssForPid(
+  pid: number,
+  processExitMayBeInProgress = false,
+): Promise<number | null> {
   try {
-    return parseLinuxRssKiB(await readFile(`/proc/${pid}/status`, "utf8"), "VmHWM");
+    const status = await readFile(`/proc/${pid}/status`, "utf8");
+    return processExitMayBeInProgress
+      ? parseLinuxRssKiBDuringExit(status, "VmHWM")
+      : parseLinuxRssKiB(status, "VmHWM");
   } catch (error) {
     if (isDisappearedKernelPath(error)) return null;
     throw error;

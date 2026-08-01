@@ -7,6 +7,7 @@ import {
   parseCgroupPidList,
   parseCgroupScalar,
   parseLinuxRssKiB,
+  parseLinuxRssKiBDuringExit,
   parseUnifiedCgroupPath,
   qualifyNativeLinuxTarget,
   resourceLimits,
@@ -49,6 +50,25 @@ describe("release resource gate", () => {
     expect(parseLinuxRssKiB(status, "VmHWM")).toBe(189_068);
     expect(() => parseLinuxRssKiB("VmRSS:\t42 kB\n", "VmHWM")).toThrow("VmHWM");
     expect(() => parseLinuxRssKiB("VmHWM:\tunknown kB\n", "VmHWM")).toThrow("VmHWM");
+  });
+
+  test("retains the last valid RSS sample only during a confirmed exit transition", () => {
+    const live = "Name:\tserver\nState:\tS (sleeping)\nVmHWM:\t189068 kB\n";
+    const zombie = "Name:\tserver\nState:\tZ (zombie)\nPid:\t42\n";
+    const dead = "Name:\tserver\nState:\tX (dead)\nPid:\t42\n";
+    expect(parseLinuxRssKiBDuringExit(live, "VmHWM")).toBe(189_068);
+    expect(parseLinuxRssKiBDuringExit(zombie, "VmHWM")).toBeNull();
+    expect(parseLinuxRssKiBDuringExit(dead, "VmHWM")).toBeNull();
+    expect(() => parseLinuxRssKiB(zombie, "VmHWM")).toThrow("VmHWM");
+    expect(() =>
+      parseLinuxRssKiBDuringExit("State:\tS (sleeping)\n", "VmHWM"),
+    ).toThrow("VmHWM");
+    expect(() => parseLinuxRssKiBDuringExit("VmHWM:\tunknown kB\n", "VmHWM")).toThrow(
+      "VmHWM",
+    );
+    expect(() => parseLinuxRssKiBDuringExit("VmHWM unknown\n", "VmHWM")).toThrow(
+      "VmHWM",
+    );
   });
 
   test("rejects invalid peak inputs", () => {

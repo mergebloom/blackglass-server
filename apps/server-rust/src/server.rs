@@ -28,7 +28,7 @@ use std::{
     path::PathBuf,
     sync::{
         Arc, Mutex as StdMutex,
-        atomic::{AtomicU64, Ordering},
+        atomic::{AtomicI64, AtomicU64, Ordering},
     },
     time::{Duration, Instant, SystemTime, UNIX_EPOCH},
 };
@@ -106,6 +106,7 @@ pub struct AppState {
     pub db: Db,
     events: broadcast::Sender<Event>,
     commit_order: Arc<AsyncMutex<()>>,
+    storage_reservations: Arc<StorageReservations>,
     uploads: Arc<Semaphore>,
     connections: Arc<Semaphore>,
     auth_checks: Arc<Semaphore>,
@@ -250,6 +251,7 @@ pub async fn run(config: Config) -> Result<()> {
         db,
         events,
         commit_order: Arc::new(AsyncMutex::new(())),
+        storage_reservations: Arc::new(StorageReservations::default()),
         uploads: Arc::new(Semaphore::new(max_uploads)),
         connections: Arc::new(Semaphore::new(max_connections)),
         auth_checks: Arc::new(Semaphore::new(auth::MAX_CONCURRENT_PASSWORD_CHECKS)),
@@ -947,6 +949,68 @@ struct Session {
     pending: Option<Pending>,
     live: Option<crate::admin::LiveGuard>,
 }
+
+#[derive(Default)]
+struct StorageReservations {
+    bytes: AtomicI64,
+}
+
+impl StorageReservations {
+    fn reserved(&self) -> i64 {
+        self.bytes.load(Ordering::Acquire)
+    }
+
+    fn try_reserve(
+        self: &Arc<Self>,
+        committed: i64,
+        additional: i64,
+        limit: i64,
+    ) -> Option<StorageReservation> {
+        if committed < 0 || additional <= 0 || limit <= 0 {
+            return None;
+        }
+        let mut reserved = self.bytes.load(Ordering::Acquire);
+        loop {
+            if committed > limit || reserved > limit - committed {
+                return None;
+            }
+            let available = limit - committed - reserved;
+            if additional > available {
+                return None;
+            }
+            match self.bytes.compare_exchange_weak(
+                reserved,
+                reserved + additional,
+                Ordering::AcqRel,
+                Ordering::Acquire,
+            ) {
+                Ok(_) => {
+                    return Some(StorageReservation {
+                        bytes: additional,
+                        reservations: self.clone(),
+                    });
+                }
+                Err(actual) => reserved = actual,
+            }
+        }
+    }
+}
+
+struct StorageReservation {
+    bytes: i64,
+    reservations: Arc<StorageReservations>,
+}
+
+impl Drop for StorageReservation {
+    fn drop(&mut self) {
+        let previous = self
+            .reservations
+            .bytes
+            .fetch_sub(self.bytes, Ordering::AcqRel);
+        debug_assert!(previous >= self.bytes);
+    }
+}
+
 struct Pending {
     revision: NewRevision,
     path: PathBuf,
@@ -954,6 +1018,7 @@ struct Pending {
     pieces: i64,
     bytes: i64,
     idle_deadline: TokioInstant,
+    _storage_reservation: StorageReservation,
     _permit: tokio::sync::OwnedSemaphorePermit,
 }
 
@@ -1152,9 +1217,10 @@ async fn handle_message(
                 "ping" => send(tx, json!({"op":"pong"})).await?,
                 "size" => {
                     let vault = session.vault.clone().unwrap();
-                    let (size, vault_size) =
-                        db_task(s, move |db| Ok((db.total_size()?, db.vault_size(&vault)?)))
-                            .await?;
+                    let (size, vault_size) = db_task(s, move |db| {
+                        Ok((db.stored_ciphertext_size()?, db.vault_size(&vault)?))
+                    })
+                    .await?;
                     send(tx,json!({"res":"ok","size":size,"limit":s.config.storage_quota_bytes,"vault_size":vault_size})).await?
                 }
                 "usernames" => send(tx, json!({"1":s.config.display_name})).await?,
@@ -1454,6 +1520,17 @@ async fn begin_push(
             return Ok(());
         }
     };
+    let storage_reservation = {
+        let _commit = s.commit_order.lock().await;
+        let committed = db_task(s, |db| db.stored_ciphertext_size()).await?;
+        s.storage_reservations
+            .try_reserve(committed, revision.size, s.config.storage_quota_bytes)
+    };
+    let Some(storage_reservation) = storage_reservation else {
+        drop(permit);
+        reject_storage_quota(s, tx).await?;
+        return Ok(());
+    };
     let path = s
         .config
         .staging_dir
@@ -1466,6 +1543,7 @@ async fn begin_push(
         pieces: 0,
         bytes: 0,
         idle_deadline: TokioInstant::now() + s.config.upload_idle_timeout,
+        _storage_reservation: storage_reservation,
         _permit: permit,
     });
     send(tx, json!({"res":"next"})).await?;
@@ -1511,17 +1589,22 @@ async fn upload_chunk(
     drop(pending.file);
     let revision = pending.revision.clone();
     let path = pending.path.clone();
+    let storage_reservation = pending._storage_reservation;
     let storage_quota_bytes = s.config.storage_quota_bytes;
     let commit_result = {
         let _commit = s.commit_order.lock().await;
-        db_task(s, move |db| {
+        let result = db_task(s, move |db| {
             db.add_file_revision(&revision, &path, storage_quota_bytes)
         })
         .await
         .and_then(|stored| {
             let stored_size = stored.size;
             Ok((publish_committed(s, stored)?, stored_size))
-        })
+        });
+        // The database result now reflects this upload. Release its in-flight
+        // capacity while the commit-order guard still excludes new admission.
+        drop(storage_reservation);
+        result
     };
     if let Err(error) = tokio::fs::remove_file(&pending.path).await {
         warn!(event = "staged_upload_cleanup_failed", error = %error);
@@ -1532,7 +1615,7 @@ async fn upload_chunk(
     let (notice, stored_size) = match commit_result {
         Ok(committed) => committed,
         Err(error) if crate::db::is_storage_quota_exceeded(&error) => {
-            reject_storage_quota(s, tx).await?;
+            close_storage_quota(s, tx).await?;
             return Ok(());
         }
         Err(error) => return Err(error),
@@ -1790,8 +1873,10 @@ async fn restore(
         let vault = session.vault.clone().unwrap();
         let device = session.device.clone();
         let storage_quota_bytes = s.config.storage_quota_bytes;
+        let reserved = s.storage_reservations.reserved();
+        let restore_quota_bytes = storage_quota_bytes.saturating_sub(reserved);
         match db_task(s, move |db| {
-            db.restore(&vault, uid, &device, storage_quota_bytes)
+            db.restore(&vault, uid, &device, restore_quota_bytes)
         })
         .await
         {
@@ -1840,6 +1925,27 @@ fn publish_committed(s: &AppState, r: Revision) -> Result<Event> {
 }
 
 async fn reject_storage_quota(s: &AppState, tx: &mut SplitSink<WebSocket, Message>) -> Result<()> {
+    record_storage_quota_rejection(s);
+    send(tx, json!({"err":STORAGE_QUOTA_CLIENT_ERROR})).await
+}
+
+async fn close_storage_quota(s: &AppState, tx: &mut SplitSink<WebSocket, Message>) -> Result<()> {
+    record_storage_quota_rejection(s);
+    // Obsidian 1.12.7 checks the metadata response but discards JSON after a
+    // binary piece. A close frame is therefore the only fail-safe final-stage
+    // signal that cannot be mistaken for a successful upload.
+    socket_send(tx, Message::Close(Some(storage_quota_close_frame()))).await?;
+    Err(anyhow::anyhow!(STORAGE_QUOTA_CLIENT_ERROR))
+}
+
+fn storage_quota_close_frame() -> CloseFrame {
+    CloseFrame {
+        code: 1008,
+        reason: STORAGE_QUOTA_CLIENT_ERROR.into(),
+    }
+}
+
+fn record_storage_quota_rejection(s: &AppState) {
     s.metrics
         .storage_quota_rejections
         .fetch_add(1, Ordering::Relaxed);
@@ -1847,7 +1953,6 @@ async fn reject_storage_quota(s: &AppState, tx: &mut SplitSink<WebSocket, Messag
         event = "storage_quota_rejected",
         storage_quota_bytes = s.config.storage_quota_bytes
     );
-    send(tx, json!({"err":STORAGE_QUOTA_CLIENT_ERROR})).await
 }
 
 fn serialized_notice_size(revision: &NewRevision) -> Result<usize> {
@@ -2425,6 +2530,7 @@ mod tests {
                 db,
                 events: broadcast::channel(EVENT_CAPACITY).0,
                 commit_order: Arc::new(AsyncMutex::new(())),
+                storage_reservations: Arc::new(StorageReservations::default()),
                 uploads: Arc::new(Semaphore::new(max_uploads)),
                 connections: Arc::new(Semaphore::new(max_connections)),
                 auth_checks: Arc::new(Semaphore::new(auth::MAX_CONCURRENT_PASSWORD_CHECKS)),
@@ -2460,6 +2566,31 @@ mod tests {
             request = request.header(header::AUTHORIZATION, authorization);
         }
         request.body(Body::empty()).unwrap()
+    }
+
+    #[test]
+    fn storage_reservations_are_bounded_and_release_on_drop() {
+        let reservations = Arc::new(StorageReservations::default());
+        let first = reservations.try_reserve(16, 32, 64).unwrap();
+        assert_eq!(reservations.reserved(), 32);
+        assert!(reservations.try_reserve(16, 17, 64).is_none());
+        let second = reservations.try_reserve(16, 16, 64).unwrap();
+        assert_eq!(reservations.reserved(), 48);
+        assert!(reservations.try_reserve(16, 1, 64).is_none());
+        drop(first);
+        assert_eq!(reservations.reserved(), 16);
+        let third = reservations.try_reserve(16, 32, 64).unwrap();
+        assert_eq!(reservations.reserved(), 48);
+        drop(second);
+        drop(third);
+        assert_eq!(reservations.reserved(), 0);
+    }
+
+    #[test]
+    fn final_storage_quota_rejection_is_a_close_frame_not_json() {
+        let frame = storage_quota_close_frame();
+        assert_eq!(frame.code, 1008);
+        assert_eq!(frame.reason.as_str(), STORAGE_QUOTA_CLIENT_ERROR);
     }
 
     #[tokio::test]
