@@ -6,7 +6,7 @@
     "destinationSchema": 6
   },
   "previousRollbackTag": "v0.3.0",
-  "clientToolingRevision": "9a9c4e9ff5ad96f4a5f025801b60f569d7c01225",
+  "clientToolingRevision": "5240b3ca7947f07106d0da924fe9af3cee9049ff",
   "qualifiedRenderers": [
     {
       "version": "1.12.7",
