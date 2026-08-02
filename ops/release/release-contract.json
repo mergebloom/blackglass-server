@@ -1,6 +1,6 @@
 {
   "schemaVersion": 1,
-  "serverVersion": "0.4.0",
+  "serverVersion": "0.4.1",
   "database": {
     "supportedSourceSchemas": [5],
     "destinationSchema": 6
