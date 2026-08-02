@@ -3,7 +3,7 @@ use crate::{
     model::{AuthContext, NewRevision, PullInfo, PushNotice, Revision, UserCredential, Vault},
 };
 use anyhow::{Context, Result, bail};
-use rusqlite::{Connection, OptionalExtension, params, types::Value};
+use rusqlite::{Connection, OptionalExtension, TransactionBehavior, params, types::Value};
 use std::{
     collections::HashSet,
     error::Error as StdError,
@@ -713,7 +713,7 @@ impl Db {
     }
     pub fn create_vault_for_user(&self, user_id: i64, vault: &Vault) -> Result<()> {
         self.with(|c| {
-            let tx = c.transaction()?;
+            let tx = c.transaction_with_behavior(TransactionBehavior::Immediate)?;
             let count: i64 = tx.query_row("SELECT COUNT(*) FROM vaults", [], |row| row.get(0))?;
             if count >= MAX_VAULTS {
                 bail!("vault limit reached")
@@ -786,7 +786,7 @@ impl Db {
     }
     pub fn delete_vault_for_user(&self, user_id: i64, id: &str) -> Result<bool> {
         self.with(|c| {
-            let tx = c.transaction()?;
+            let tx = c.transaction_with_behavior(TransactionBehavior::Immediate)?;
             let exists = tx.query_row(
                 "SELECT EXISTS(SELECT 1 FROM vaults WHERE id=? AND owner_user_id=?)",
                 params![id, user_id],
@@ -815,7 +815,7 @@ impl Db {
         replacement: &Vault,
     ) -> Result<bool> {
         self.with(|c| {
-            let tx = c.transaction()?;
+            let tx = c.transaction_with_behavior(TransactionBehavior::Immediate)?;
             let exists = tx.query_row(
                 "SELECT EXISTS(SELECT 1 FROM vaults WHERE id=? AND owner_user_id=?)",
                 params![source_id,user_id],
@@ -859,6 +859,9 @@ impl Db {
     pub fn stored_ciphertext_size(&self) -> Result<i64> {
         self.with(|connection| stored_ciphertext_size(connection))
     }
+    pub fn stored_ciphertext_size_for_owner(&self, user_id: i64) -> Result<i64> {
+        self.with(|connection| owner_stored_ciphertext_size(connection, user_id))
+    }
     pub fn vault_size(&self, id: &str) -> Result<i64> {
         self.with(|c| vault_size(c, id))
     }
@@ -867,11 +870,20 @@ impl Db {
         &self,
         revision: &NewRevision,
         storage_quota_bytes: i64,
+        owner_storage_quota_bytes: i64,
     ) -> Result<Revision> {
         if revision.size != 0 || revision.pieces != 0 {
             bail!("metadata-only revision must have zero size and pieces")
         }
-        self.with(|c| add_revision(c, revision, None, storage_quota_bytes))
+        self.with(|c| {
+            add_revision(
+                c,
+                revision,
+                None,
+                storage_quota_bytes,
+                owner_storage_quota_bytes,
+            )
+        })
     }
 
     pub fn add_file_revision(
@@ -879,6 +891,7 @@ impl Db {
         revision: &NewRevision,
         file_path: &Path,
         storage_quota_bytes: i64,
+        owner_storage_quota_bytes: i64,
     ) -> Result<Revision> {
         if revision.folder
             || revision.deleted
@@ -888,8 +901,15 @@ impl Db {
             bail!("file revision metadata is inconsistent")
         }
         self.with(|c| {
-            let tx=c.transaction()?; let ts=now_ms();
-            enforce_storage_quota(&tx, revision.size, storage_quota_bytes)?;
+            let tx=c.transaction_with_behavior(TransactionBehavior::Immediate)?; let ts=now_ms();
+            enforce_storage_quotas(
+                &tx,
+                &revision.vault_id,
+                revision.user_id,
+                revision.size,
+                storage_quota_bytes,
+                owner_storage_quota_bytes,
+            )?;
             tx.execute("INSERT INTO revisions(vault_id,path,relatedpath,extension,hash,ctime,mtime,folder,deleted,size,pieces,content,device,user_id,ts) VALUES(?,?,?,?,?,?,?,?,?,?,?,NULL,?,?,?)",
                 params![revision.vault_id,revision.path,revision.relatedpath,revision.extension,revision.hash,revision.ctime,revision.mtime,revision.folder as i64,revision.deleted as i64,revision.size,revision.pieces,revision.device,revision.user_id,ts])?;
             let uid=tx.last_insert_rowid();
@@ -1089,7 +1109,14 @@ impl Db {
         device: &str,
         storage_quota_bytes: i64,
     ) -> Result<Option<Revision>> {
-        self.restore_for_user(1, vault, uid, device, storage_quota_bytes)
+        self.restore_for_user(
+            1,
+            vault,
+            uid,
+            device,
+            storage_quota_bytes,
+            storage_quota_bytes,
+        )
     }
 
     pub fn restore_for_user(
@@ -1099,15 +1126,16 @@ impl Db {
         uid: i64,
         device: &str,
         storage_quota_bytes: i64,
+        owner_storage_quota_bytes: i64,
     ) -> Result<Option<Revision>> {
         self.with(|c|{
-        let tx=c.transaction()?;
-        let target:Option<(String,bool)>=tx.query_row("SELECT path,deleted FROM revisions WHERE uid=? AND vault_id=?",params![uid,vault],|r|Ok((r.get(0)?,r.get::<_,i64>(1)?==1))).optional()?;
+        let tx=c.transaction_with_behavior(TransactionBehavior::Immediate)?;
+        let target:Option<(String,bool)>=tx.query_row("SELECT r.path,r.deleted FROM revisions r JOIN vaults v ON v.id=r.vault_id WHERE r.uid=? AND r.vault_id=? AND v.owner_user_id=?",params![uid,vault,user_id],|r|Ok((r.get(0)?,r.get::<_,i64>(1)?==1))).optional()?;
         let Some((path,deleted))=target else{return Ok(None)};
         let source_uid=if deleted {tx.query_row("SELECT uid FROM revisions WHERE vault_id=? AND path=? AND uid<? AND deleted=0 ORDER BY uid DESC LIMIT 1",params![vault,path,uid],|r|r.get(0)).optional()?}else{Some(uid)};
         let Some(source_uid)=source_uid else{return Ok(None)}; let ts=now_ms();
         let source_size:i64=tx.query_row("SELECT size FROM revisions WHERE uid=?",[source_uid],|r|r.get(0))?;
-        enforce_storage_quota(&tx, source_size, storage_quota_bytes)?;
+        enforce_storage_quotas(&tx, vault, user_id, source_size, storage_quota_bytes, owner_storage_quota_bytes)?;
         tx.execute("INSERT INTO revisions(vault_id,path,relatedpath,extension,hash,ctime,mtime,folder,deleted,size,pieces,content,device,user_id,ts) SELECT vault_id,?,NULL,extension,hash,ctime,mtime,folder,0,size,pieces,NULL,?,?,? FROM revisions WHERE uid=?",params![path,device,user_id,ts,source_uid])?;
         let new_uid=tx.last_insert_rowid();
         if new_uid > MAX_JS_SAFE_INTEGER {
@@ -1135,8 +1163,12 @@ impl Db {
     })
     }
 
+    #[cfg(test)]
     pub fn purge(&self, vault: &str) -> Result<()> {
-        self.with(|c|{let tx=c.transaction()?;tx.execute("DELETE FROM revisions WHERE vault_id=? AND uid NOT IN (SELECT MAX(uid) FROM revisions WHERE vault_id=? GROUP BY path)",params![vault,vault])?;let version: i64=tx.query_row("SELECT version FROM vaults WHERE id=?",[vault],|r|r.get(0))?;refresh_vault(&tx,vault,version)?;tx.commit()?;Ok(())})
+        self.purge_for_user(1, vault)
+    }
+    pub fn purge_for_user(&self, user_id: i64, vault: &str) -> Result<()> {
+        self.with(|c|{let tx=c.transaction_with_behavior(TransactionBehavior::Immediate)?;let authorized:bool=tx.query_row("SELECT EXISTS(SELECT 1 FROM vaults WHERE id=? AND owner_user_id=?)",params![vault,user_id],|r|Ok(r.get::<_,i64>(0)?==1))?;if !authorized{return Ok(())};tx.execute("DELETE FROM revisions WHERE vault_id=? AND uid NOT IN (SELECT MAX(uid) FROM revisions WHERE vault_id=? GROUP BY path)",params![vault,vault])?;let version: i64=tx.query_row("SELECT version FROM vaults WHERE id=?",[vault],|r|r.get(0))?;refresh_vault(&tx,vault,version)?;tx.commit()?;Ok(())})
     }
     pub fn checkpoint(&self) -> Result<()> {
         self.with(|c| {
@@ -1206,6 +1238,16 @@ fn stored_ciphertext_size(c: &Connection) -> Result<i64> {
     )?)
 }
 
+fn owner_stored_ciphertext_size(c: &Connection, user_id: i64) -> Result<i64> {
+    Ok(c.query_row(
+        "SELECT COALESCE(SUM(r.size),0)
+           FROM revisions r JOIN vaults v ON v.id=r.vault_id
+          WHERE v.owner_user_id=?",
+        [user_id],
+        |row| row.get(0),
+    )?)
+}
+
 fn initialize_runtime_storage_usage(c: &Connection) -> Result<()> {
     let ciphertext_bytes =
         c.query_row("SELECT COALESCE(SUM(size),0) FROM revisions", [], |row| {
@@ -1238,20 +1280,40 @@ fn initialize_runtime_storage_usage(c: &Connection) -> Result<()> {
     Ok(())
 }
 
-fn enforce_storage_quota(c: &Connection, additional: i64, limit: i64) -> Result<()> {
-    if additional < 0 || limit < 0 {
+fn enforce_storage_quotas(
+    c: &Connection,
+    vault_id: &str,
+    acting_user_id: i64,
+    additional: i64,
+    global_limit: i64,
+    owner_limit: i64,
+) -> Result<()> {
+    if additional < 0 || global_limit < 0 || owner_limit < 0 {
         bail!("invalid stored ciphertext quota accounting input")
     }
+    let owner_user_id = c
+        .query_row(
+            "SELECT owner_user_id FROM vaults WHERE id=? AND owner_user_id=?",
+            params![vault_id, acting_user_id],
+            |row| row.get::<_, i64>(0),
+        )
+        .optional()?
+        .context("vault is unavailable")?;
     // Zero-byte tombstones and folder metadata remain available while over
     // quota so an owner can delete and purge data to recover.
     if additional == 0 {
         return Ok(());
     }
-    if limit == 0 {
+    if global_limit == 0 || owner_limit == 0 {
         return Err(StorageQuotaExceeded.into());
     }
-    let used = stored_ciphertext_size(c)?;
-    if used > limit || additional > limit - used {
+    let global_used = stored_ciphertext_size(c)?;
+    let owner_used = owner_stored_ciphertext_size(c, owner_user_id)?;
+    if global_used > global_limit
+        || additional > global_limit - global_used
+        || owner_used > owner_limit
+        || additional > owner_limit - owner_used
+    {
         return Err(StorageQuotaExceeded.into());
     }
     Ok(())
@@ -1262,9 +1324,17 @@ fn add_revision(
     r: &NewRevision,
     content: Option<&[u8]>,
     storage_quota_bytes: i64,
+    owner_storage_quota_bytes: i64,
 ) -> Result<Revision> {
-    let tx = c.transaction()?;
-    enforce_storage_quota(&tx, r.size, storage_quota_bytes)?;
+    let tx = c.transaction_with_behavior(TransactionBehavior::Immediate)?;
+    enforce_storage_quotas(
+        &tx,
+        &r.vault_id,
+        r.user_id,
+        r.size,
+        storage_quota_bytes,
+        owner_storage_quota_bytes,
+    )?;
     let ts = now_ms();
     tx.execute("INSERT INTO revisions(vault_id,path,relatedpath,extension,hash,ctime,mtime,folder,deleted,size,pieces,content,device,user_id,ts) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)",params![r.vault_id,r.path,r.relatedpath,r.extension,r.hash,r.ctime,r.mtime,r.folder as i64,r.deleted as i64,r.size,r.pieces,content,r.device,r.user_id,ts])?;
     let uid = tx.last_insert_rowid();
@@ -3574,6 +3644,7 @@ mod tests {
                 &test_file_revision("vault", "external", content_len as i64),
                 &staged,
                 MAX_JS_SAFE_INTEGER,
+                MAX_JS_SAFE_INTEGER,
             )
             .unwrap();
         let piece = REVISION_PIECE_SIZE as usize;
@@ -3688,7 +3759,13 @@ mod tests {
         let revision = test_file_revision("vault", "inline", content_len as i64);
         let stored = database
             .with(|connection| {
-                add_revision(connection, &revision, Some(&content), MAX_JS_SAFE_INTEGER)
+                add_revision(
+                    connection,
+                    &revision,
+                    Some(&content),
+                    MAX_JS_SAFE_INTEGER,
+                    MAX_JS_SAFE_INTEGER,
+                )
             })
             .unwrap();
         let piece = REVISION_PIECE_SIZE as usize;
@@ -3746,6 +3823,7 @@ mod tests {
                     &test_file_revision("vault", name, quota),
                     &staged,
                     quota,
+                    quota,
                 )
             }));
         }
@@ -3768,8 +3846,92 @@ mod tests {
         let mut tombstone = test_file_revision("vault", "cleanup", 0);
         tombstone.deleted = true;
         tombstone.hash.clear();
-        database.add_empty_revision(&tombstone, quota).unwrap();
+        database
+            .add_empty_revision(&tombstone, quota, quota)
+            .unwrap();
         assert_eq!(database.stored_ciphertext_size().unwrap(), quota);
+    }
+
+    #[test]
+    fn owner_storage_quota_is_isolated_and_global_quota_remains_independent() {
+        let dir = tempfile::tempdir().unwrap();
+        let database = Db::open(&dir.path().join("owner-storage-quota.sqlite")).unwrap();
+        create_test_vault(&database, "owner-one");
+        let owner_two = database
+            .create_user(
+                "owner-two@example.test",
+                "Owner two",
+                &auth::hash_password("owner-two-password").unwrap(),
+            )
+            .unwrap();
+        database
+            .create_vault_for_user(
+                owner_two,
+                &Vault {
+                    id: "owner-two".into(),
+                    name: "Owner two vault".into(),
+                    keyhash: Some("key".into()),
+                    salt: Some("salt".into()),
+                    host: "localhost:3003".into(),
+                    region: "Blackglass Server".into(),
+                    encryption_version: 3,
+                    size: 0,
+                    created: 1,
+                    password: None,
+                },
+            )
+            .unwrap();
+        let owner_limit = 16;
+        let global_limit = 24;
+
+        for (vault, user_id, byte) in [("owner-one", 1, 0x11), ("owner-two", owner_two, 0x22)] {
+            let staged = dir.path().join(format!("{vault}.part"));
+            std::fs::write(&staged, vec![byte; owner_limit as usize]).unwrap();
+            let mut revision = test_file_revision(vault, "opaque", owner_limit);
+            revision.user_id = user_id;
+            let result = database.add_file_revision(&revision, &staged, global_limit, owner_limit);
+            if user_id == 1 {
+                result.unwrap();
+            } else {
+                assert!(result.as_ref().err().is_some_and(is_storage_quota_exceeded));
+            }
+        }
+        assert_eq!(
+            database.stored_ciphertext_size_for_owner(1).unwrap(),
+            owner_limit
+        );
+        assert_eq!(
+            database
+                .stored_ciphertext_size_for_owner(owner_two)
+                .unwrap(),
+            0
+        );
+
+        let staged = dir.path().join("owner-one-over-limit.part");
+        std::fs::write(&staged, [0x44]).unwrap();
+        let owner_one_extra = test_file_revision("owner-one", "extra", 1);
+        assert!(
+            database
+                .add_file_revision(&owner_one_extra, &staged, global_limit, owner_limit)
+                .as_ref()
+                .err()
+                .is_some_and(is_storage_quota_exceeded)
+        );
+
+        let staged = dir.path().join("owner-two-small.part");
+        std::fs::write(&staged, vec![0x33; 8]).unwrap();
+        let mut revision = test_file_revision("owner-two", "small", 8);
+        revision.user_id = owner_two;
+        database
+            .add_file_revision(&revision, &staged, global_limit, owner_limit)
+            .unwrap();
+        assert_eq!(database.stored_ciphertext_size().unwrap(), global_limit);
+        assert_eq!(
+            database
+                .stored_ciphertext_size_for_owner(owner_two)
+                .unwrap(),
+            8
+        );
     }
 
     #[test]
@@ -3785,6 +3947,7 @@ mod tests {
             .add_file_revision(
                 &test_file_revision("vault", "history", size),
                 &staged,
+                quota,
                 quota,
             )
             .unwrap();
@@ -3951,6 +4114,7 @@ mod tests {
                     device: "test".into(),
                     user_id: 1,
                 },
+                MAX_JS_SAFE_INTEGER,
                 MAX_JS_SAFE_INTEGER,
             )
             .unwrap();
@@ -4176,19 +4340,32 @@ mod tests {
             user_id: 1,
         };
         database
-            .add_empty_revision(&revision("live", "live-1", false), MAX_JS_SAFE_INTEGER)
+            .add_empty_revision(
+                &revision("live", "live-1", false),
+                MAX_JS_SAFE_INTEGER,
+                MAX_JS_SAFE_INTEGER,
+            )
             .unwrap();
         database
-            .add_empty_revision(&revision("live", "live-2", false), MAX_JS_SAFE_INTEGER)
+            .add_empty_revision(
+                &revision("live", "live-2", false),
+                MAX_JS_SAFE_INTEGER,
+                MAX_JS_SAFE_INTEGER,
+            )
             .unwrap();
         database
             .add_empty_revision(
                 &revision("deleted", "deleted-1", false),
                 MAX_JS_SAFE_INTEGER,
+                MAX_JS_SAFE_INTEGER,
             )
             .unwrap();
         let tombstone = database
-            .add_empty_revision(&revision("deleted", "deleted-2", true), MAX_JS_SAFE_INTEGER)
+            .add_empty_revision(
+                &revision("deleted", "deleted-2", true),
+                MAX_JS_SAFE_INTEGER,
+                MAX_JS_SAFE_INTEGER,
+            )
             .unwrap();
         database.checkpoint().unwrap();
         drop(database);
@@ -4255,6 +4432,7 @@ mod tests {
                             user_id: 1,
                         },
                         MAX_JS_SAFE_INTEGER,
+                        MAX_JS_SAFE_INTEGER,
                     )
                     .unwrap();
             }
@@ -4315,6 +4493,7 @@ mod tests {
                     device: "test".into(),
                     user_id: 1,
                 },
+                MAX_JS_SAFE_INTEGER,
                 MAX_JS_SAFE_INTEGER,
             )
             .unwrap();
@@ -4378,7 +4557,9 @@ mod tests {
             device: "test".into(),
             user_id: 1,
         };
-        let stored = db.add_empty_revision(&rev, MAX_JS_SAFE_INTEGER).unwrap();
+        let stored = db
+            .add_empty_revision(&rev, MAX_JS_SAFE_INTEGER, MAX_JS_SAFE_INTEGER)
+            .unwrap();
         assert_eq!(stored.uid, 1);
         assert_eq!(db.current_version("v1").unwrap(), 1);
         db.checkpoint().unwrap();

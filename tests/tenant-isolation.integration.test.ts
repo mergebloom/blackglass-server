@@ -120,10 +120,66 @@ describe("Phase 3 tenant isolation", () => {
     member.json({ op: "usernames" });
     expect(await member.nextJson()).toEqual({ "2": "Member" });
 
+    owner.json({ op: "size" });
+    expect(await owner.nextJson()).toMatchObject({
+      res: "ok",
+      size: 0,
+      limit: 16 * 1024 * 1024,
+      vault_size: 0,
+    });
+
+    const ownerSecond = await Probe.connect(`ws://127.0.0.1:${dataPort}`);
+    ownerSecond.json(init(ownerToken, ownerVault, "Owner second device"));
+    expect(await ownerSecond.nextJson()).toMatchObject({ res: "ok", userId: 1 });
+    expect(await ownerSecond.nextJson()).toMatchObject({ op: "ready" });
+
+    owner.json({
+      op: "push",
+      path: "held-upload",
+      relatedpath: null,
+      extension: "bin",
+      hash: "held-hash",
+      ctime: 1,
+      mtime: 2,
+      folder: false,
+      deleted: false,
+      size: 1,
+      pieces: 1,
+    });
+    expect(await owner.nextJson()).toEqual({ res: "next" });
+    ownerSecond.json({
+      op: "push",
+      path: "denied-upload",
+      relatedpath: null,
+      extension: "bin",
+      hash: "denied-hash",
+      ctime: 1,
+      mtime: 2,
+      folder: false,
+      deleted: false,
+      size: 1,
+      pieces: 1,
+    });
+    expect(await ownerSecond.nextJson()).toEqual({
+      err: "Account upload capacity reached; retry shortly",
+    });
+
+    const ownerOverLimit = await Probe.connect(`ws://127.0.0.1:${dataPort}`);
+    ownerOverLimit.json(init(ownerToken, ownerVault, "Owner over limit"));
+    expect(await ownerOverLimit.nextJson()).toEqual({
+      res: "err",
+      msg: "Account connection capacity reached; retry shortly",
+    });
+    expect((await ownerOverLimit.closed).code).toBe(1013);
+
     const cross = await Probe.connect(`ws://127.0.0.1:${dataPort}`);
     cross.json(init(memberToken, ownerVault, "Cross-tenant device"));
     expect(await cross.nextJson()).toEqual({ res: "err", msg: "Vault not found" });
     expect((await cross.closed).code).toBe(1008);
+    owner.socket.close();
+    ownerSecond.socket.close();
+    member.socket.close();
+    await Promise.all([owner.closed, ownerSecond.closed, member.closed]);
   });
 
   test("P3-REVOKE signout immediately closes only the matching session sockets", async () => {
@@ -214,6 +270,10 @@ function spawnServer() {
       SELFHOST_DATABASE: join(directory, "server.sqlite"),
       SELFHOST_STAGING_DIR: join(directory, "uploads"),
       SELFHOST_PER_FILE_MAX: String(8 * 1024 * 1024),
+      SELFHOST_STORAGE_QUOTA_BYTES: String(32 * 1024 * 1024),
+      SELFHOST_STORAGE_QUOTA_BYTES_PER_OWNER: String(16 * 1024 * 1024),
+      SELFHOST_MAX_WS_CONNECTIONS_PER_USER: "2",
+      SELFHOST_MAX_CONCURRENT_UPLOADS_PER_USER: "1",
       SELFHOST_ALLOWED_ORIGIN: "app://obsidian.md",
       SELFHOST_LOG_FORMAT: "pretty",
     },

@@ -108,7 +108,11 @@ one exact private or loopback IP, never a CIDR. Only set it when that peer is th
 exclusive ingress and overwrites `X-Forwarded-For`; the supplied Caddy example
 does both with `127.0.0.1`. Otherwise leave it unset and add equivalent
 per-source limits at ingress. `SELFHOST_MAX_WS_CONNECTIONS` defaults to 16 and
-is constrained to 1..16 by the qualified memory envelope.
+is constrained to 1..16 by the qualified memory envelope. The independent
+per-user defaults are four WebSockets and two active uploads; neither per-user
+value may exceed its corresponding global limit. Retained ciphertext is
+admitted against both `SELFHOST_STORAGE_QUOTA_BYTES` and the uniform
+`SELFHOST_STORAGE_QUOTA_BYTES_PER_OWNER` ceiling.
 
 ## Read-only admin console
 

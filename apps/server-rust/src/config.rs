@@ -31,11 +31,14 @@ pub struct Config {
     pub staging_dir: PathBuf,
     pub per_file_max: u64,
     pub storage_quota_bytes: i64,
+    pub storage_quota_bytes_per_owner: i64,
     pub session_ttl: Duration,
     pub upload_idle_timeout: Duration,
     pub allowed_origins: Vec<String>,
     pub max_concurrent_uploads: usize,
+    pub max_concurrent_uploads_per_user: usize,
     pub max_ws_connections: usize,
+    pub max_ws_connections_per_user: usize,
     pub trusted_proxy: Option<IpAddr>,
     pub admin: Option<crate::admin::AdminConfig>,
     pub json_logs: bool,
@@ -73,6 +76,15 @@ impl Config {
         let storage_quota_bytes =
             number("SELFHOST_STORAGE_QUOTA_BYTES", DEFAULT_STORAGE_QUOTA_BYTES)?;
         validate_storage_quota(storage_quota_bytes, per_file_max)?;
+        let storage_quota_bytes_per_owner = number(
+            "SELFHOST_STORAGE_QUOTA_BYTES_PER_OWNER",
+            storage_quota_bytes,
+        )?;
+        validate_owner_storage_quota(
+            storage_quota_bytes_per_owner,
+            storage_quota_bytes,
+            per_file_max,
+        )?;
         let session_ttl_seconds = number("SELFHOST_SESSION_TTL_SECONDS", 30 * 24 * 60 * 60u64)?;
         if !(300..=365 * 24 * 60 * 60).contains(&session_ttl_seconds) {
             bail!("SELFHOST_SESSION_TTL_SECONDS must be between 300 seconds and 365 days");
@@ -84,10 +96,28 @@ impl Config {
         validate_upload_idle_timeout(upload_idle_timeout_seconds)?;
         let max_concurrent_uploads = number("SELFHOST_MAX_CONCURRENT_UPLOADS", 4usize)?;
         validate_concurrent_uploads(max_concurrent_uploads)?;
+        let max_concurrent_uploads_per_user = number(
+            "SELFHOST_MAX_CONCURRENT_UPLOADS_PER_USER",
+            max_concurrent_uploads.min(2),
+        )?;
+        validate_per_user_limit(
+            "SELFHOST_MAX_CONCURRENT_UPLOADS_PER_USER",
+            max_concurrent_uploads_per_user,
+            max_concurrent_uploads,
+        )?;
         let max_ws_connections = number("SELFHOST_MAX_WS_CONNECTIONS", DEFAULT_MAX_WS_CONNECTIONS)?;
         if !(1..=MAX_WS_CONNECTIONS_LIMIT).contains(&max_ws_connections) {
             bail!("SELFHOST_MAX_WS_CONNECTIONS must be between 1 and {MAX_WS_CONNECTIONS_LIMIT}");
         }
+        let max_ws_connections_per_user = number(
+            "SELFHOST_MAX_WS_CONNECTIONS_PER_USER",
+            max_ws_connections.min(4),
+        )?;
+        validate_per_user_limit(
+            "SELFHOST_MAX_WS_CONNECTIONS_PER_USER",
+            max_ws_connections_per_user,
+            max_ws_connections,
+        )?;
         let allowed_origins = match (
             value("SELFHOST_ALLOWED_ORIGINS"),
             value("SELFHOST_ALLOWED_ORIGIN"),
@@ -128,11 +158,14 @@ impl Config {
             staging_dir,
             per_file_max,
             storage_quota_bytes,
+            storage_quota_bytes_per_owner,
             session_ttl: Duration::from_secs(session_ttl_seconds),
             upload_idle_timeout: Duration::from_secs(upload_idle_timeout_seconds),
             allowed_origins,
             max_concurrent_uploads,
+            max_concurrent_uploads_per_user,
             max_ws_connections,
+            max_ws_connections_per_user,
             trusted_proxy,
             admin,
             json_logs: value("SELFHOST_LOG_FORMAT").as_deref() != Some("pretty"),
@@ -150,11 +183,14 @@ impl Config {
             staging_dir: root.join("uploads"),
             per_file_max: 8 * 1024 * 1024,
             storage_quota_bytes: DEFAULT_STORAGE_QUOTA_BYTES,
+            storage_quota_bytes_per_owner: DEFAULT_STORAGE_QUOTA_BYTES,
             session_ttl: Duration::from_secs(3600),
             upload_idle_timeout: Duration::from_secs(DEFAULT_UPLOAD_IDLE_TIMEOUT_SECONDS),
             allowed_origins: vec!["app://obsidian.md".into()],
             max_concurrent_uploads: 2,
+            max_concurrent_uploads_per_user: 2,
             max_ws_connections: DEFAULT_MAX_WS_CONNECTIONS,
+            max_ws_connections_per_user: 4,
             trusted_proxy: None,
             admin: None,
             json_logs: false,
@@ -222,6 +258,25 @@ fn validate_storage_quota(value: i64, per_file_max: u64) -> Result<()> {
         bail!(
             "SELFHOST_STORAGE_QUOTA_BYTES must be between {minimum} bytes (one maximum-size encrypted file) and {MAX_JS_SAFE_INTEGER} bytes"
         )
+    }
+    Ok(())
+}
+
+fn validate_owner_storage_quota(value: i64, global: i64, per_file_max: u64) -> Result<()> {
+    validate_storage_quota(value, per_file_max).map_err(|_| {
+        anyhow::anyhow!(
+            "SELFHOST_STORAGE_QUOTA_BYTES_PER_OWNER must hold one maximum-size encrypted file and remain JavaScript-safe"
+        )
+    })?;
+    if value > global {
+        bail!("SELFHOST_STORAGE_QUOTA_BYTES_PER_OWNER must not exceed SELFHOST_STORAGE_QUOTA_BYTES")
+    }
+    Ok(())
+}
+
+fn validate_per_user_limit(name: &str, value: usize, global: usize) -> Result<()> {
+    if value == 0 || value > global {
+        bail!("{name} must be between 1 and its corresponding global limit ({global})")
     }
     Ok(())
 }
@@ -502,6 +557,19 @@ mod tests {
             DEFAULT_STORAGE_QUOTA_BYTES, 1_099_511_627_776,
             "the compatibility default must preserve the previously advertised 1 TiB limit"
         );
+    }
+
+    #[test]
+    fn per_user_resource_limits_never_exceed_global_limits() {
+        validate_per_user_limit("connections", 1, 1).unwrap();
+        validate_per_user_limit("connections", 4, 16).unwrap();
+        assert!(validate_per_user_limit("connections", 0, 16).is_err());
+        assert!(validate_per_user_limit("connections", 5, 4).is_err());
+
+        let per_file_max = 200 * 1024 * 1024u64;
+        let minimum = (per_file_max + AES_GCM_WIRE_OVERHEAD_BYTES) as i64;
+        validate_owner_storage_quota(minimum, minimum, per_file_max).unwrap();
+        assert!(validate_owner_storage_quota(minimum + 1, minimum, per_file_max).is_err());
     }
 
     #[test]

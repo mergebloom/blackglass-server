@@ -28,7 +28,7 @@ use std::{
     path::PathBuf,
     sync::{
         Arc, Mutex as StdMutex,
-        atomic::{AtomicI64, AtomicU64, Ordering},
+        atomic::{AtomicU64, Ordering},
     },
     time::{Duration, Instant, SystemTime, UNIX_EPOCH},
 };
@@ -108,6 +108,7 @@ pub struct AppState {
     events: broadcast::Sender<Event>,
     commit_order: Arc<AsyncMutex<()>>,
     storage_reservations: Arc<StorageReservations>,
+    user_concurrency: Arc<UserConcurrency>,
     uploads: Arc<Semaphore>,
     connections: Arc<Semaphore>,
     auth_checks: Arc<Semaphore>,
@@ -253,6 +254,7 @@ pub async fn run(config: Config) -> Result<()> {
         events,
         commit_order: Arc::new(AsyncMutex::new(())),
         storage_reservations: Arc::new(StorageReservations::default()),
+        user_concurrency: Arc::new(UserConcurrency::default()),
         uploads: Arc::new(Semaphore::new(max_uploads)),
         connections: Arc::new(Semaphore::new(max_connections)),
         auth_checks: Arc::new(Semaphore::new(auth::MAX_CONCURRENT_PASSWORD_CHECKS)),
@@ -979,66 +981,155 @@ struct Session {
     device: String,
     pending: Option<Pending>,
     live: Option<crate::admin::LiveGuard>,
+    _user_connection_permit: Option<UserConcurrencyPermit>,
 }
 
 #[derive(Default)]
 struct StorageReservations {
-    bytes: AtomicI64,
+    state: StdMutex<StorageReservationState>,
+}
+
+#[derive(Default)]
+struct StorageReservationState {
+    global_bytes: i64,
+    owner_bytes: HashMap<i64, i64>,
 }
 
 impl StorageReservations {
     fn reserved(&self) -> i64 {
-        self.bytes.load(Ordering::Acquire)
+        self.state.lock().map_or(0, |state| state.global_bytes)
+    }
+
+    fn reserved_for_owner(&self, user_id: i64) -> i64 {
+        self.state
+            .lock()
+            .ok()
+            .and_then(|state| state.owner_bytes.get(&user_id).copied())
+            .unwrap_or(0)
     }
 
     fn try_reserve(
         self: &Arc<Self>,
-        committed: i64,
+        committed_global: i64,
+        committed_owner: i64,
+        owner_user_id: i64,
         additional: i64,
-        limit: i64,
+        global_limit: i64,
+        owner_limit: i64,
     ) -> Option<StorageReservation> {
-        if committed < 0 || additional <= 0 || limit <= 0 {
+        if committed_global < 0
+            || committed_owner < 0
+            || additional <= 0
+            || global_limit <= 0
+            || owner_limit <= 0
+        {
             return None;
         }
-        let mut reserved = self.bytes.load(Ordering::Acquire);
-        loop {
-            if committed > limit || reserved > limit - committed {
-                return None;
-            }
-            let available = limit - committed - reserved;
-            if additional > available {
-                return None;
-            }
-            match self.bytes.compare_exchange_weak(
-                reserved,
-                reserved + additional,
-                Ordering::AcqRel,
-                Ordering::Acquire,
-            ) {
-                Ok(_) => {
-                    return Some(StorageReservation {
-                        bytes: additional,
-                        reservations: self.clone(),
-                    });
-                }
-                Err(actual) => reserved = actual,
-            }
+        let mut state = self.state.lock().ok()?;
+        let owner_reserved = state.owner_bytes.get(&owner_user_id).copied().unwrap_or(0);
+        if committed_global > global_limit
+            || state.global_bytes > global_limit - committed_global
+            || additional > global_limit - committed_global - state.global_bytes
+            || committed_owner > owner_limit
+            || owner_reserved > owner_limit - committed_owner
+            || additional > owner_limit - committed_owner - owner_reserved
+        {
+            return None;
         }
+        state.global_bytes += additional;
+        *state.owner_bytes.entry(owner_user_id).or_default() += additional;
+        Some(StorageReservation {
+            owner_user_id,
+            bytes: additional,
+            reservations: self.clone(),
+        })
     }
 }
 
 struct StorageReservation {
+    owner_user_id: i64,
     bytes: i64,
     reservations: Arc<StorageReservations>,
 }
 
 impl Drop for StorageReservation {
     fn drop(&mut self) {
-        let previous = self
-            .reservations
-            .bytes
-            .fetch_sub(self.bytes, Ordering::AcqRel);
-        debug_assert!(previous >= self.bytes);
+        if let Ok(mut state) = self.reservations.state.lock() {
+            debug_assert!(state.global_bytes >= self.bytes);
+            state.global_bytes = state.global_bytes.saturating_sub(self.bytes);
+            if let Some(owner_bytes) = state.owner_bytes.get_mut(&self.owner_user_id) {
+                debug_assert!(*owner_bytes >= self.bytes);
+                *owner_bytes = owner_bytes.saturating_sub(self.bytes);
+                if *owner_bytes == 0 {
+                    state.owner_bytes.remove(&self.owner_user_id);
+                }
+            }
+        }
+    }
+}
+
+#[derive(Default)]
+struct UserConcurrency {
+    entries: StdMutex<HashMap<i64, UserConcurrencyEntry>>,
+}
+
+#[derive(Default)]
+struct UserConcurrencyEntry {
+    connections: usize,
+    uploads: usize,
+}
+
+#[derive(Clone, Copy)]
+enum UserConcurrencyKind {
+    Connection,
+    Upload,
+}
+
+impl UserConcurrency {
+    fn try_acquire(
+        self: &Arc<Self>,
+        user_id: i64,
+        kind: UserConcurrencyKind,
+        limit: usize,
+    ) -> Option<UserConcurrencyPermit> {
+        let mut entries = self.entries.lock().ok()?;
+        let entry = entries.entry(user_id).or_default();
+        let count = match kind {
+            UserConcurrencyKind::Connection => &mut entry.connections,
+            UserConcurrencyKind::Upload => &mut entry.uploads,
+        };
+        if *count >= limit {
+            return None;
+        }
+        *count += 1;
+        Some(UserConcurrencyPermit {
+            user_id,
+            kind,
+            limits: self.clone(),
+        })
+    }
+}
+
+struct UserConcurrencyPermit {
+    user_id: i64,
+    kind: UserConcurrencyKind,
+    limits: Arc<UserConcurrency>,
+}
+
+impl Drop for UserConcurrencyPermit {
+    fn drop(&mut self) {
+        if let Ok(mut entries) = self.limits.entries.lock()
+            && let Some(entry) = entries.get_mut(&self.user_id)
+        {
+            let count = match self.kind {
+                UserConcurrencyKind::Connection => &mut entry.connections,
+                UserConcurrencyKind::Upload => &mut entry.uploads,
+            };
+            *count = count.saturating_sub(1);
+            if entry.connections == 0 && entry.uploads == 0 {
+                entries.remove(&self.user_id);
+            }
+        }
     }
 }
 
@@ -1051,6 +1142,7 @@ struct Pending {
     idle_deadline: TokioInstant,
     _storage_reservation: StorageReservation,
     _permit: tokio::sync::OwnedSemaphorePermit,
+    _user_upload_permit: UserConcurrencyPermit,
 }
 
 async fn socket_loop(
@@ -1072,6 +1164,7 @@ async fn socket_loop(
         device: "Unknown device".into(),
         pending: None,
         live: None,
+        _user_connection_permit: None,
     };
     let mut source_permit = Some(source_permit);
     let authentication_deadline = tokio::time::sleep(AUTHENTICATION_DEADLINE);
@@ -1257,11 +1350,17 @@ async fn handle_message(
                 "ping" => send(tx, json!({"op":"pong"})).await?,
                 "size" => {
                     let vault = session.vault.clone().unwrap();
+                    let user_id = session
+                        .user_id
+                        .context("authenticated session has no user ID")?;
                     let (size, vault_size) = db_task(s, move |db| {
-                        Ok((db.stored_ciphertext_size()?, db.vault_size(&vault)?))
+                        Ok((
+                            db.stored_ciphertext_size_for_owner(user_id)?,
+                            db.vault_size(&vault)?,
+                        ))
                     })
                     .await?;
-                    send(tx,json!({"res":"ok","size":size,"limit":s.config.storage_quota_bytes,"vault_size":vault_size})).await?
+                    send(tx,json!({"res":"ok","size":size,"limit":s.config.storage_quota_bytes_per_owner,"vault_size":vault_size})).await?
                 }
                 "usernames" => {
                     let vault = session.vault.clone().unwrap();
@@ -1275,8 +1374,11 @@ async fn handle_message(
                 "restore" => restore(s, session, events, tx, v).await?,
                 "purge" => {
                     let vault = session.vault.clone().unwrap();
+                    let user_id = session
+                        .user_id
+                        .context("authenticated session has no user ID")?;
                     let _commit = s.commit_order.lock().await;
-                    db_task(s, move |db| db.purge(&vault)).await?;
+                    db_task(s, move |db| db.purge_for_user(user_id, &vault)).await?;
                     drop(_commit);
                     send(tx, json!({"res":"ok"})).await?
                 }
@@ -1390,10 +1492,23 @@ async fn init(
         },
     };
     let auth_context = auth_context.unwrap();
+    let Some(user_connection_permit) = s.user_concurrency.try_acquire(
+        auth_context.user_id,
+        UserConcurrencyKind::Connection,
+        s.config.max_ws_connections_per_user,
+    ) else {
+        send(
+            tx,
+            json!({"res":"err","msg":"Account connection capacity reached; retry shortly"}),
+        )
+        .await?;
+        return close(tx, 1013, "Account connection capacity reached").await;
+    };
     session.authenticated = true;
     session.token_hash = Some(auth_context.token_hash.clone());
     session.user_id = Some(auth_context.user_id);
     session.expires_at = Some(auth_context.expires_at);
+    session._user_connection_permit = Some(user_connection_permit);
     session.vault = Some(vault.id.clone());
     session.device = bounded(
         v.get("device")
@@ -1546,8 +1661,9 @@ async fn begin_push(
         let notice = {
             let _commit = s.commit_order.lock().await;
             let storage_quota_bytes = s.config.storage_quota_bytes;
+            let owner_storage_quota_bytes = s.config.storage_quota_bytes_per_owner;
             let stored = match db_task(s, move |db| {
-                db.add_empty_revision(&revision, storage_quota_bytes)
+                db.add_empty_revision(&revision, storage_quota_bytes, owner_storage_quota_bytes)
             })
             .await
             {
@@ -1575,14 +1691,41 @@ async fn begin_push(
             return Ok(());
         }
     };
+    let user_id = revision.user_id;
+    let Some(user_upload_permit) = s.user_concurrency.try_acquire(
+        user_id,
+        UserConcurrencyKind::Upload,
+        s.config.max_concurrent_uploads_per_user,
+    ) else {
+        drop(permit);
+        send(
+            tx,
+            json!({"err":"Account upload capacity reached; retry shortly"}),
+        )
+        .await?;
+        return Ok(());
+    };
     let storage_reservation = {
         let _commit = s.commit_order.lock().await;
-        let committed = db_task(s, |db| db.stored_ciphertext_size()).await?;
-        s.storage_reservations
-            .try_reserve(committed, revision.size, s.config.storage_quota_bytes)
+        let (committed_global, committed_owner) = db_task(s, move |db| {
+            Ok((
+                db.stored_ciphertext_size()?,
+                db.stored_ciphertext_size_for_owner(user_id)?,
+            ))
+        })
+        .await?;
+        s.storage_reservations.try_reserve(
+            committed_global,
+            committed_owner,
+            user_id,
+            revision.size,
+            s.config.storage_quota_bytes,
+            s.config.storage_quota_bytes_per_owner,
+        )
     };
     let Some(storage_reservation) = storage_reservation else {
         drop(permit);
+        drop(user_upload_permit);
         reject_storage_quota(s, tx).await?;
         return Ok(());
     };
@@ -1600,6 +1743,7 @@ async fn begin_push(
         idle_deadline: TokioInstant::now() + s.config.upload_idle_timeout,
         _storage_reservation: storage_reservation,
         _permit: permit,
+        _user_upload_permit: user_upload_permit,
     });
     send(tx, json!({"res":"next"})).await?;
     Ok(())
@@ -1646,10 +1790,16 @@ async fn upload_chunk(
     let path = pending.path.clone();
     let storage_reservation = pending._storage_reservation;
     let storage_quota_bytes = s.config.storage_quota_bytes;
+    let owner_storage_quota_bytes = s.config.storage_quota_bytes_per_owner;
     let commit_result = {
         let _commit = s.commit_order.lock().await;
         let result = db_task(s, move |db| {
-            db.add_file_revision(&revision, &path, storage_quota_bytes)
+            db.add_file_revision(
+                &revision,
+                &path,
+                storage_quota_bytes,
+                owner_storage_quota_bytes,
+            )
         })
         .await
         .and_then(|stored| {
@@ -1931,10 +2081,20 @@ async fn restore(
             .user_id
             .context("authenticated session has no user ID")?;
         let storage_quota_bytes = s.config.storage_quota_bytes;
-        let reserved = s.storage_reservations.reserved();
-        let restore_quota_bytes = storage_quota_bytes.saturating_sub(reserved);
+        let owner_storage_quota_bytes = s.config.storage_quota_bytes_per_owner;
+        let reserved_global = s.storage_reservations.reserved();
+        let reserved_owner = s.storage_reservations.reserved_for_owner(user_id);
+        let restore_global_quota_bytes = storage_quota_bytes.saturating_sub(reserved_global);
+        let restore_owner_quota_bytes = owner_storage_quota_bytes.saturating_sub(reserved_owner);
         match db_task(s, move |db| {
-            db.restore_for_user(user_id, &vault, uid, &device, restore_quota_bytes)
+            db.restore_for_user(
+                user_id,
+                &vault,
+                uid,
+                &device,
+                restore_global_quota_bytes,
+                restore_owner_quota_bytes,
+            )
         })
         .await
         {
@@ -2596,6 +2756,7 @@ mod tests {
                 events: broadcast::channel(EVENT_CAPACITY).0,
                 commit_order: Arc::new(AsyncMutex::new(())),
                 storage_reservations: Arc::new(StorageReservations::default()),
+                user_concurrency: Arc::new(UserConcurrency::default()),
                 uploads: Arc::new(Semaphore::new(max_uploads)),
                 connections: Arc::new(Semaphore::new(max_connections)),
                 auth_checks: Arc::new(Semaphore::new(auth::MAX_CONCURRENT_PASSWORD_CHECKS)),
@@ -2636,19 +2797,50 @@ mod tests {
     #[test]
     fn storage_reservations_are_bounded_and_release_on_drop() {
         let reservations = Arc::new(StorageReservations::default());
-        let first = reservations.try_reserve(16, 32, 64).unwrap();
+        let first = reservations.try_reserve(16, 16, 1, 32, 64, 64).unwrap();
         assert_eq!(reservations.reserved(), 32);
-        assert!(reservations.try_reserve(16, 17, 64).is_none());
-        let second = reservations.try_reserve(16, 16, 64).unwrap();
+        assert_eq!(reservations.reserved_for_owner(1), 32);
+        assert!(reservations.try_reserve(16, 16, 1, 17, 64, 64).is_none());
+        let second = reservations.try_reserve(16, 16, 2, 16, 64, 64).unwrap();
         assert_eq!(reservations.reserved(), 48);
-        assert!(reservations.try_reserve(16, 1, 64).is_none());
+        assert!(reservations.try_reserve(16, 16, 2, 1, 64, 32).is_none());
         drop(first);
         assert_eq!(reservations.reserved(), 16);
-        let third = reservations.try_reserve(16, 32, 64).unwrap();
+        let third = reservations.try_reserve(16, 16, 1, 32, 64, 64).unwrap();
         assert_eq!(reservations.reserved(), 48);
         drop(second);
         drop(third);
         assert_eq!(reservations.reserved(), 0);
+    }
+
+    #[test]
+    fn per_user_concurrency_is_isolated_and_releases_on_drop() {
+        let limits = Arc::new(UserConcurrency::default());
+        let first = limits
+            .try_acquire(1, UserConcurrencyKind::Connection, 1)
+            .unwrap();
+        assert!(
+            limits
+                .try_acquire(1, UserConcurrencyKind::Connection, 1)
+                .is_none()
+        );
+        let other = limits
+            .try_acquire(2, UserConcurrencyKind::Connection, 1)
+            .unwrap();
+        let upload = limits
+            .try_acquire(1, UserConcurrencyKind::Upload, 1)
+            .unwrap();
+        assert!(
+            limits
+                .try_acquire(1, UserConcurrencyKind::Upload, 1)
+                .is_none()
+        );
+        drop(first);
+        let replacement = limits
+            .try_acquire(1, UserConcurrencyKind::Connection, 1)
+            .unwrap();
+        drop((replacement, other, upload));
+        assert!(limits.entries.lock().unwrap().is_empty());
     }
 
     #[test]
