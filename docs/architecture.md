@@ -4,7 +4,7 @@
 
 Provide a stable, self-hosted implementation of the Sync control and data
 planes expected by qualified Obsidian desktop clients. Client-release analysis
-and adaptation live separately in Blackglass Bridge.
+and adaptation live separately in Blackglass.
 
 ## Control plane
 
@@ -59,7 +59,7 @@ visible.
 
 ## Compatibility boundary
 
-Blackglass Server owns the durable protocol contract. Blackglass Bridge owns
+Blackglass Server owns the durable protocol contract. Blackglass owns
 release-specific endpoint changes and qualifies each new desktop renderer.
 That boundary allows server upgrades and client-release maintenance to proceed
 independently. Unknown client protocol changes must fail qualification rather

@@ -16,7 +16,7 @@ privacy without dependence on Obsidian's hosted Sync infrastructure. End-to-end
 encryption protects vault contents; as noted in the security model below, the
 server can still observe some metadata.
 
-The stable server/client boundary and Blackglass Bridge's small, fail-closed
+The stable server/client boundary and Blackglass's small, fail-closed
 endpoint adaptation are designed to make qualification of future Obsidian
 releases repeatable and low-maintenance rather than a continuing fork of the
 application.
@@ -46,7 +46,7 @@ listeners. Native installs and the OCI image default to loopback. The supported
 Linux Docker deployment uses host networking so host Caddy can reach those
 listeners without publishing plaintext ports. Caddy is the only public
 listener. SQLite stores opaque ciphertext and protocol state behind an atomic
-retained-history quota. Blackglass Bridge owns the small,
+retained-history quota. Blackglass owns the small,
 release-specific client endpoint adapter.
 
 See [architecture](docs/architecture.md) for the component and trust boundaries.

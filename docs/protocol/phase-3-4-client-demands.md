@@ -12,7 +12,7 @@ Evidence:
 - Published compressed SHA-256: `75dd34f14c9db558fbad19e80f0b201bc9805b51b7388370277e0f91a38bd850`
 - Verified decompressed ASAR SHA-256: `2b2483b2e1246772e0d25367ec055cbc5047ea2f0091b667c35656678f86d712`
 - Package version read from the archive: `1.12.7`
-- Blackglass Bridge analyzer result: all six exact patch anchors matched once and the release was patch-ready.
+- Blackglass analyzer result: all six exact patch anchors matched once and the release was patch-ready.
 - Machine-readable scrubbed evidence: [`../validation/obsidian-1.12.7-phase-3-4-client-demand.json`](../validation/obsidian-1.12.7-phase-3-4-client-demand.json)
 - Obsidian 1.13.4 official DMG SHA-256: `e84b9595aba5e50221c97e43d3e3f437416edfbf4c4a84c379461e70f854d78f`
 - Obsidian 1.13.4 verified renderer ASAR SHA-256: `51218495ad940a8515b202d380bde638be6570a198e121f7ca6d484a8a158917`

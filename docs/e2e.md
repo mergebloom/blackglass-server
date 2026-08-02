@@ -2,7 +2,7 @@
 
 Blackglass Server owns the automated protocol, migration, recovery, backup,
 security-limit, and resource gates for the Rust/SQLite service. The companion
-Blackglass Bridge repository owns qualification of an exact macOS client app
+Blackglass repository owns qualification of an exact macOS client app
 against an exact server binary.
 
 This separation keeps server validation reproducible without committing
@@ -35,7 +35,7 @@ bun run check
 bun run server:measure
 ```
 
-Then follow `docs/e2e.md` in the companion Blackglass Bridge checkout, passing
+Then follow `docs/e2e.md` in the companion Blackglass checkout, passing
 the exact `blackglass-server` binary produced from the commit being qualified.
 That procedure creates the two clients, performs restart and source-loss
 recovery, verifies artifact identities, and emits the sanitized validation

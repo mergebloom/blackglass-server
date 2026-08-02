@@ -32,7 +32,7 @@ The phases are separate production releases. Phase 4 cannot begin implementation
 
 ### Task 0.1 — Extend the protocol inventory
 
-Repository: `blackglass-bridge`.
+Repository: `blackglass`.
 
 Update:
 
@@ -58,7 +58,7 @@ Do not store or redistribute renderer source. Generated evidence may contain rou
 
 Merge in this order so the observed Bridge contract is the source for the server fixture:
 
-1. In `blackglass-bridge`, extend `tests/client-adapter.test.ts` and `tools/analyze-release.ts` with scrubbed shape assertions.
+1. In `blackglass`, extend `tests/client-adapter.test.ts` and `tools/analyze-release.ts` with scrubbed shape assertions.
 2. In `blackglass-server`, update `packages/protocol/src/control.ts`, `packages/protocol/src/sync.ts`, and add the matching cases to `tests/client-contract.integration.test.ts`.
 
 Add typed fixtures for:
@@ -622,7 +622,7 @@ Create these named suites rather than extending one undifferentiated integration
 - `tests/collaboration.integration.test.ts`: `P4-SHARE`, `P4-INVENTORY`, `P4-ATTRIBUTION`, `P4-DATA`, `P4-REVOKE`, `P4-RACES`, and `P4-MIGRATE`.
 - `tests/database-migration.integration.test.ts`: `P3-MIGRATE-V5`, `P4-MIGRATE-V6`, source preservation, pre-activation rollback, and post-activation roll-forward fixtures.
 - Rust unit tests beside `auth.rs`, `db.rs`, and `server.rs`: email canonicalization, password/session lifecycle, `VaultAccess`, SQL scoping, foreign-key invariants, quota transactions, event audiences, and invalidation races.
-- Blackglass Bridge contract tests: the `CLIENT-1127-*` fixtures plus matching `CLIENT-1134-*` fixtures, including `CLIENT-1134-POW-UNSUPPORTED`.
+- Blackglass contract tests: the `CLIENT-1127-*` fixtures plus matching `CLIENT-1134-*` fixtures, including `CLIENT-1134-POW-UNSUPPORTED`.
 - Exact-client macOS scenarios: `E2E-P3-TENANCY`, `E2E-P4-CUSTOM-E2EE`, and `E2E-P4-MANAGED-ENCRYPTION`. The two Phase 4 scenarios each use owner A, collaborator B, and outsider C; managed encryption is not allowed to pass solely through a protocol mock.
 
 Each requirement has one release-blocking owner:
@@ -650,7 +650,7 @@ bun test tests/collaboration.integration.test.ts
 git diff --check
 ```
 
-Minimum Bridge commands from `blackglass-bridge`:
+Minimum Bridge commands from `blackglass`:
 
 ```sh
 bun run check
