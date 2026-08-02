@@ -1,12 +1,12 @@
 {
   "schemaVersion": 1,
-  "serverVersion": "0.4.2",
+  "serverVersion": "0.4.3",
   "database": {
     "supportedSourceSchemas": [5],
     "destinationSchema": 6
   },
   "previousRollbackTag": "v0.3.0",
-  "clientToolingRevision": "58d3278a072cd1e736d4a32e354fce1f285c7d1a",
+  "clientToolingRevision": "f30c273abfc7d32c355d3509188ca2d781cbd2f6",
   "qualifiedRenderers": [
     {
       "version": "1.12.7",

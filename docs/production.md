@@ -203,8 +203,8 @@ storage contention, an undersized host, or an unexpectedly expensive query.
 Alert on `blackglass_share_invites_total{outcome="rate_limited"}`. The fixed
 outcome labels contain no email address, user ID, vault ID, or target digest.
 
-The `v0.4.2` archive includes `release-contract.json`. Release automation
-checks that it binds server 0.4.2 to schema 6 and schema-5 migration input,
+The `v0.4.3` archive includes `release-contract.json`. Release automation
+checks that it binds server 0.4.3 to schema 6 and schema-5 migration input,
 the previous rollback tag, the exact client tooling revision, both qualified
 renderer baselines, and the required primary/recovery monitoring selectors.
 
