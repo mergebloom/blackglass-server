@@ -347,6 +347,7 @@ fn control_router(state: AppState) -> Router {
     let mut r = Router::new();
     for path in [
         "/user/signin",
+        "/user/pow-challenge",
         "/user/signout",
         "/user/info",
         "/subscription/list",
@@ -561,9 +562,10 @@ async fn control(
     let source = request_source(&s.config, peer, &headers);
     let result = match uri.path() {
         "/user/signin" => signin(&s, source, value).await,
-        "/user/signup" | "/user/forgetpass" | "/user/resendconfirmation" => {
-            Err(ADMIN_MANAGED_ACCOUNT_ERROR.into())
-        }
+        "/user/pow-challenge"
+        | "/user/signup"
+        | "/user/forgetpass"
+        | "/user/resendconfirmation" => Err(ADMIN_MANAGED_ACCOUNT_ERROR.into()),
         _ => authorized_control(&s, uri.path(), value).await,
     };
     match result {

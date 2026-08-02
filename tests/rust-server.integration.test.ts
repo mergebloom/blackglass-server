@@ -98,7 +98,12 @@ describe("production Rust server", () => {
       license: null,
     });
     expect(await post("/subscription/list", { token })).toEqual({ sync: true, publish: false });
-    for (const path of ["/user/signup", "/user/forgetpass", "/user/resendconfirmation"]) {
+    for (const path of [
+      "/user/pow-challenge",
+      "/user/signup",
+      "/user/forgetpass",
+      "/user/resendconfirmation",
+    ]) {
       expect(await post(path, {})).toEqual({
         error: "Accounts are managed by the Blackglass Server administrator",
       });
@@ -175,6 +180,7 @@ describe("production Rust server", () => {
         "/subscription/sync/signup-mobile",
         "Mobile Sync signup is unavailable on a self-hosted server",
       ],
+      ["/user/pow-challenge", "Accounts are managed by the Blackglass Server administrator"],
       ["/user/authtoken", "Accounts are managed by the Blackglass Server administrator"],
     ] as const;
 

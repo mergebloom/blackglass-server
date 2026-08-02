@@ -1,4 +1,5 @@
 export const CONTROL_ROUTES = {
+  powChallenge: "/user/pow-challenge",
   signin: "/user/signin",
   signout: "/user/signout",
   userInfo: "/user/info",
@@ -22,6 +23,10 @@ export interface SigninRequest {
 
 export interface TokenRequest {
   token: string;
+}
+
+export interface VaultListRequest extends TokenRequest {
+  supported_encryption_version: number;
 }
 
 export interface VaultCreateRequest extends TokenRequest {
@@ -50,6 +55,39 @@ export interface RemoteVault {
   size: number;
   created: number;
   password?: string;
+}
+
+export interface SharedRemoteVault extends RemoteVault {
+  share_uid: number;
+}
+
+export interface VaultListResponse {
+  vaults: RemoteVault[];
+  shared: SharedRemoteVault[];
+  limit: number;
+}
+
+export interface VaultShareListRequest extends TokenRequest {
+  vault_uid: string;
+}
+
+export interface VaultShareInviteRequest extends VaultShareListRequest {
+  email: string;
+}
+
+export interface VaultShareRemoveRequest extends VaultShareListRequest {
+  share_uid: number;
+}
+
+export interface VaultShareItem {
+  uid: number;
+  email: string;
+  name: string;
+  accepted: boolean;
+}
+
+export interface VaultShareListResponse {
+  shares: VaultShareItem[];
 }
 
 export interface VaultRenameRequest extends TokenRequest {

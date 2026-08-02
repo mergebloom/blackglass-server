@@ -1,10 +1,10 @@
-# Obsidian 1.12.7 client demands for Blackglass Phase 3 and Phase 4
+# Stock client demands for Blackglass Phase 3 and Phase 4
 
-Status: static contract validated on 2026-07-30; multi-user and collaboration runtime qualification remains an implementation gate.
+Status: static contract validated for the Obsidian 1.12.7 compatibility floor and 1.13.4 candidate; multi-user and collaboration runtime qualification remains an implementation gate.
 
 ## Scope and evidence
 
-This document records what the stock Obsidian 1.12.7 renderer actually asks of the server. It is a compatibility contract, not an attempt to reproduce or publish proprietary client source.
+This document records what the stock Obsidian 1.12.7 and 1.13.4 renderers actually ask of the server. It is a compatibility contract, not an attempt to reproduce or publish proprietary client source. Unless a version-specific delta is called out, the contract is common to both releases.
 
 Evidence:
 
@@ -14,6 +14,9 @@ Evidence:
 - Package version read from the archive: `1.12.7`
 - Blackglass Bridge analyzer result: all six exact patch anchors matched once and the release was patch-ready.
 - Machine-readable scrubbed evidence: [`../validation/obsidian-1.12.7-phase-3-4-client-demand.json`](../validation/obsidian-1.12.7-phase-3-4-client-demand.json)
+- Obsidian 1.13.4 official DMG SHA-256: `e84b9595aba5e50221c97e43d3e3f437416edfbf4c4a84c379461e70f854d78f`
+- Obsidian 1.13.4 verified renderer ASAR SHA-256: `51218495ad940a8515b202d380bde638be6570a198e121f7ca6d484a8a158917`
+- The companion Bridge repository's reviewed `compatibility/obsidian-1.13.4.json` baseline and versioned protocol delta.
 - Existing Blackglass protocol notes and deterministic integration tests.
 - [Obsidian's public collaboration documentation](https://obsidian.md/help/sync/collaborate) and [Sync security documentation](https://obsidian.md/help/sync/security), used only to explain user-visible semantics. The client artifact remains the protocol authority.
 
@@ -40,6 +43,8 @@ The client requires at least:
 - `/subscription/list`: request field `token`; `sync: true` enables the client to connect to a remote vault.
 
 The stock renderer also contains signup, password-reset, confirmation, auth-token, mobile-subscription, business-subscription, Publish, and regions routes. Blackglass may continue returning explicit unsupported responses for flows outside the self-hosted product contract. Phase 3 must not accidentally expose public self-signup or password reset merely because the route strings exist.
+
+Obsidian 1.13.4 additionally calls `/user/pow-challenge` from its self-service signup flow. Normal sign-in does not use that route. Blackglass recognizes it and returns the same stable administrator-managed-account error as the other disabled signup routes; it does not perform proof-of-work or password hashing for that request.
 
 ### Vault inventory
 
