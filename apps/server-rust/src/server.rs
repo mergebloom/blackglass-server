@@ -231,9 +231,7 @@ pub async fn run(config: Config) -> Result<()> {
     let _database_lock = acquire_database_lock(&config.database_path)?;
     let _staging_lock = acquire_path_lock(&config.staging_dir, "staging")?;
     prepare_staging(&config.staging_dir)?;
-    let initial_user =
-        crate::db::InitialUser::new(&config.email, &config.display_name, &config.password_hash)?;
-    let db = Db::open_with_initial_user(&config.database_path, &initial_user)?;
+    let db = Db::open_existing(&config.database_path)?;
     let configured_host = config.public_data_host.clone();
     let mismatched_hosts = db
         .mismatched_data_hosts(&configured_host)
@@ -641,7 +639,7 @@ async fn signin(s: &AppState, source: IpAddr, v: Value) -> std::result::Result<V
         .as_ref()
         .filter(|user| user.active)
         .map(|user| user.password_hash.clone())
-        .unwrap_or_else(|| s.config.password_hash.clone());
+        .unwrap_or_else(|| auth::DUMMY_PASSWORD_HASH.to_owned());
     let password_ok = tokio::task::spawn_blocking(move || {
         let valid = auth::verify_password(&password, &encoded);
         drop((permit, bulk_memory));

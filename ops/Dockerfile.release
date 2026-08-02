@@ -68,15 +68,15 @@ RUN /target/release/blackglass-server build-info \
 # both listeners, and readiness. The password is fixed test data in a disposable
 # build layer, not a production credential.
 RUN set -eu; \
-    password_hash=$(printf '%s\n' release-smoke-password | /target/release/blackglass-server hash-password); \
+    printf '%s\n' release-smoke-password \
+        | /target/release/blackglass-server user create \
+            /tmp/blackglass-smoke.sqlite release-smoke@example.test 'Release smoke user'; \
     SELFHOST_BIND_HOST=127.0.0.1 \
     SELFHOST_CONTROL_PORT=3100 \
     SELFHOST_DATA_PORT=3103 \
     SELFHOST_DATA_HOST=127.0.0.1:3103 \
     SELFHOST_DATABASE=/tmp/blackglass-smoke.sqlite \
     SELFHOST_STAGING_DIR=/tmp/blackglass-smoke-uploads \
-    SELFHOST_EMAIL=release-smoke@example.test \
-    SELFHOST_PASSWORD_HASH="$password_hash" \
     SELFHOST_LOG_FORMAT=pretty \
     /target/release/blackglass-server serve >/tmp/blackglass-smoke.log 2>&1 & \
     server_pid=$!; \

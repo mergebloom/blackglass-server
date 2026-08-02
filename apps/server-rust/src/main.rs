@@ -5,7 +5,7 @@ mod db;
 mod model;
 mod server;
 
-use anyhow::{Result, bail};
+use anyhow::{Context, Result, bail};
 use std::{
     io::{self, Read},
     path::PathBuf,
@@ -67,10 +67,24 @@ async fn main() -> Result<()> {
         [scope, command, database, email, name] if scope == "user" && command == "create" => {
             let database = PathBuf::from(database);
             let _database_lock = server::acquire_database_lock(&database)?;
-            let db = db::Db::open_offline_under_lock(&database)?;
             let password = read_password()?;
             let password_hash = auth::hash_password(&password)?;
-            let user_id = db.create_user(email, name, &password_hash)?;
+            let user_id = match std::fs::symlink_metadata(&database) {
+                Ok(_) => {
+                    let db = db::Db::open_offline_under_lock(&database)?;
+                    db.create_user(email, name, &password_hash)?
+                }
+                Err(error) if error.kind() == io::ErrorKind::NotFound => {
+                    let initial_user = db::InitialUser::new(email, name, &password_hash)?;
+                    let db = db::Db::initialize(&database, &initial_user)?;
+                    db.list_users()?
+                        .into_iter()
+                        .next()
+                        .context("initialized database has no user")?
+                        .id
+                }
+                Err(error) => return Err(error.into()),
+            };
             println!("created user: {user_id}");
             Ok(())
         }

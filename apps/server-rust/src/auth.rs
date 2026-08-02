@@ -11,6 +11,7 @@ const MAX_ARGON2_TIME_COST: u32 = 5;
 const MIN_ARGON2_PARALLELISM: u32 = 1;
 const MAX_ARGON2_PARALLELISM: u32 = 4;
 const MAX_PASSWORD_HASH_LENGTH: usize = 512;
+pub(crate) const DUMMY_PASSWORD_HASH: &str = "$argon2id$v=19$m=19456,t=2,p=1$5fbyOApt3Wwi327kSXBbGw$cBqxvjLMOlreSy3VIuQIfNEnwiaqznZKxx3KzdzK2Us";
 pub(crate) const MAX_EMAIL_BYTES: usize = 254;
 pub(crate) const MAX_DISPLAY_NAME_BYTES: usize = 128;
 pub(crate) const MAX_CONCURRENT_PASSWORD_CHECKS: usize = 1;

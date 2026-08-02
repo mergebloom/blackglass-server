@@ -2,13 +2,13 @@
 
 ## Supported production shape
 
-The production target is deliberately narrow: one owner, end-to-end-encrypted
-vaults, one Rust process, one SQLite database, and one static node. Publish,
-public registration, sharing, high availability, and mobile clients are not
-supported in this phase. Both custom-password and managed-encryption vaults are
-compatible. Prefer a custom vault password when the server operator must not be
-able to derive the vault key; managed mode stores its generated recovery
-password in SQLite and backups.
+The production target is deliberately narrow: administrator-provisioned local
+accounts with isolated end-to-end-encrypted vaults, one Rust process, one
+SQLite database, and one static node. Publish, public registration, sharing,
+high availability, and mobile clients are not supported in this phase. Both
+custom-password and managed-encryption vaults are compatible. Prefer a custom
+vault password when the server operator must not be able to derive the vault
+key; managed mode stores its generated recovery password in SQLite and backups.
 
 Native installs have two loopback listeners. A TLS reverse proxy is the only
 public listener:
@@ -52,20 +52,26 @@ sudo install -m 0755 \
   /opt/blackglass-server/
 ```
 
-Generate the password hash without putting the password in a process argument:
+Initialize the database and first account offline without putting the password
+in a process argument:
 
 ```sh
+sudo systemd-sysusers ./ops/blackglass-server.sysusers.conf
+sudo install -d -o blackglass-server -g blackglass-server -m 0700 \
+  /var/lib/blackglass-server
 read -r -s account_password
-printf '%s' "$account_password" | \
-  /opt/blackglass-server/blackglass-server hash-password
+printf '%s' "$account_password" | sudo -u blackglass-server \
+  /opt/blackglass-server/blackglass-server user create \
+  /var/lib/blackglass-server/server.sqlite owner@example.com 'Vault owner'
 unset account_password
 ```
 
 Copy `ops/blackglass-server.env.example` to
 `/etc/blackglass-server/server.env`, replace
-the sample values, and set its owner to root and mode to 0600. The service will
-not accept a plaintext production password. Sessions are random 256-bit bearer
-tokens; only SHA-256 token digests, expiry, and revocation state are stored.
+the sample values, and set its owner to root and mode to 0600. Account
+credentials live only in SQLite and are changed through offline `user`
+commands. Sessions are random 256-bit bearer tokens; only SHA-256 token
+digests, user IDs, expiry, and revocation state are stored.
 Imported password hashes must use Argon2id v=19 with bounded work parameters:
 `m=19456..65536`, `t=2..5`, and `p=1..4`. Hashes outside those limits are
 rejected before password verification to prevent an unsafe operator value from
@@ -97,7 +103,7 @@ the same time as the plural variable. Never use wildcard CORS.
 One Argon2 password check runs at a time, with at most eight fair queued
 waiters. The server also admits six sign-in attempts per real source in a
 60-second window and at most four unauthenticated WebSockets per source;
-successful owner sign-in refunds its attempt. `SELFHOST_TRUSTED_PROXY` accepts
+successful sign-in refunds its attempt. `SELFHOST_TRUSTED_PROXY` accepts
 one exact private or loopback IP, never a CIDR. Only set it when that peer is the
 exclusive ingress and overwrites `X-Forwarded-For`; the supplied Caddy example
 does both with `127.0.0.1`. Otherwise leave it unset and add equivalent
@@ -200,10 +206,10 @@ start the service, and require `/ready`. Every desktop must then sign in again,
 reselect the replacement remote vault, and recover into a fresh empty local
 vault. Do not let a pre-restore local profile resume against its retired remote
 identity. Complete a fresh-client recovery test before discarding old files.
-The recovery response is deliberately narrow: a recorded retired vault ID plus
-any 64-character lowercase-hex token receives `Vault not found`, even when a
-post-backup token is absent from the restored session table. Other token shapes
-and arbitrary missing vault IDs retain the generic authentication error.
+The recovery response is deliberately tenant-scoped: only a valid session for
+the retired vault's owner receives `Vault not found`. Invalid, expired,
+token-shaped, cross-tenant, and arbitrary identifiers retain the generic
+authentication error.
 
 If a signed-in device or bearer token may be compromised, stop the service and
 revoke every session before restarting it:
@@ -213,8 +219,9 @@ revoke every session before restarting it:
   revoke-all-sessions /var/lib/blackglass-server/server.sqlite
 ```
 
-All clients must sign in again. Changing the account password hash should be
-paired with this command.
+All clients must sign in again. Prefer the scoped offline command
+`blackglass-server user revoke-sessions <database> <user-id>`; password and
+email replacement revoke that user's sessions transactionally.
 
 ## Upgrade and rollback
 

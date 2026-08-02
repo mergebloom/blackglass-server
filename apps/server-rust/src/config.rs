@@ -29,9 +29,6 @@ pub struct Config {
     pub public_data_host: String,
     pub database_path: PathBuf,
     pub staging_dir: PathBuf,
-    pub email: String,
-    pub password_hash: String,
-    pub display_name: String,
     pub per_file_max: u64,
     pub storage_quota_bytes: i64,
     pub session_ttl: Duration,
@@ -56,10 +53,6 @@ impl Config {
             Some(_) => bail!("SELFHOST_ACKNOWLEDGE_EXTERNAL_BIND must be exactly 1 when set"),
         };
         validate_bind_host(bind_host, external_bind_acknowledged)?;
-        let allow_plaintext_password = plaintext_password_allowed(
-            bind_host,
-            value("SELFHOST_ALLOW_PLAINTEXT_PASSWORD").as_deref(),
-        )?;
         let control_port = number("SELFHOST_CONTROL_PORT", 3000u16)?;
         let data_port = number("SELFHOST_DATA_PORT", 3003u16)?;
         let database_path = PathBuf::from(
@@ -72,21 +65,6 @@ impl Config {
                 path.set_extension("uploads");
                 path
             });
-        let password_hash = match value("SELFHOST_PASSWORD_HASH") {
-            Some(hash) => hash,
-            None if allow_plaintext_password => {
-                let password = required("SELFHOST_PASSWORD")?;
-                crate::auth::hash_password(&password)?
-            }
-            None => bail!(
-                "SELFHOST_PASSWORD_HASH is required (use `hash-password`; the plaintext override is loopback-only test convenience)"
-            ),
-        };
-        if !crate::auth::password_hash_is_production_grade(&password_hash) {
-            bail!(
-                "SELFHOST_PASSWORD_HASH must be an Argon2id v=19 PHC string with m=19456..65536,t=2..5,p=1..4"
-            );
-        }
         if control_port == 0 || data_port == 0 || control_port == data_port {
             bail!("control and data ports must be distinct and non-zero");
         }
@@ -148,9 +126,6 @@ impl Config {
             public_data_host,
             database_path,
             staging_dir,
-            email: required("SELFHOST_EMAIL")?,
-            password_hash,
-            display_name: value("SELFHOST_NAME").unwrap_or_else(|| "Blackglass user".into()),
             per_file_max,
             storage_quota_bytes,
             session_ttl: Duration::from_secs(session_ttl_seconds),
@@ -173,9 +148,6 @@ impl Config {
             public_data_host: format!("127.0.0.1:{data_port}"),
             database_path: root.join("server.sqlite"),
             staging_dir: root.join("uploads"),
-            email: "owner@example.test".into(),
-            password_hash: crate::auth::hash_password("test-password")?,
-            display_name: "Test owner".into(),
             per_file_max: 8 * 1024 * 1024,
             storage_quota_bytes: DEFAULT_STORAGE_QUOTA_BYTES,
             session_ttl: Duration::from_secs(3600),
@@ -214,17 +186,6 @@ fn validate_bind_host(bind_host: IpAddr, external_bind_acknowledged: bool) -> Re
         )
     }
     Ok(())
-}
-
-fn plaintext_password_allowed(bind_host: IpAddr, configured: Option<&str>) -> Result<bool> {
-    match configured {
-        None => Ok(false),
-        Some("1") if bind_host.is_loopback() => Ok(true),
-        Some("1") => bail!(
-            "SELFHOST_ALLOW_PLAINTEXT_PASSWORD=1 is permitted only with a loopback SELFHOST_BIND_HOST"
-        ),
-        Some(_) => bail!("SELFHOST_ALLOW_PLAINTEXT_PASSWORD must be exactly 1 when set"),
-    }
 }
 
 fn validate_concurrent_uploads(value: usize) -> Result<()> {
@@ -335,9 +296,6 @@ fn parse_allowed_origins(raw: &str) -> Result<Vec<String>> {
         }
     }
     Ok(origins)
-}
-fn required(name: &str) -> Result<String> {
-    value(name).with_context(|| format!("{name} is required"))
 }
 fn number<T>(name: &str, default: T) -> Result<T>
 where
@@ -480,24 +438,6 @@ mod tests {
         assert!(validate_bind_host("0.0.0.0".parse().unwrap(), true).is_ok());
         assert!(validate_bind_host("::".parse().unwrap(), true).is_ok());
         assert!(validate_bind_host("192.0.2.10".parse().unwrap(), true).is_err());
-    }
-
-    #[test]
-    fn plaintext_password_override_is_loopback_only() {
-        for bind in ["127.0.0.1", "::1"] {
-            assert!(
-                plaintext_password_allowed(bind.parse().unwrap(), Some("1")).unwrap(),
-                "loopback override rejected for {bind}"
-            );
-        }
-        for bind in ["0.0.0.0", "::", "192.0.2.10"] {
-            assert!(
-                plaintext_password_allowed(bind.parse().unwrap(), Some("1")).is_err(),
-                "external plaintext override passed for {bind}"
-            );
-        }
-        assert!(!plaintext_password_allowed("127.0.0.1".parse().unwrap(), None).unwrap());
-        assert!(plaintext_password_allowed("127.0.0.1".parse().unwrap(), Some("true")).is_err());
     }
 
     #[test]

@@ -134,7 +134,7 @@ pub struct Db {
 }
 
 impl Db {
-    pub fn open_with_initial_user(path: &Path, initial_user: &InitialUser) -> Result<Self> {
+    fn open_internal(path: &Path, initial_user: Option<&InitialUser>) -> Result<Self> {
         let existed = match std::fs::symlink_metadata(path) {
             Ok(metadata) => {
                 if !metadata.is_file() {
@@ -149,6 +149,12 @@ impl Db {
                     .with_context(|| format!("inspect server database: {}", path.display()));
             }
         };
+
+        if !existed && initial_user.is_none() {
+            bail!(
+                "server database does not exist; initialize it offline with `blackglass-server user create <database> <email> <name>`"
+            )
+        }
 
         if !existed {
             if let Some(parent) = path.parent().filter(|p| !p.as_os_str().is_empty()) {
@@ -194,7 +200,7 @@ impl Db {
             conn.pragma_update(None, "synchronous", "FULL")?;
             conn.busy_timeout(std::time::Duration::from_secs(5))?;
             if !existed {
-                migrate(&conn, Some(initial_user))?;
+                migrate(&conn, initial_user)?;
             }
             verify_connection(&conn)?;
             initialize_runtime_storage_usage(&conn)?;
@@ -215,7 +221,15 @@ impl Db {
 
     #[cfg(test)]
     pub fn open(path: &Path) -> Result<Self> {
-        Self::open_with_initial_user(path, &test_initial_user())
+        Self::open_internal(path, Some(&test_initial_user()))
+    }
+
+    pub(crate) fn open_existing(path: &Path) -> Result<Self> {
+        Self::open_internal(path, None)
+    }
+
+    pub(crate) fn initialize(path: &Path, initial_user: &InitialUser) -> Result<Self> {
+        Self::open_internal(path, Some(initial_user))
     }
 
     pub(crate) fn open_offline_under_lock(path: &Path) -> Result<Self> {
@@ -3518,6 +3532,18 @@ mod tests {
                 0o600
             );
         }
+    }
+
+    #[test]
+    fn runtime_startup_refuses_to_bootstrap_a_missing_database() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("missing.sqlite");
+        let error = match Db::open_existing(&path) {
+            Ok(_) => panic!("runtime startup initialized a missing database"),
+            Err(error) => error.to_string(),
+        };
+        assert!(error.contains("initialize it offline"));
+        assert!(!path.exists());
     }
 
     #[test]

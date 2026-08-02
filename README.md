@@ -62,15 +62,18 @@ cargo test --locked --manifest-path apps/server-rust/Cargo.toml
 Start a loopback-only development server:
 
 ```sh
-SELFHOST_EMAIL=admin@example.test \
-SELFHOST_PASSWORD='replace-this' \
-SELFHOST_ALLOW_PLAINTEXT_PASSWORD=1 \
+printf '%s\n' 'replace-this' | cargo run --release --locked \
+  --manifest-path apps/server-rust/Cargo.toml -- \
+  user create ./selfhost-sync.sqlite admin@example.test 'Local admin'
 cargo run --release --locked \
   --manifest-path apps/server-rust/Cargo.toml -- serve
 ```
 
 The default listeners are `127.0.0.1:3000` and `127.0.0.1:3003`.
-Plaintext credentials and transport are for loopback development only.
+Account passwords are read from standard input by offline user-management
+commands and stored only as bounded Argon2id hashes in SQLite. Serving does not
+read account credentials from environment variables. Plaintext transport is
+for loopback development only.
 
 An optional dependency-free, read-only admin console can run on a third,
 independently configured listener. It is disabled unless all three admin

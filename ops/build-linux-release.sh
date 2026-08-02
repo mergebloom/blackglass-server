@@ -61,6 +61,7 @@ source_archive="$temporary/source.tar"
 source_context="$temporary/source"
 image=
 container=
+storage_volume=
 publish_staging=
 cleanup() {
     if test -n "$container"; then
@@ -68,6 +69,9 @@ cleanup() {
     fi
     if test -n "$image"; then
         docker image rm -f "$image" >/dev/null 2>&1 || true
+    fi
+    if test -n "$storage_volume"; then
+        docker volume rm -f "$storage_volume" >/dev/null 2>&1 || true
     fi
     if test -n "$publish_staging"; then
         rm -rf "$publish_staging"
@@ -164,29 +168,32 @@ actual_version=$(docker run --rm \
     "$image" --version)
 test "$actual_version" = "blackglass-server $version"
 
-password_hash=$(printf '%s\n' release-runtime-password | docker run --rm -i \
+storage_volume="blackglass-release-smoke-${target}-$$"
+docker volume create "$storage_volume" >/dev/null
+printf '%s\n' release-runtime-password | docker run --rm -i \
     --platform "$platform" \
     --read-only \
+    --mount "type=volume,src=$storage_volume,dst=/var/lib/blackglass-server" \
     --cap-drop ALL \
     --security-opt no-new-privileges \
-    "$image" hash-password)
+    "$image" user create /var/lib/blackglass-server/server.sqlite \
+        release-runtime@example.test 'Release runtime user'
 container=$(docker run --detach --rm \
     --platform "$platform" \
     --network host \
     --stop-timeout 30 \
     --read-only \
+    --mount "type=volume,src=$storage_volume,dst=/var/lib/blackglass-server" \
     --memory 256m \
     --pids-limit 64 \
     --ulimit nofile=4096:4096 \
     --tmpfs /tmp:rw,noexec,nosuid,nodev,size=32m,mode=1777 \
     --cap-drop ALL \
     --security-opt no-new-privileges \
-    --env SELFHOST_EMAIL=release-runtime@example.test \
     --env SELFHOST_BIND_HOST=127.0.0.1 \
     --env SELFHOST_ACKNOWLEDGE_EXTERNAL_BIND= \
     --env SELFHOST_TRUSTED_PROXY=127.0.0.1 \
     --env SELFHOST_DATA_HOST=sync-data.example.test \
-    --env "SELFHOST_PASSWORD_HASH=$password_hash" \
     "$image" serve)
 control_address=127.0.0.1:3000
 data_address=127.0.0.1:3003

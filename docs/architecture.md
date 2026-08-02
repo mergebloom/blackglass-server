@@ -8,14 +8,15 @@ and adaptation live separately in Blackglass Bridge.
 
 ## Control plane
 
-The Rust service provides one configured user and the account and vault
-operations required to create, connect, migrate encryption, rename, and delete
-a Sync vault. Registration, password-recovery, and business-subscription routes
-return explicit administrator-managed JSON errors instead of transport errors.
-Sharing reports an empty list and invite/remove operations fail cleanly in
-single-user mode. Passwords are verified with Argon2id. Successful sign-in
-creates a random 256-bit bearer session whose digest, expiry, and revocation
-state live in SQLite.
+The Rust service provides durable SQLite-backed local users and the account and
+vault operations required to create, connect, migrate encryption, rename, and
+delete a Sync vault. Each vault and session is bound to one user; serving never
+loads account credentials from environment variables. Registration,
+password-recovery, and business-subscription routes return explicit
+administrator-managed JSON errors instead of transport errors. Sharing reports
+an empty list and invite/remove operations fail cleanly. Passwords are verified
+with Argon2id. Successful sign-in creates a random 256-bit bearer session whose
+digest, user, expiry, and revocation state live in SQLite.
 
 ## Data plane
 
@@ -36,7 +37,7 @@ the pool indefinitely.
 
 ## Persistence
 
-SQLite is the supported database for the single-node, single-owner deployment.
+SQLite is the supported database for the single-node, multi-account deployment.
 WAL commits use FULL synchronous durability. Startup, backup, restore, and
 offline session revocation fail closed on unexpected schema objects or logical
 state inconsistencies instead of silently repairing an unknown database.

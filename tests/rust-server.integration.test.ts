@@ -1,7 +1,7 @@
 import { afterAll, beforeAll, describe, expect, test } from "bun:test";
 import { createConnection, createServer } from "node:net";
 import { createHash, randomBytes } from "node:crypto";
-import { readFileSync } from "node:fs";
+import { existsSync, readFileSync } from "node:fs";
 import { mkdtemp, readFile, readdir, stat } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join, resolve } from "node:path";
@@ -15,8 +15,6 @@ const configuredBinary = process.env.BLACKGLASS_RUST_BINARY;
 const binary = configuredBinary ?? join(root, "apps/server-rust/target/debug/blackglass-server");
 const perFileMax = 8 * 1024 * 1024;
 const aesGcmWireOverhead = 12 + 16;
-const maximumWorkPasswordHash =
-  "$argon2id$v=19$m=65536,t=5,p=4$YmxhY2tnbGFzcy1yZXNvdXJjZS1lbnZlbG9wZS12MQ$qF1GQ0hLTNgx8hhl7Qo3R7r1pSYB+eYXdX4KtmWP5VI";
 let directory = "";
 let controlPort = 0;
 let dataPort = 0;
@@ -566,29 +564,12 @@ describe("production Rust server", () => {
       "SELFHOST_ACKNOWLEDGE_EXTERNAL_BIND=1",
     );
 
-    const plaintextDirectory = await mkdtemp(join(tmpdir(), "blackglass-external-plaintext-"));
-    const [plaintextControlPort, plaintextDataPort] = await Promise.all([freePort(), freePort()]);
-    const plaintext = spawnRustServer(plaintextDirectory, plaintextControlPort, plaintextDataPort, {
-      SELFHOST_BIND_HOST: "0.0.0.0",
-      SELFHOST_ACKNOWLEDGE_EXTERNAL_BIND: "1",
-      SELFHOST_DATA_HOST: "sync-data.example.test",
-    });
-    expect(
-      await promiseWithTimeout(plaintext.exited, 3_000, "external plaintext password did not fail"),
-    ).not.toBe(0);
-    expect(await new Response(plaintext.stderr as ReadableStream<Uint8Array>).text()).toContain(
-      "permitted only with a loopback SELFHOST_BIND_HOST",
-    );
-
     const allowedDirectory = await mkdtemp(join(tmpdir(), "blackglass-external-bind-allowed-"));
     const [allowedControlPort, allowedDataPort] = await Promise.all([freePort(), freePort()]);
     const allowed = spawnRustServer(allowedDirectory, allowedControlPort, allowedDataPort, {
       SELFHOST_BIND_HOST: "0.0.0.0",
       SELFHOST_ACKNOWLEDGE_EXTERNAL_BIND: "1",
       SELFHOST_DATA_HOST: "sync-data.example.test",
-      SELFHOST_PASSWORD: "",
-      SELFHOST_ALLOW_PLAINTEXT_PASSWORD: "",
-      SELFHOST_PASSWORD_HASH: maximumWorkPasswordHash,
     });
     try {
       await waitForHealthAt(allowedControlPort, allowed);
@@ -605,9 +586,6 @@ describe("production Rust server", () => {
         SELFHOST_BIND_HOST: bind,
         SELFHOST_ACKNOWLEDGE_EXTERNAL_BIND: bind === "::1" ? "" : "1",
         SELFHOST_DATA_HOST: "",
-        SELFHOST_PASSWORD: "",
-        SELFHOST_ALLOW_PLAINTEXT_PASSWORD: "",
-        SELFHOST_PASSWORD_HASH: maximumWorkPasswordHash,
       });
       expect(await promiseWithTimeout(missing.exited, 3_000, `missing data host passed for ${bind}`)).not.toBe(0);
       expect(await new Response(missing.stderr as ReadableStream<Uint8Array>).text()).toContain(
@@ -1829,6 +1807,14 @@ async function uploadOpaqueCiphertext(probe: Probe, path: string, hash: string, 
   return notice;
 }
 function spawnRustServer(serviceDirectory: string, serviceControlPort: number, serviceDataPort: number, overrides: Record<string, string> = {}) {
+  const database = overrides.SELFHOST_DATABASE ?? join(serviceDirectory, "server.sqlite");
+  if (!existsSync(database)) {
+    const initialized = Bun.spawnSync(
+      [binary, "user", "create", database, "owner@example.test", "Rust test owner"],
+      { cwd: root, stdin: Buffer.from("test-password\n"), stdout: "pipe", stderr: "pipe" },
+    );
+    if (initialized.exitCode !== 0) throw new Error(initialized.stderr.toString());
+  }
   return Bun.spawn([binary, "serve"], {
     cwd: root,
     stdout: "pipe",
@@ -1839,12 +1825,8 @@ function spawnRustServer(serviceDirectory: string, serviceControlPort: number, s
       SELFHOST_CONTROL_PORT: String(serviceControlPort),
       SELFHOST_DATA_PORT: String(serviceDataPort),
       SELFHOST_DATA_HOST: `127.0.0.1:${serviceDataPort}`,
-      SELFHOST_DATABASE: join(serviceDirectory, "server.sqlite"),
+      SELFHOST_DATABASE: database,
       SELFHOST_STAGING_DIR: join(serviceDirectory, "uploads"),
-      SELFHOST_EMAIL: "owner@example.test",
-      SELFHOST_PASSWORD: "test-password",
-      SELFHOST_ALLOW_PLAINTEXT_PASSWORD: "1",
-      SELFHOST_NAME: "Rust test owner",
       SELFHOST_PER_FILE_MAX: String(perFileMax),
       SELFHOST_ALLOWED_ORIGIN: "app://obsidian.md",
       SELFHOST_LOG_FORMAT: "pretty",

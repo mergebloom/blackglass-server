@@ -137,7 +137,7 @@ Requirements:
 8. Re-running migration into an existing destination fails closed.
 9. A round-trip test proves the old database remains usable by the previous exact binary.
 
-After schema v5 cutover, the database is the sole runtime authority for users and password hashes. The legacy `SELFHOST_EMAIL`, `SELFHOST_NAME`, and `SELFHOST_PASSWORD_HASH` settings may be read by the explicit offline migration path, but Phase 3 serving must never silently fall back to them or auto-bootstrap a missing user. The plaintext test-only `SELFHOST_PASSWORD` path must remain unavailable outside its existing loopback test constraint and must not be accepted by migration. Keep the old production values only in protected rollback material until the Phase 3 rollback window closes, then retire them deliberately.
+After schema v5 cutover, the database is the sole runtime authority for users and password hashes. The legacy `SELFHOST_EMAIL`, `SELFHOST_NAME`, and `SELFHOST_PASSWORD_HASH` settings may be read by the explicit offline migration path, but Phase 3 serving must never silently fall back to them or auto-bootstrap a missing user. Runtime serving and migration must never accept a plaintext `SELFHOST_PASSWORD`; user creation reads the password from standard input while the service is offline. Keep the old production values only in protected rollback material until the Phase 3 rollback window closes, then retire them deliberately.
 
 Update `restore_database` and `rotate_recovery_epoch` for schemas v5/v6 and add a separate tenant-safe stale-backup mode; a normal schema migration must not resurrect accounts or sharing authorization from an old restore point. While every listener and edge route is detached, the current binary writes a new recovered destination that:
 

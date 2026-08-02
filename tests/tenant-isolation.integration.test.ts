@@ -35,10 +35,7 @@ describe("Phase 3 tenant isolation", () => {
     directory = await mkdtemp(join(tmpdir(), "blackglass-tenants-"));
     [controlPort, dataPort] = await Promise.all([freePort(), freePort()]);
 
-    server = spawnServer();
-    await waitForHealth(server);
-    await stopServer();
-
+    createUser("owner@example.test", "Rust test owner", "test-password");
     createUser("member@example.test", "Member", "member-password");
     createUser("outsider@example.test", "Outsider", "outsider-password");
     const listed = Bun.spawnSync([binary, "user", "list", join(directory, "server.sqlite")], {
@@ -216,10 +213,6 @@ function spawnServer() {
       SELFHOST_DATA_HOST: `127.0.0.1:${dataPort}`,
       SELFHOST_DATABASE: join(directory, "server.sqlite"),
       SELFHOST_STAGING_DIR: join(directory, "uploads"),
-      SELFHOST_EMAIL: "owner@example.test",
-      SELFHOST_PASSWORD: "test-password",
-      SELFHOST_ALLOW_PLAINTEXT_PASSWORD: "1",
-      SELFHOST_NAME: "Rust test owner",
       SELFHOST_PER_FILE_MAX: String(8 * 1024 * 1024),
       SELFHOST_ALLOWED_ORIGIN: "app://obsidian.md",
       SELFHOST_LOG_FORMAT: "pretty",
