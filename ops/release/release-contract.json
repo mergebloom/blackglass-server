@@ -6,7 +6,7 @@
     "destinationSchema": 5
   },
   "previousRollbackTag": "v0.2.5",
-  "bridgeToolingRevision": "ed1068ba4f6ad2eaa3e0f39f6509d34d8eb4021c",
+  "bridgeToolingRevision": "7b95bbf6b073e7c7dd77f9759b8961b11c7547bb",
   "qualifiedRenderers": [
     {
       "version": "1.12.7",
