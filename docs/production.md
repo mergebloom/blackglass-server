@@ -76,6 +76,8 @@ Imported password hashes must use Argon2id v=19 with bounded work parameters:
 `m=19456..65536`, `t=2..5`, and `p=1..4`. Hashes outside those limits are
 rejected before password verification to prevent an unsafe operator value from
 causing unbounded CPU or memory use.
+New and replaced account passwords are generated at the qualified policy
+maximum (`m=65536,t=5,p=4`).
 
 Install `ops/blackglass-server.service`, run `systemd-analyze security` against it,
 then enable it. The supplied sysusers file and unit use a static unprivileged

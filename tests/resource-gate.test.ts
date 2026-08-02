@@ -1,4 +1,6 @@
 import { describe, expect, test } from "bun:test";
+import { readFile } from "node:fs/promises";
+import { resolve } from "node:path";
 import {
   cgroupResourceLimits,
   evaluateCgroupResourceGate,
@@ -17,6 +19,19 @@ import {
 } from "../tools/resource-gate.ts";
 
 describe("release resource gate", () => {
+  test("provisions its account offline and opens the qualified per-user envelope", async () => {
+    const harness = await readFile(
+      resolve(import.meta.dir, "../tools/measure-rust-server.ts"),
+      "utf8",
+    );
+    expect(harness).toContain("provisionResourceUser(binary");
+    expect(harness).toContain("SELFHOST_MAX_WS_CONNECTIONS_PER_USER");
+    expect(harness).toContain("SELFHOST_MAX_CONCURRENT_UPLOADS_PER_USER");
+    expect(harness).not.toContain('SELFHOST_EMAIL: "resource@example.test"');
+    expect(harness).not.toContain('"SELFHOST_EMAIL=resource@example.test"');
+    expect(harness).not.toContain("SELFHOST_PASSWORD_HASH");
+  });
+
   test("binds the absolute process RSS peak to the service memory maximum", () => {
     expect(resourceReportSchemaVersion).toBe(5);
     expect(resourceLimits).toEqual({

@@ -1,5 +1,5 @@
 use anyhow::{Result, bail};
-use argon2::{Argon2, PasswordHash, PasswordHasher, PasswordVerifier};
+use argon2::{Algorithm, Argon2, Params, PasswordHash, PasswordHasher, PasswordVerifier, Version};
 use password_hash::SaltString;
 use rand::{RngCore, rngs::OsRng};
 use sha2::{Digest, Sha256};
@@ -11,7 +11,7 @@ const MAX_ARGON2_TIME_COST: u32 = 5;
 const MIN_ARGON2_PARALLELISM: u32 = 1;
 const MAX_ARGON2_PARALLELISM: u32 = 4;
 const MAX_PASSWORD_HASH_LENGTH: usize = 512;
-pub(crate) const DUMMY_PASSWORD_HASH: &str = "$argon2id$v=19$m=19456,t=2,p=1$5fbyOApt3Wwi327kSXBbGw$cBqxvjLMOlreSy3VIuQIfNEnwiaqznZKxx3KzdzK2Us";
+pub(crate) const DUMMY_PASSWORD_HASH: &str = "$argon2id$v=19$m=65536,t=5,p=4$YmxhY2tnbGFzcy1yZXNvdXJjZS1lbnZlbG9wZS12MQ$qF1GQ0hLTNgx8hhl7Qo3R7r1pSYB+eYXdX4KtmWP5VI";
 pub(crate) const MAX_EMAIL_BYTES: usize = 254;
 pub(crate) const MAX_DISPLAY_NAME_BYTES: usize = 128;
 pub(crate) const MAX_CONCURRENT_PASSWORD_CHECKS: usize = 1;
@@ -41,7 +41,14 @@ const _: () = assert!(
 
 pub fn hash_password(password: &str) -> Result<String> {
     let salt = SaltString::generate(&mut password_hash::rand_core::OsRng);
-    Ok(Argon2::default()
+    let params = Params::new(
+        MAX_ARGON2_MEMORY_KIB,
+        MAX_ARGON2_TIME_COST,
+        MAX_ARGON2_PARALLELISM,
+        Some(32),
+    )
+    .map_err(|e| anyhow::anyhow!("unable to configure password hashing: {e}"))?;
+    Ok(Argon2::new(Algorithm::Argon2id, Version::V0x13, params)
         .hash_password(password.as_bytes(), &salt)
         .map_err(|e| anyhow::anyhow!("unable to hash password: {e}"))?
         .to_string())
@@ -167,7 +174,7 @@ mod tests {
             with_argon2_params(&encoded, 19_456, 2, 0),
             with_argon2_params(&encoded, 19_456, 2, 5),
             with_argon2_params(&encoded, u32::MAX, u32::MAX, u32::MAX),
-            encoded.replacen("p=1", "p=1,x=1", 1),
+            encoded.replacen("p=4", "p=4,x=1", 1),
             encoded.replace("$v=19$", "$v=16$"),
             format!("{encoded}{}", "x".repeat(MAX_PASSWORD_HASH_LENGTH)),
         ] {

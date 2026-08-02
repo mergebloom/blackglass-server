@@ -60,13 +60,6 @@ if (resourceMode !== "process-rss" && resourceMode !== "cgroup-v2") {
   throw new Error("BLACKGLASS_RESOURCE_MODE must be process-rss or cgroup-v2");
 }
 const cgroupMode = resourceMode === "cgroup-v2";
-// A deterministic, non-secret test fixture at every accepted Argon2 work
-// maximum. Starting the server with it makes the measured password queue cover
-// the production configuration envelope rather than only the generated
-// default. Changing the accepted policy without updating this gate fails fast.
-const maximumWorkPasswordHash =
-  "$argon2id$v=19$m=65536,t=5,p=4$YmxhY2tnbGFzcy1yZXNvdXJjZS1lbnZlbG9wZS12MQ$qF1GQ0hLTNgx8hhl7Qo3R7r1pSYB+eYXdX4KtmWP5VI";
-
 type CgroupContext = {
   container: string;
   image: string;
@@ -172,6 +165,7 @@ if (cgroupMode) {
     throw error;
   }
 } else {
+  provisionResourceUser(binary, join(directory, "server.sqlite"));
   child = Bun.spawn([binary, "serve"], {
     cwd: root,
     stdout: process.env.BLACKGLASS_RESOURCE_DEBUG === "1" ? "inherit" : "ignore",
@@ -184,11 +178,10 @@ if (cgroupMode) {
       SELFHOST_DATA_HOST: `127.0.0.1:${dataPort}`,
       SELFHOST_DATABASE: join(directory, "server.sqlite"),
       SELFHOST_STAGING_DIR: join(directory, "uploads"),
-      SELFHOST_EMAIL: "resource@example.test",
-      SELFHOST_PASSWORD_HASH: maximumWorkPasswordHash,
-      SELFHOST_NAME: "Resource test",
       SELFHOST_PER_FILE_MAX: String(128 * 1024 * 1024),
       SELFHOST_MAX_CONCURRENT_UPLOADS: String(concurrentUploads),
+      SELFHOST_MAX_CONCURRENT_UPLOADS_PER_USER: String(concurrentUploads),
+      SELFHOST_MAX_WS_CONNECTIONS_PER_USER: String(websocketConnections),
       SELFHOST_ALLOWED_ORIGINS: "app://obsidian.md",
       SELFHOST_TRUSTED_PROXY: "127.0.0.1",
       SELFHOST_LOG_FORMAT: "pretty",
@@ -819,6 +812,27 @@ async function startCgroupContainer(): Promise<CgroupContext> {
     ]);
     const imageId = runDocker(["image", "inspect", "--format", "{{.Id}}", image]).trim();
     runDocker(["volume", "create", volume]);
+    runDockerWithInput(
+      [
+        "run",
+        "--rm",
+        "-i",
+        "--read-only",
+        "--cap-drop",
+        "ALL",
+        "--security-opt",
+        "no-new-privileges",
+        "--mount",
+        `type=volume,src=${volume},dst=/var/lib/blackglass-server`,
+        imageId,
+        "user",
+        "create",
+        "/var/lib/blackglass-server/server.sqlite",
+        "resource@example.test",
+        "Resource test",
+      ],
+      `${resourcePassword}\n`,
+    );
     runDocker([
       "create",
       "--name",
@@ -853,15 +867,13 @@ async function startCgroupContainer(): Promise<CgroupContext> {
       "--env",
       `SELFHOST_DATA_HOST=127.0.0.1:${dataPort}`,
       "--env",
-      "SELFHOST_EMAIL=resource@example.test",
-      "--env",
-      `SELFHOST_PASSWORD_HASH=${maximumWorkPasswordHash}`,
-      "--env",
-      "SELFHOST_NAME=Resource test",
-      "--env",
       `SELFHOST_PER_FILE_MAX=${128 * 1024 * 1024}`,
       "--env",
       `SELFHOST_MAX_CONCURRENT_UPLOADS=${concurrentUploads}`,
+      "--env",
+      `SELFHOST_MAX_CONCURRENT_UPLOADS_PER_USER=${concurrentUploads}`,
+      "--env",
+      `SELFHOST_MAX_WS_CONNECTIONS_PER_USER=${websocketConnections}`,
       "--env",
       "SELFHOST_ALLOWED_ORIGINS=app://obsidian.md",
       "--env",
@@ -955,6 +967,39 @@ function runDocker(args: string[]): string {
     throw new Error(`docker ${args[0]} failed: ${result.stderr.toString()}`);
   }
   return result.stdout.toString();
+}
+
+function runDockerWithInput(args: string[], input: string): string {
+  const result = Bun.spawnSync(["docker", ...args], {
+    stdin: Buffer.from(input),
+    stdout: "pipe",
+    stderr: "pipe",
+  });
+  if (result.exitCode !== 0) {
+    throw new Error(`docker ${args[0]} failed: ${result.stderr.toString()}`);
+  }
+  return result.stdout.toString();
+}
+
+function provisionResourceUser(executable: string, database: string): void {
+  const result = Bun.spawnSync(
+    [
+      executable,
+      "user",
+      "create",
+      database,
+      "resource@example.test",
+      "Resource test",
+    ],
+    {
+      stdin: Buffer.from(`${resourcePassword}\n`),
+      stdout: "pipe",
+      stderr: "pipe",
+    },
+  );
+  if (result.exitCode !== 0) {
+    throw new Error(`resource account provisioning failed: ${result.stderr.toString()}`);
+  }
 }
 
 function mountCoversPath(destination: string, path: string): boolean {
