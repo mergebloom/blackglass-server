@@ -65,6 +65,7 @@ describe("supported release versions", () => {
   });
 
   test("OCI publishing verifies repository releases and registry digests without owner-wide package listing", async () => {
+    const release = await readFile(join(root, "ops/publish-release.sh"), "utf8");
     const publish = await readFile(join(root, "ops/publish-oci-version.sh"), "utf8");
     const promote = await readFile(join(root, "ops/promote-oci-latest.sh"), "utf8");
 
@@ -75,6 +76,93 @@ describe("supported release versions", () => {
     expect(promote).toContain(
       'repos/${GITHUB_REPOSITORY}/releases?per_page=100',
     );
+    expect(release).toContain(
+      'repos/${GITHUB_REPOSITORY}/releases?per_page=100',
+    );
+    expect(release).not.toContain(
+      'repos/${GITHUB_REPOSITORY}/releases/tags/${tag}',
+    );
+  });
+
+  test("release publishing resumes an exact-tag draft that is absent from the tag endpoint", async () => {
+    const toolDirectory = await mkdtemp(join(tmpdir(), "blackglass-release-tools-"));
+    try {
+      const asset = join(toolDirectory, "test-release.bin");
+      const uploaded = join(toolDirectory, "uploaded");
+      const published = join(toolDirectory, "published");
+      const revision = "a".repeat(40);
+      const digest = "b".repeat(64);
+      await writeFile(asset, "payload");
+      await writeFile(join(toolDirectory, "git"), `#!/bin/sh
+test "\${1:-}" = rev-parse || exit 91
+printf '%s\\n' "$BLACKGLASS_TEST_REVISION"
+`);
+      await writeFile(join(toolDirectory, "sha256sum"), `#!/bin/sh
+printf '%s  %s\\n' "$BLACKGLASS_TEST_DIGEST" "\${1:-}"
+`);
+      await writeFile(join(toolDirectory, "stat"), `#!/bin/sh
+printf '%s\\n' 7
+`);
+      await writeFile(join(toolDirectory, "gh"), `#!/bin/sh
+set -eu
+case "\${1:-}:\${2:-}" in
+  api:--paginate)
+    case "\${3:-}" in
+      */releases?per_page=100)
+        draft=true
+        test ! -f "$BLACKGLASS_TEST_PUBLISHED" || draft=false
+        printf '[[{"id":7,"tag_name":"v1.2.3","name":"Test release","prerelease":false,"draft":%s}]]\\n' "$draft"
+        ;;
+      */releases/7/assets?per_page=100)
+        if test -f "$BLACKGLASS_TEST_UPLOADED"; then
+          printf '[[{"id":8,"name":"test-release.bin","state":"uploaded","digest":"sha256:%s","size":7}]]\\n' "$BLACKGLASS_TEST_DIGEST"
+        else
+          printf '[[]]\\n'
+        fi
+        ;;
+      *) exit 92 ;;
+    esac
+    ;;
+  release:upload)
+    : > "$BLACKGLASS_TEST_UPLOADED"
+    ;;
+  release:edit)
+    : > "$BLACKGLASS_TEST_PUBLISHED"
+    ;;
+  *) exit 93 ;;
+esac
+`);
+      for (const command of ["git", "sha256sum", "stat", "gh"]) {
+        await chmod(join(toolDirectory, command), 0o755);
+      }
+
+      const result = Bun.spawnSync([
+        join(root, "ops/publish-release.sh"),
+        "v1.2.3",
+        "Test release",
+        asset,
+      ], {
+        cwd: root,
+        env: {
+          ...process.env,
+          PATH: `${toolDirectory}:${process.env.PATH ?? ""}`,
+          GITHUB_REPOSITORY: "example/repository",
+          GITHUB_SHA: revision,
+          GH_TOKEN: "test-token",
+          BLACKGLASS_TEST_REVISION: revision,
+          BLACKGLASS_TEST_DIGEST: digest,
+          BLACKGLASS_TEST_UPLOADED: uploaded,
+          BLACKGLASS_TEST_PUBLISHED: published,
+        },
+        stdout: "pipe",
+        stderr: "pipe",
+      });
+      expect(result.exitCode, result.stderr.toString()).toBe(0);
+      expect(await readFile(uploaded, "utf8")).toBe("");
+      expect(await readFile(published, "utf8")).toBe("");
+    } finally {
+      await rm(toolDirectory, { recursive: true, force: true });
+    }
   });
 
   test("accepts only v-prefixed supported release tags", () => {

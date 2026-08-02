@@ -42,12 +42,12 @@ for asset in "${assets[@]}"; do
 done
 
 release_json=$(mktemp)
+release_pages=$(mktemp)
+release_matches=$(mktemp)
 assets_json=$(mktemp)
 expected_names=$(mktemp)
 actual_names=$(mktemp)
-response_headers=$(mktemp)
-response_error=$(mktemp)
-trap 'rm -f "$release_json" "$assets_json" "$expected_names" "$actual_names" "$response_headers" "$response_error"' EXIT
+trap 'rm -f "$release_json" "$release_pages" "$release_matches" "$assets_json" "$expected_names" "$actual_names"' EXIT
 
 printf '%s\n' "${assets[@]##*/}" | LC_ALL=C sort > "$expected_names"
 if [[ "$(wc -l < "$expected_names" | tr -d ' ')" -ne "${#assets[@]}" ]] ||
@@ -60,35 +60,38 @@ if ! awk '/^[A-Za-z0-9._-]+$/ { next } { exit 1 }' "$expected_names"; then
   exit 1
 fi
 
-release_endpoint="repos/${GITHUB_REPOSITORY}/releases/tags/${tag}"
-
-probe_release() {
-  : > "$response_headers"
-  : > "$response_error"
-  if gh api --include --silent "$release_endpoint" > "$response_headers" 2> "$response_error"; then
-    [[ "$(awk '/^HTTP\// { code=$2 } END { print code }' "$response_headers")" == "200" ]] || {
-      echo "error: unexpected successful release lookup response" >&2
-      cat "$response_headers" >&2
-      return 2
-    }
-    return 0
+find_release() {
+  local release_count
+  if ! gh api --paginate "repos/${GITHUB_REPOSITORY}/releases?per_page=100" --slurp \
+    > "$release_pages"; then
+    echo "error: unable to list repository releases while locating ${tag}" >&2
+    return 2
   fi
-  status=$(awk '/^HTTP\// { code=$2 } END { print code }' "$response_headers")
-  if [[ "$status" == "404" ]]; then
+  if ! jq -e 'type == "array" and all(.[]; type == "array")' \
+    "$release_pages" >/dev/null; then
+    echo "error: repository release list has an unexpected shape" >&2
+    return 2
+  fi
+  jq --arg tag "$tag" 'add | map(select(.tag_name == $tag))' \
+    "$release_pages" > "$release_matches"
+  release_count=$(jq -er 'length' "$release_matches")
+  if [[ "$release_count" -eq 0 ]]; then
     return 1
   fi
-  echo "error: unable to determine whether release ${tag} exists" >&2
-  cat "$response_error" >&2
-  return 2
+  if [[ "$release_count" -ne 1 ]]; then
+    echo "error: repository contains multiple releases for ${tag}" >&2
+    return 2
+  fi
+  jq '.[0]' "$release_matches" > "$release_json"
 }
 
 created_release=false
-if probe_release; then
+if find_release; then
   :
 else
-  probe_result=$?
-  if [[ "$probe_result" -ne 1 ]]; then
-    exit "$probe_result"
+  find_result=$?
+  if [[ "$find_result" -ne 1 ]]; then
+    exit "$find_result"
   fi
   create_flags=(--draft --verify-tag --title "$title" --generate-notes --latest=false)
   if [[ "$release_prerelease" == "true" ]]; then
@@ -99,7 +102,16 @@ else
 fi
 
 refresh_release() {
-  gh api "$release_endpoint" > "$release_json"
+  local find_result
+  if find_release; then
+    :
+  else
+    find_result=$?
+    if [[ "$find_result" -eq 1 ]]; then
+      echo "error: release ${tag} is not visible in the repository release list" >&2
+    fi
+    return "$find_result"
+  fi
   jq -e \
     --arg tag "$tag" \
     --arg title "$title" \
