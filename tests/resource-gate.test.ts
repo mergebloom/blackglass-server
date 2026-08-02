@@ -20,8 +20,8 @@ describe("release resource gate", () => {
   test("binds the absolute process RSS peak to the service memory maximum", () => {
     expect(resourceReportSchemaVersion).toBe(5);
     expect(resourceLimits).toEqual({
-      serviceMemoryMaxMiB: 256,
-      minimumProcessRssMarginMiB: 32,
+      serviceMemoryMaxMiB: 384,
+      minimumProcessRssMarginMiB: 160,
       maxPeakProcessRssMiB: 224,
       maxDeltaProcessRssMiB: 128,
     });
@@ -91,9 +91,9 @@ describe("release resource gate", () => {
 
   test("fails cgroup survival on a wrong limit, OOM signal, or unclean exit", () => {
     expect(cgroupResourceLimits).toEqual({
-      memoryMaxBytes: 256 * 1024 * 1024,
+      memoryMaxBytes: 384 * 1024 * 1024,
       memorySwapMaxBytes: 0,
-      dockerMemorySwapTotalBytes: 256 * 1024 * 1024,
+      dockerMemorySwapTotalBytes: 384 * 1024 * 1024,
     });
     const evaluate = (
       peak: number = cgroupResourceLimits.memoryMaxBytes,

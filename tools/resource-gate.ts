@@ -1,14 +1,14 @@
 export const resourceReportSchemaVersion = 5;
 export const resourceLimits = Object.freeze({
-  serviceMemoryMaxMiB: 256,
-  minimumProcessRssMarginMiB: 32,
+  serviceMemoryMaxMiB: 384,
+  minimumProcessRssMarginMiB: 160,
   maxPeakProcessRssMiB: 224,
   maxDeltaProcessRssMiB: 128,
 });
 export const cgroupResourceLimits = Object.freeze({
-  memoryMaxBytes: 256 * 1024 * 1024,
+  memoryMaxBytes: 384 * 1024 * 1024,
   memorySwapMaxBytes: 0,
-  dockerMemorySwapTotalBytes: 256 * 1024 * 1024,
+  dockerMemorySwapTotalBytes: 384 * 1024 * 1024,
 });
 
 export type CgroupEvents = {

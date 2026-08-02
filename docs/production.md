@@ -312,7 +312,7 @@ releases the upload slot, removes the partial file, and closes the connection.
 WebSocket admission defaults to 16 and cannot exceed 16. One bounded
 Argon2 check, an eight-request wait queue, 2 MiB frames, bounded reconnect
 pages, a single large JSON response, and bounded database workers stay inside
-the supplied 256 MiB service cap under the release workload.
+the supplied 384 MiB service cap under the release workload.
 A fair memory-admission pool leaves one authenticated Sync lane available
 during password verification. Pulls read SQLite in 2 MiB pieces, with a fixed
 limit of two concurrent frames and admission released between pieces. This
@@ -340,7 +340,7 @@ does not necessarily shrink the SQLite file; the quota is a stored-ciphertext
 guard, not a replacement for disk-free-space monitoring.
 
 Each Linux package job runs its exact exported native binary as UID 65532 in a
-server-only cgroup with a 256 MiB memory maximum and swap disabled. The host
+server-only cgroup with a 384 MiB memory maximum and swap disabled. The host
 workload first drives 11 concurrent large-metadata reconnects. It then holds 16
 authenticated WebSockets while overlapping four 64 MiB uploads, eight pulls, a
 large history response, and ten sign-in attempts at the maximum accepted
@@ -348,7 +348,7 @@ Argon2id work parameters (`m=65536,t=5,p=4`). A separate phase requires that
 maximum-cost password work and the reserved Sync lane both complete.
 
 Qualification requires the configured cgroup `memory.max` to remain exactly
-256 MiB with swap disabled; startup and final OOM counters to remain zero;
+384 MiB with swap disabled; startup and final OOM counters to remain zero;
 exact artifact, staged, and in-image hashes to match; and a graceful non-OOM
 exit. The report records `memory.peak` and `memory.events.max`, but does not
 treat successful direct reclaim as an OOM: Linux permits temporary usage above

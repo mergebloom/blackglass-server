@@ -42,7 +42,7 @@ AmbientCapabilities=
 LimitNOFILE=4096
 TasksMax=64
 MemoryHigh=192M
-MemoryMax=256M
+MemoryMax=384M
 
 [Install]
 WantedBy=multi-user.target

@@ -42,8 +42,8 @@ def zero_oom:
 .deltaRssKiB < 131072 and
 .peakRssMiB == (.peakRssKiB / 1024) and
 .deltaRssMiB == (.deltaRssKiB / 1024) and
-.processRssMarginMiB == (256 - .peakRssMiB) and
-.processRssMarginMiB > 32 and
+.processRssMarginMiB == (384 - .peakRssMiB) and
+.processRssMarginMiB > 160 and
 .execution.nativeTarget == $target and
 .execution.hostPlatform == "linux" and
 (
@@ -76,7 +76,7 @@ def zero_oom:
 .cgroup.version == 2 and
 (.cgroup.eventsSource == "memory.events.local" or .cgroup.eventsSource == "memory.events") and
 .cgroup.memoryPeakBytes > 0 and
-.cgroup.memoryMaxBytes == 268435456 and
+.cgroup.memoryMaxBytes == 402653184 and
 .cgroup.memorySwapMaxBytes == 0 and
 (.cgroup.memoryEventsBefore | zero_oom) and
 (.cgroup.memoryEvents | zero_oom) and
@@ -93,8 +93,8 @@ def zero_oom:
   (.cgroup.memoryEvents.oomKill - .cgroup.memoryEventsBefore.oomKill) and
 .cgroup.memoryEventDelta.oomGroupKill ==
   (.cgroup.memoryEvents.oomGroupKill - .cgroup.memoryEventsBefore.oomGroupKill) and
-.container.dockerMemoryLimitBytes == 268435456 and
-.container.dockerMemorySwapTotalBytes == 268435456 and
+.container.dockerMemoryLimitBytes == 402653184 and
+.container.dockerMemorySwapTotalBytes == 402653184 and
 .container.gracefulExit == true and
 .container.exitCode == 0 and
 .container.oomKilled == false and
@@ -103,11 +103,11 @@ def zero_oom:
 .stagingEntries == [".blackglass-staging-v1"] and
 .unexpectedStagingEntries == [] and
 .limits == {
-  serviceMemoryMaxMiB: 256,
-  minimumProcessRssMarginMiB: 32,
+  serviceMemoryMaxMiB: 384,
+  minimumProcessRssMarginMiB: 160,
   maxPeakProcessRssMiB: 224,
   maxDeltaProcessRssMiB: 128,
-  memoryMaxBytes: 268435456,
+  memoryMaxBytes: 402653184,
   memorySwapMaxBytes: 0,
-  dockerMemorySwapTotalBytes: 268435456
+  dockerMemorySwapTotalBytes: 402653184
 }

@@ -54,7 +54,7 @@ trusted proxy, read-only rootfs, 256 MiB memory and 64-PID limits, and proves
 the control health endpoint and data listener are reachable.
 
 The package job then subjects the exact raw binary to the full protocol and
-recovery workload in a server-only, no-swap 256 MiB cgroup. Publication requires
+recovery workload in a server-only, no-swap 384 MiB cgroup. Publication requires
 zero OOM events, a bounded process high-water measurement, an observed cgroup
 high-water measurement, matching artifact and in-image hashes, and a graceful
 exit.
@@ -133,7 +133,8 @@ docker run -d \
   --network host \
   --stop-timeout 30 \
   --read-only \
-  --memory 256m \
+  --memory 384m \
+  --memory-swap 384m \
   --pids-limit 64 \
   --ulimit nofile=4096:4096 \
   --tmpfs /tmp:rw,noexec,nosuid,nodev,size=32m,mode=1777 \
@@ -157,7 +158,7 @@ stable, exclusive peer IP; an ingress fleet cannot be represented by this
 exact-IP option. Apply ingress per-source sign-in limits and a NetworkPolicy,
 and use `runAsUser`/`runAsGroup`/`fsGroup` 65532,
 `fsGroupChangePolicy: OnRootMismatch`, `readOnlyRootFilesystem: true`, a 32 MiB
-memory-backed `/tmp`, `terminationGracePeriodSeconds` of at least 30, a 256 MiB
+memory-backed `/tmp`, `terminationGracePeriodSeconds` of at least 30, a 384 MiB
 memory limit, a 64-PID limit where supported, and a locally backed PVC with
 verified ownership. Never expose the server through a public NodePort,
 LoadBalancer, or direct host-wide bind. Qualify that exact ingress topology

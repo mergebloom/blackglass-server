@@ -66,7 +66,7 @@ function validReport(): any {
     deltaRssKiB: 92_160,
     peakRssMiB: 100,
     deltaRssMiB: 90,
-    processRssMarginMiB: 156,
+    processRssMarginMiB: 284,
     execution: {
       nativeTarget: "linux-amd64",
       hostPlatform: "linux",
@@ -98,15 +98,15 @@ function validReport(): any {
       // Linux may temporarily report a peak above memory.max while direct
       // reclaim succeeds; the zero OOM counters remain the failure boundary.
       memoryPeakBytes: 270_000_000,
-      memoryMaxBytes: 268_435_456,
+      memoryMaxBytes: 402_653_184,
       memorySwapMaxBytes: 0,
       memoryEventsBefore: eventsBefore,
       memoryEvents,
       memoryEventDelta,
     },
     container: {
-      dockerMemoryLimitBytes: 268_435_456,
-      dockerMemorySwapTotalBytes: 268_435_456,
+      dockerMemoryLimitBytes: 402_653_184,
+      dockerMemorySwapTotalBytes: 402_653_184,
       gracefulExit: true,
       exitCode: 0,
       oomKilled: false,
@@ -116,13 +116,13 @@ function validReport(): any {
     stagingEntries: [".blackglass-staging-v1"],
     unexpectedStagingEntries: [],
     limits: {
-      serviceMemoryMaxMiB: 256,
-      minimumProcessRssMarginMiB: 32,
+      serviceMemoryMaxMiB: 384,
+      minimumProcessRssMarginMiB: 160,
       maxPeakProcessRssMiB: 224,
       maxDeltaProcessRssMiB: 128,
-      memoryMaxBytes: 268_435_456,
+      memoryMaxBytes: 402_653_184,
       memorySwapMaxBytes: 0,
-      dockerMemorySwapTotalBytes: 268_435_456,
+      dockerMemorySwapTotalBytes: 402_653_184,
     },
   };
 }
