@@ -86,6 +86,11 @@ version=$(jq -er '.version' "$source_tree/package.json")
 target_directory="$project_root/apps/server-rust/target"
 destination_directory="$target_directory/release"
 binary="$destination_directory/blackglass-server"
+build_target_directory="$target_directory/native-release-cache"
+test ! -L "$target_directory"
+mkdir -p "$build_target_directory"
+test ! -L "$build_target_directory"
+test -d "$build_target_directory"
 if test -e "$binary" && test "$force_rebuild" != 1; then
     test ! -L "$target_directory"
     test ! -L "$destination_directory"
@@ -97,7 +102,6 @@ if test -e "$binary" && test "$force_rebuild" != 1; then
     fi
     echo "rebuilding stale native release binary: $binary" >&2
 fi
-build_target_directory="$temporary/cargo-target"
 (
     unset CDPATH
     cd -- "$source_tree"

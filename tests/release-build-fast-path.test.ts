@@ -38,6 +38,8 @@ describe("release build fast paths", () => {
     expect(script).toContain('BLACKGLASS_FORCE_REBUILD:-0');
     expect(script).toContain("rebuilding stale native release binary:");
     expect(script).toContain("BLACKGLASS_FORCE_REBUILD must be 0 or 1");
+    expect(script).toContain('build_target_directory="$target_directory/native-release-cache"');
+    expect(script).toContain('test ! -L "$build_target_directory"');
     expect(script.indexOf("native release already ready:")).toBeLessThan(
       script.indexOf('cargo test --locked'),
     );

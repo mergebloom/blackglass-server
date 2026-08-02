@@ -76,9 +76,10 @@ package and lockfile versions must all match.
 
 Repeated builds are cheap and fail closed. A complete Linux artifact set is
 verified against the exact source revision and reused; a partial or stale set
-is rejected. The native builder likewise reuses an already attested binary.
-BuildKit keeps architecture-specific Cargo registry and compiled-output caches,
-but copies the qualified binary out of the cache before packaging. CI may skip
+is rejected. The native builder likewise reuses an already attested binary and
+keeps an ignored Cargo target cache between exact-source builds. BuildKit keeps
+architecture-specific Cargo registry and compiled-output caches. Both builders
+copy the qualified binary out of their cache before publication. CI may skip
 the duplicate release-unit-test invocation only when
 `BLACKGLASS_TESTED_SOURCE_REVISION` exactly equals the clean source commit that
 passed the preceding gate; local standalone builds run the tests normally.
