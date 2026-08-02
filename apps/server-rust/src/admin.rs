@@ -1,6 +1,6 @@
 use crate::{
     db::{AdminActivity, AdminDatabaseSnapshot, AdminSession, AdminUser, AdminVault},
-    server::AppState,
+    server::{AppState, DatabaseOperation, observe_database_error},
 };
 use anyhow::{Result, bail};
 use axum::{
@@ -511,6 +511,10 @@ async fn snapshot(
     let expected_host = s.config.public_data_host.clone();
     let data = match tokio::task::spawn_blocking(move || db.admin_snapshot(&expected_host)).await {
         Ok(Ok(v)) => v,
+        Ok(Err(error)) => {
+            observe_database_error(s, DatabaseOperation::AdminSnapshot, &error);
+            return StatusCode::SERVICE_UNAVAILABLE.into_response();
+        }
         _ => return StatusCode::SERVICE_UNAVAILABLE.into_response(),
     };
     Json(build_snapshot(s, data)).into_response()

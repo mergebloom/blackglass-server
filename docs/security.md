@@ -30,6 +30,7 @@ E2EE does not hide those facts.
 | SQLite corruption or hostile schema | WAL with FULL synchronous commits, foreign keys, defensive/untrusted-schema connections, copy-first offline per-version migrations with transactional validation/rollback, graceful checkpoint, online backup API, exact schema/logical verification, and restore drills |
 | Endpoint rotation | Canonical data-host validation, startup equality gate across persisted vaults, and a verified-backup-first transactional rebind command |
 | Data leakage through logs | Structured events omit credentials, tokens, ciphertext paths/hashes/bodies, and managed vault recovery passwords |
+| Data leakage through metrics | Authorization and SQLite counters use fixed operation/reason labels only; no tenant, account, vault, session, database error, or payload value becomes a label |
 | Privilege escalation | Static unprivileged systemd user, empty capabilities, strict filesystem/device/kernel protections, syscall and address-family restrictions |
 | Client drift | Version-specific deterministic patch anchors, upstream/generated hashes, updates disabled in the copied profile, and official-client E2E qualification |
 | Dependency supply chain | Locked crates, a checksum-pinned advisory/license/source scanner, explicit license allowlist, Cargo plus native/runtime notices, digest-pinned build images, and commit-pinned CI actions |

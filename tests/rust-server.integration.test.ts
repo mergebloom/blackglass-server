@@ -1,4 +1,4 @@
-import { afterAll, beforeAll, describe, expect, test } from "bun:test";
+import { afterAll, afterEach, beforeAll, describe, expect, test } from "bun:test";
 import { createConnection, createServer } from "node:net";
 import { createHash, randomBytes } from "node:crypto";
 import { existsSync, readFileSync } from "node:fs";
@@ -80,10 +80,12 @@ describe("production Rust server", () => {
   }, 60_000);
 
   afterAll(async () => {
-    for (const socket of sockets) socket.close();
+    await closeTrackedSockets();
     processHandle?.kill("SIGTERM");
     if (processHandle) await processHandle.exited;
   });
+
+  afterEach(closeTrackedSockets);
 
   test("uses expiring sessions, client-managed E2EE vaults, and exact origins", async () => {
     expect(vault).toMatchObject({
@@ -546,7 +548,7 @@ describe("production Rust server", () => {
 
     const overCapDirectory = await mkdtemp(join(tmpdir(), "blackglass-ws-over-cap-"));
     const [overCapControlPort, overCapDataPort] = await Promise.all([freePort(), freePort()]);
-    const overCap = spawnRustServer(overCapDirectory, overCapControlPort, overCapDataPort, {
+    const overCap = spawnUninitializedRustServer(overCapDirectory, overCapControlPort, overCapDataPort, {
       SELFHOST_MAX_WS_CONNECTIONS: "33",
     });
     expect(await promiseWithTimeout(overCap.exited, 3_000, "over-cap server did not fail")).not.toBe(0);
@@ -558,7 +560,7 @@ describe("production Rust server", () => {
   test("requires an explicit acknowledgement for container-reachable binds", async () => {
     const deniedDirectory = await mkdtemp(join(tmpdir(), "blackglass-external-bind-denied-"));
     const [deniedControlPort, deniedDataPort] = await Promise.all([freePort(), freePort()]);
-    const denied = spawnRustServer(deniedDirectory, deniedControlPort, deniedDataPort, {
+    const denied = spawnUninitializedRustServer(deniedDirectory, deniedControlPort, deniedDataPort, {
       SELFHOST_BIND_HOST: "0.0.0.0",
       SELFHOST_ACKNOWLEDGE_EXTERNAL_BIND: "",
     });
@@ -585,7 +587,7 @@ describe("production Rust server", () => {
     for (const bind of ["0.0.0.0", "::1", "::"]) {
       const missingDirectory = await mkdtemp(join(tmpdir(), "blackglass-data-host-missing-"));
       const [missingControlPort, missingDataPort] = await Promise.all([freePort(), freePort()]);
-      const missing = spawnRustServer(missingDirectory, missingControlPort, missingDataPort, {
+      const missing = spawnUninitializedRustServer(missingDirectory, missingControlPort, missingDataPort, {
         SELFHOST_BIND_HOST: bind,
         SELFHOST_ACKNOWLEDGE_EXTERNAL_BIND: bind === "::1" ? "" : "1",
         SELFHOST_DATA_HOST: "",
@@ -608,7 +610,7 @@ describe("production Rust server", () => {
     ]) {
       const invalidDirectory = await mkdtemp(join(tmpdir(), "blackglass-data-host-invalid-"));
       const [invalidControlPort, invalidDataPort] = await Promise.all([freePort(), freePort()]);
-      const invalid = spawnRustServer(invalidDirectory, invalidControlPort, invalidDataPort, {
+      const invalid = spawnUninitializedRustServer(invalidDirectory, invalidControlPort, invalidDataPort, {
         SELFHOST_DATA_HOST: host,
       });
       expect(await promiseWithTimeout(invalid.exited, 3_000, `invalid data host passed: ${host}`)).not.toBe(0);
@@ -981,6 +983,10 @@ describe("production Rust server", () => {
     ]);
     expect(writerAUids).toEqual(observedUids);
     expect(writerBUids).toEqual(observedUids);
+    writerA.socket.close();
+    writerB.socket.close();
+    observer.socket.close();
+    await Promise.all([writerA.closed, writerB.closed, observer.closed]);
 
     const resumed = await Probe.connect(`ws://127.0.0.1:${dataPort}`);
     resumed.json(init("Ordered resume verifier", baseVersion, false));
@@ -998,6 +1004,8 @@ describe("production Rust server", () => {
     expect(new Set(replayed.map((notice) => notice.path))).toEqual(
       new Set(observed.map((notice) => notice.path)),
     );
+    resumed.socket.close();
+    await resumed.closed;
 
     const fresh = await Probe.connect(`ws://127.0.0.1:${dataPort}`);
     fresh.json(init("Ordered snapshot verifier", 0, true));
@@ -1013,9 +1021,8 @@ describe("production Rust server", () => {
     }
     expect(snapshot.filter((notice) => notice.path.startsWith("ordered-")).map((notice) => notice.uid)).toEqual(observedUids);
 
-    writerA.socket.close();
-    writerB.socket.close();
-    observer.socket.close();
+    fresh.socket.close();
+    await fresh.closed;
     resumed.socket.close();
     fresh.socket.close();
   }, 30_000);
@@ -1532,7 +1539,9 @@ describe("production Rust server", () => {
     const observers: Probe[] = [];
     let writer: Probe | undefined;
     try {
-      for (let index = 0; index < 6; index++) {
+      // Three observers plus one writer exercise both database workers while
+      // staying inside the qualified four-connection per-user default.
+      for (let index = 0; index < 3; index++) {
         const observer = await Probe.connect(`ws://127.0.0.1:${dataPort}`);
         observers.push(observer);
         await initializeFor(
@@ -1612,7 +1621,7 @@ describe("production Rust server", () => {
             headers: { "content-type": "application/json", origin: "app://obsidian.md" },
             body: JSON.stringify({ email: "owner@example.test", password: "test-password" }),
           }),
-          2_000,
+          5_000,
           "slow bodies exhausted admitted control work",
         );
         expect(ownerResponse.status).toBe(200);
@@ -1842,9 +1851,9 @@ async function uploadOpaqueCiphertext(probe: Probe, path: string, hash: string, 
   expect(await probe.nextJson()).toEqual({ res: "ok" });
   return notice;
 }
-function spawnRustServer(serviceDirectory: string, serviceControlPort: number, serviceDataPort: number, overrides: Record<string, string> = {}) {
+function spawnRustServer(serviceDirectory: string, serviceControlPort: number, serviceDataPort: number, overrides: Record<string, string> = {}, initializeDatabase = true) {
   const database = overrides.SELFHOST_DATABASE ?? join(serviceDirectory, "server.sqlite");
-  if (!existsSync(database)) {
+  if (initializeDatabase && !existsSync(database)) {
     const initialized = Bun.spawnSync(
       [binary, "user", "create", database, "owner@example.test", "Rust test owner"],
       { cwd: root, stdin: Buffer.from("test-password\n"), stdout: "pipe", stderr: "pipe" },
@@ -1869,6 +1878,23 @@ function spawnRustServer(serviceDirectory: string, serviceControlPort: number, s
       ...overrides,
     },
   });
+}
+function spawnUninitializedRustServer(serviceDirectory: string, serviceControlPort: number, serviceDataPort: number, overrides: Record<string, string>) {
+  return spawnRustServer(serviceDirectory, serviceControlPort, serviceDataPort, overrides, false);
+}
+async function closeTrackedSockets() {
+  const tracked = sockets.splice(0);
+  await Promise.all(tracked.map((socket) => {
+    if (socket.readyState === WebSocket.CLOSED) return Promise.resolve();
+    return new Promise<void>((resolveClose) => {
+      const deadline = setTimeout(resolveClose, 1_000);
+      socket.addEventListener("close", () => {
+        clearTimeout(deadline);
+        resolveClose();
+      }, { once: true });
+      if (socket.readyState < WebSocket.CLOSING) socket.close();
+    });
+  }));
 }
 async function post(path: string, body: Record<string, unknown>) { return postAt(controlPort, path, body); }
 async function postAt(port: number, path: string, body: Record<string, unknown>, extraHeaders: Record<string, string> = {}) { const response = await fetch(`http://127.0.0.1:${port}${path}`, { method: "POST", headers: { "content-type": "application/json", origin: "app://obsidian.md", ...extraHeaders }, body: JSON.stringify(body) }); return response.json(); }

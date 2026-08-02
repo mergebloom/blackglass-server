@@ -99,6 +99,15 @@ describe("Phase 3 tenant isolation", () => {
     expect(
       await post("/vault/delete", { token: outsiderToken, vault_uid: ownerVault.id }),
     ).toEqual({ error: "Unable to delete vault" });
+    expect(
+      await post("/vault/migrate", {
+        token: memberToken,
+        vault_uid: ownerVault.id,
+        keyhash: "replacement-keyhash",
+        salt: "replacement-salt",
+        encryption_version: 3,
+      }),
+    ).toEqual({ error: "Unable to migrate vault" });
     expect((await post("/vault/list", { token: ownerToken })).vaults[0].name).toBe(
       "Owner vault",
     );
@@ -176,6 +185,35 @@ describe("Phase 3 tenant isolation", () => {
     cross.json(init(memberToken, ownerVault, "Cross-tenant device"));
     expect(await cross.nextJson()).toEqual({ res: "err", msg: "Vault not found" });
     expect((await cross.closed).code).toBe(1008);
+    const metrics = await (
+      await fetch(`http://127.0.0.1:${controlPort}/metrics`)
+    ).text();
+    expect(metricValue(
+      metrics,
+      'blackglass_authorization_denials_total{operation="access",reason="not_authorized"}',
+    )).toBeGreaterThanOrEqual(1);
+    expect(metricValue(
+      metrics,
+      'blackglass_authorization_denials_total{operation="rename",reason="not_authorized"}',
+    )).toBeGreaterThanOrEqual(1);
+    expect(metricValue(
+      metrics,
+      'blackglass_authorization_denials_total{operation="delete",reason="not_authorized"}',
+    )).toBeGreaterThanOrEqual(1);
+    expect(metricValue(
+      metrics,
+      'blackglass_authorization_denials_total{operation="migrate",reason="not_authorized"}',
+    )).toBeGreaterThanOrEqual(1);
+    expect(metricValue(
+      metrics,
+      'blackglass_authorization_denials_total{operation="data_init",reason="not_authorized"}',
+    )).toBeGreaterThanOrEqual(1);
+    expect(metrics).toContain(
+      'blackglass_sqlite_busy_total{operation="request"} 0',
+    );
+    expect(metrics).toContain(
+      'blackglass_sqlite_deadlines_total{operation="admin_snapshot"} 0',
+    );
     owner.socket.close();
     ownerSecond.socket.close();
     member.socket.close();
@@ -372,6 +410,12 @@ function withTimeout<T>(promise: Promise<T>, milliseconds: number): Promise<T> {
       setTimeout(() => reject(new Error("operation timed out")), milliseconds),
     ),
   ]);
+}
+
+function metricValue(metrics: string, name: string): number {
+  const line = metrics.split("\n").find((candidate) => candidate.startsWith(`${name} `));
+  if (!line) throw new Error(`missing metric ${name}`);
+  return Number(line.slice(name.length + 1));
 }
 
 class Probe {

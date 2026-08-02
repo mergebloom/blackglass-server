@@ -51,6 +51,9 @@ state inconsistencies instead of silently repairing an unknown database.
 Recognized older schemas are upgraded only through an offline, copy-first
 command whose per-version validation runs inside each migration transaction.
 SQLite connections use defensive mode with trusted schemas disabled.
+Database work has a bounded worker queue, SQLite busy timeout, and dedicated
+admin-query deadline. Fixed-cardinality metrics distinguish request and admin
+snapshot pressure without database text or tenant identifiers.
 Current revisions store encrypted paths, encrypted hashes, and encrypted file
 bodies. A separate server timestamp supports history even when a deletion has
 zero file timestamps. The service is content-blind but not metadata-blind:
@@ -65,7 +68,7 @@ That boundary allows server upgrades and client-release maintenance to proceed
 independently. Unknown client protocol changes must fail qualification rather
 than being guessed at in production.
 
-Every current Bridge qualification report is bound to the server binary's
+Every current Blackglass qualification report is bound to the server binary's
 reported semantic version, byte size, architecture, and SHA-256. Rebuilding or
 renaming a binary creates a new artifact that must earn a new client E2E record.
 

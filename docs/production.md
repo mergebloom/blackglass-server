@@ -175,6 +175,13 @@ that stopped making progress during an upload.
 Alert on `blackglass_storage_quota_rejections_total` and record
 `blackglass_storage_quota_bytes` alongside host disk capacity. A quota
 rejection is an expected bounded client error, not a server fault.
+Alert on unexpected increases in `blackglass_authorization_denials_total`;
+its fixed `operation` and `reason` labels identify the denied protocol surface
+without tenant, vault, session, or payload data. Alert on any sustained increase
+in `blackglass_sqlite_busy_total` or `blackglass_sqlite_deadlines_total`.
+Those counters use only the fixed `request` and `admin_snapshot` operation
+labels. A single busy event can be transient; a continuing increase indicates
+storage contention, an undersized host, or an unexpectedly expensive query.
 
 The `v0.3.0` archive includes `release-contract.json`. Release automation
 checks that it binds server 0.3.0 to schema 5, the supported migration sources,

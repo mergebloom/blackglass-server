@@ -54,6 +54,7 @@ const GRACEFUL_CONNECTION_DRAIN_DEADLINE: Duration = Duration::from_secs(15);
 const SESSION_REVALIDATE_INTERVAL: Duration = Duration::from_secs(5);
 const SOCKET_WRITE_TIMEOUT: Duration = Duration::from_secs(10);
 const SIGNIN_QUEUE_TIMEOUT: Duration = Duration::from_secs(10);
+const DB_WORKER_QUEUE_DEADLINE: Duration = Duration::from_secs(5);
 const SIGNIN_RATE_WINDOW: Duration = Duration::from_secs(60);
 const SIGNIN_ATTEMPTS_PER_SOURCE: usize = 6;
 const MAX_SIGNIN_WAITERS: usize = 8;
@@ -91,6 +92,71 @@ pub struct Metrics {
     downloads: AtomicU64,
     errors: AtomicU64,
     control_rejections: AtomicU64,
+    authorization_denials: [AtomicU64; AuthorizationOperation::COUNT],
+    database_busy: [AtomicU64; DatabaseOperation::COUNT],
+    database_deadlines: [AtomicU64; DatabaseOperation::COUNT],
+}
+
+#[derive(Clone, Copy)]
+enum AuthorizationOperation {
+    Access,
+    Migrate,
+    Rename,
+    Delete,
+    DataInit,
+}
+
+impl AuthorizationOperation {
+    const COUNT: usize = 5;
+    const ALL: [(Self, &'static str); Self::COUNT] = [
+        (Self::Access, "access"),
+        (Self::Migrate, "migrate"),
+        (Self::Rename, "rename"),
+        (Self::Delete, "delete"),
+        (Self::DataInit, "data_init"),
+    ];
+}
+
+#[derive(Clone, Copy)]
+pub(crate) enum DatabaseOperation {
+    Request,
+    AdminSnapshot,
+}
+
+impl DatabaseOperation {
+    const COUNT: usize = 2;
+    const ALL: [(Self, &'static str); Self::COUNT] = [
+        (Self::Request, "request"),
+        (Self::AdminSnapshot, "admin_snapshot"),
+    ];
+}
+
+impl Metrics {
+    fn deny(&self, operation: AuthorizationOperation) {
+        self.authorization_denials[operation as usize].fetch_add(1, Ordering::Relaxed);
+    }
+
+    fn database_deadline(&self, operation: DatabaseOperation) {
+        self.database_deadlines[operation as usize].fetch_add(1, Ordering::Relaxed);
+    }
+
+    fn observe_database_error(&self, operation: DatabaseOperation, error: &anyhow::Error) {
+        for cause in error.chain() {
+            let Some(sqlite) = cause.downcast_ref::<rusqlite::Error>() else {
+                continue;
+            };
+            match sqlite.sqlite_error_code() {
+                Some(rusqlite::ErrorCode::DatabaseBusy | rusqlite::ErrorCode::DatabaseLocked) => {
+                    self.database_busy[operation as usize].fetch_add(1, Ordering::Relaxed);
+                }
+                Some(rusqlite::ErrorCode::OperationInterrupted) => {
+                    self.database_deadline(operation);
+                }
+                _ => {}
+            }
+            break;
+        }
+    }
 }
 
 #[derive(Clone)]
@@ -482,7 +548,7 @@ async fn ready(State(s): State<AppState>) -> Response {
 }
 async fn metrics(State(s): State<AppState>) -> Response {
     let m = &s.metrics;
-    let body = format!(
+    let mut body = format!(
         "blackglass_control_requests_total {}\nblackglass_control_rejections_total {}\nblackglass_signins_total {}\nblackglass_auth_failures_total {}\nblackglass_ws_connections_total {}\nblackglass_uploads_total {}\nblackglass_upload_bytes_total {}\nblackglass_upload_timeouts_total {}\nblackglass_storage_quota_bytes {}\nblackglass_storage_quota_rejections_total {}\nblackglass_downloads_total {}\nblackglass_errors_total {}\nobsidian_sync_control_requests_total {}\nobsidian_sync_signins_total {}\nobsidian_sync_auth_failures_total {}\nobsidian_sync_ws_connections_total {}\nobsidian_sync_uploads_total {}\nobsidian_sync_upload_bytes_total {}\nobsidian_sync_downloads_total {}\nobsidian_sync_errors_total {}\n",
         m.control.load(Ordering::Relaxed),
         m.control_rejections.load(Ordering::Relaxed),
@@ -505,6 +571,19 @@ async fn metrics(State(s): State<AppState>) -> Response {
         m.downloads.load(Ordering::Relaxed),
         m.errors.load(Ordering::Relaxed)
     );
+    for (operation, label) in AuthorizationOperation::ALL {
+        body.push_str(&format!(
+            "blackglass_authorization_denials_total{{operation=\"{label}\",reason=\"not_authorized\"}} {}\n",
+            m.authorization_denials[operation as usize].load(Ordering::Relaxed)
+        ));
+    }
+    for (operation, label) in DatabaseOperation::ALL {
+        body.push_str(&format!(
+            "blackglass_sqlite_busy_total{{operation=\"{label}\"}} {}\nblackglass_sqlite_deadlines_total{{operation=\"{label}\"}} {}\n",
+            m.database_busy[operation as usize].load(Ordering::Relaxed),
+            m.database_deadlines[operation as usize].load(Ordering::Relaxed)
+        ));
+    }
     (
         [
             (header::CONTENT_TYPE, "text/plain; version=0.0.4"),
@@ -801,10 +880,13 @@ async fn access_vault(
         serde_json::from_value(v).map_err(|_| "Unable to access vault".to_string())?;
     let id = r.vault_uid.ok_or("Unable to access vault")?;
     let lookup_id = id.clone();
-    let mut vault = db_task(s, move |db| db.find_owned_vault(user_id, &lookup_id))
+    let Some(mut vault) = db_task(s, move |db| db.find_owned_vault(user_id, &lookup_id))
         .await
         .map_err(internal)?
-        .ok_or("Unable to access vault")?;
+    else {
+        s.metrics.deny(AuthorizationOperation::Access);
+        return Err("Unable to access vault".into());
+    };
     if r.host.as_deref() != Some(&vault.host)
         || r.encryption_version != Some(vault.encryption_version)
     {
@@ -848,10 +930,13 @@ async fn migrate_vault(
     } = vault_credentials(r.keyhash, r.salt)?;
     let _commit = s.commit_order.lock().await;
     let lookup_id = source_id.clone();
-    let source = db_task(s, move |db| db.find_owned_vault(user_id, &lookup_id))
+    let Some(source) = db_task(s, move |db| db.find_owned_vault(user_id, &lookup_id))
         .await
         .map_err(internal)?
-        .ok_or("Unable to migrate vault")?;
+    else {
+        s.metrics.deny(AuthorizationOperation::Migrate);
+        return Err("Unable to migrate vault".into());
+    };
     if source.encryption_version >= 3 {
         return Err("Vault already uses encryption version 3".into());
     }
@@ -875,6 +960,7 @@ async fn migrate_vault(
     .await
     .map_err(internal)?
     {
+        s.metrics.deny(AuthorizationOperation::Migrate);
         return Err("Unable to migrate vault".into());
     }
     invalidate_vault(s, source_id);
@@ -903,6 +989,7 @@ async fn rename_vault(
     .await
     .map_err(internal)?
     {
+        s.metrics.deny(AuthorizationOperation::Rename);
         return Err("Unable to rename vault".into());
     }
     Ok(json!({}))
@@ -924,6 +1011,7 @@ async fn delete_vault(
     .await
     .map_err(internal)?
     {
+        s.metrics.deny(AuthorizationOperation::Delete);
         return Err("Unable to delete vault".into());
     }
     invalidate_vault(s, id);
@@ -1521,6 +1609,9 @@ async fn init(
     let valid_session = auth_context.is_some();
     let Some(vault) = vault else {
         if valid_session || (token_has_session_shape && retired_vault) {
+            if valid_session {
+                s.metrics.deny(AuthorizationOperation::DataInit);
+            }
             send(tx, json!({"res":"err","msg":"Vault not found"})).await?;
             return close(tx, 1008, "Vault not found").await;
         }
@@ -2446,12 +2537,19 @@ where
     T: Send + 'static,
     F: FnOnce(Db) -> Result<T> + Send + 'static,
 {
-    let permit = state
-        .db_workers
-        .clone()
-        .acquire_owned()
-        .await
-        .context("database worker pool stopped")?;
+    let permit = match timeout(
+        DB_WORKER_QUEUE_DEADLINE,
+        state.db_workers.clone().acquire_owned(),
+    )
+    .await
+    {
+        Ok(Ok(permit)) => permit,
+        Ok(Err(_)) => return Err(anyhow::anyhow!("database worker pool stopped")),
+        Err(_) => {
+            state.metrics.database_deadline(DatabaseOperation::Request);
+            return Err(anyhow::anyhow!("database worker deadline exceeded"));
+        }
+    };
     spawn_db_task(state, permit, operation).await
 }
 
@@ -2478,12 +2576,26 @@ where
     F: FnOnce(Db) -> Result<T> + Send + 'static,
 {
     let database = state.db.clone();
-    tokio::task::spawn_blocking(move || {
+    let result = tokio::task::spawn_blocking(move || {
         let _permit = permit;
         operation(database)
     })
     .await
-    .context("database worker stopped")?
+    .context("database worker stopped")?;
+    if let Err(error) = &result {
+        state
+            .metrics
+            .observe_database_error(DatabaseOperation::Request, error);
+    }
+    result
+}
+
+pub(crate) fn observe_database_error(
+    state: &AppState,
+    operation: DatabaseOperation,
+    error: &anyhow::Error,
+) {
+    state.metrics.observe_database_error(operation, error);
 }
 
 async fn session_active(s: &AppState, session: &Session) -> bool {
@@ -2902,6 +3014,38 @@ mod tests {
         drop(second);
         drop(third);
         assert_eq!(reservations.reserved(), 0);
+    }
+
+    #[test]
+    fn database_metrics_classify_only_fixed_busy_and_deadline_reasons() {
+        let metrics = Metrics::default();
+        let busy = anyhow::Error::new(rusqlite::Error::SqliteFailure(
+            rusqlite::ffi::Error::new(rusqlite::ffi::SQLITE_BUSY),
+            Some("untrusted detail".into()),
+        ));
+        let interrupted = anyhow::Error::new(rusqlite::Error::SqliteFailure(
+            rusqlite::ffi::Error::new(rusqlite::ffi::SQLITE_INTERRUPT),
+            None,
+        ));
+        let unrelated = anyhow::anyhow!("untrusted detail");
+
+        metrics.observe_database_error(DatabaseOperation::Request, &busy);
+        metrics.observe_database_error(DatabaseOperation::AdminSnapshot, &interrupted);
+        metrics.observe_database_error(DatabaseOperation::Request, &unrelated);
+
+        assert_eq!(
+            metrics.database_busy[DatabaseOperation::Request as usize].load(Ordering::Relaxed),
+            1
+        );
+        assert_eq!(
+            metrics.database_deadlines[DatabaseOperation::AdminSnapshot as usize]
+                .load(Ordering::Relaxed),
+            1
+        );
+        assert_eq!(
+            metrics.database_deadlines[DatabaseOperation::Request as usize].load(Ordering::Relaxed),
+            0
+        );
     }
 
     #[test]
