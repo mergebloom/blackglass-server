@@ -52,7 +52,7 @@ The Sync client persists a control-plane-provided `host`. It derives:
 
 The unadapted reference client currently accepts `127.0.0.1` or a hostname
 ending in `.obsidian.md`. The compatibility adapter replaces this with an exact
-configured-host check. Server and Bridge validation share the transport-safe
+configured-host check. Server and client validation share the transport-safe
 endpoint rules: exact `127.0.0.1`/`localhost` for plaintext development or a
 canonical production host for WSS; explicit `:443`, deceptive loopback
 prefixes, IPv6 loopback, and other 127/8 addresses are rejected.

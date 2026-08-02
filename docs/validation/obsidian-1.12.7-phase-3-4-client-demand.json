@@ -8,8 +8,8 @@
     "officialAssetUrl": "https://github.com/obsidianmd/obsidian-releases/releases/download/v1.12.7/obsidian-1.12.7.asar.gz",
     "compressedSha256": "75dd34f14c9db558fbad19e80f0b201bc9805b51b7388370277e0f91a38bd850",
     "decompressedAsarSha256": "2b2483b2e1246772e0d25367ec055cbc5047ea2f0091b667c35656678f86d712",
-    "bridgePatchAnchorsReady": true,
-    "bridgePatchAnchorCount": 6
+    "clientPatchAnchorsReady": true,
+    "clientPatchAnchorCount": 6
   },
   "controlPlane": {
     "vaultList": {

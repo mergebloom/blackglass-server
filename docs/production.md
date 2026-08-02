@@ -205,7 +205,7 @@ outcome labels contain no email address, user ID, vault ID, or target digest.
 
 The `v0.4.0` archive includes `release-contract.json`. Release automation
 checks that it binds server 0.4.0 to schema 6 and schema-5 migration input,
-the previous rollback tag, the exact Bridge tooling revision, both qualified
+the previous rollback tag, the exact client tooling revision, both qualified
 renderer baselines, and the required primary/recovery monitoring selectors.
 
 ## Backup and recovery

@@ -16,7 +16,7 @@ Evidence:
 - Machine-readable scrubbed evidence: [`../validation/obsidian-1.12.7-phase-3-4-client-demand.json`](../validation/obsidian-1.12.7-phase-3-4-client-demand.json)
 - Obsidian 1.13.4 official DMG SHA-256: `e84b9595aba5e50221c97e43d3e3f437416edfbf4c4a84c379461e70f854d78f`
 - Obsidian 1.13.4 verified renderer ASAR SHA-256: `51218495ad940a8515b202d380bde638be6570a198e121f7ca6d484a8a158917`
-- The companion Bridge repository's reviewed `compatibility/obsidian-1.13.4.json` baseline and versioned protocol delta.
+- The companion Blackglass client repository's reviewed `compatibility/obsidian-1.13.4.json` baseline and versioned protocol delta.
 - Existing Blackglass protocol notes and deterministic integration tests.
 - [Obsidian's public collaboration documentation](https://obsidian.md/help/sync/collaborate) and [Sync security documentation](https://obsidian.md/help/sync/security), used only to explain user-visible semantics. The client artifact remains the protocol authority.
 

@@ -56,7 +56,7 @@ Do not store or redistribute renderer source. Generated evidence may contain rou
 
 ### Task 0.2 — Add protocol types and synthetic fixtures
 
-Merge in this order so the observed Bridge contract is the source for the server fixture:
+Merge in this order so the observed Blackglass client contract is the source for the server fixture:
 
 1. In `blackglass`, extend `tests/client-adapter.test.ts` and `tools/analyze-release.ts` with scrubbed shape assertions.
 2. In `blackglass-server`, update `packages/protocol/src/control.ts`, `packages/protocol/src/sync.ts`, and add the matching cases to `tests/client-contract.integration.test.ts`.
@@ -75,9 +75,9 @@ Keep pending invitations as a contract fixture, but do not implement an undelive
 
 Before changing server behavior:
 
-1. Re-run Bridge analysis against the official 1.12.7 artifact and the reviewed 1.13.4 candidate artifact.
+1. Re-run Blackglass client analysis against the official 1.12.7 artifact and the reviewed 1.13.4 candidate artifact.
 2. Verify each published compressed-artifact digest and record each decompressed ASAR digest.
-3. Re-run current single-owner server and bridge tests.
+3. Re-run current single-owner server and client tests.
 4. Run the existing two-client single-owner macOS E2E for both qualified renderer versions from copied profiles and temporary vaults.
 5. Save a scrubbed validation manifest; retain no account secrets, local-vault content, or renderer source.
 
@@ -363,7 +363,7 @@ Gate: Phase 3 is releasable only after static analysis, Rust tests, Bun/integrat
 
 ## Release and schema boundaries
 
-Phase 3 is released as `v0.3.0` with schema v5. Phase 4 is released as `v0.4.0` with schema v6. Each release manifest records the exact supported source schema, destination schema, previous rollback binary/tag, Bridge tooling revision, and qualified renderer matrix. Release automation must reject a tag/version/schema disagreement.
+Phase 3 is released as `v0.3.0` with schema v5. Phase 4 is released as `v0.4.0` with schema v6. Each release manifest records the exact supported source schema, destination schema, previous rollback binary/tag, client tooling revision, and qualified renderer matrix. Release automation must reject a tag/version/schema disagreement.
 
 ## Phase 3 production rollout
 
@@ -650,7 +650,7 @@ bun test tests/collaboration.integration.test.ts
 git diff --check
 ```
 
-Minimum Bridge commands from `blackglass`:
+Minimum Blackglass client commands from `blackglass`:
 
 ```sh
 bun run check
