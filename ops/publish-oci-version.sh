@@ -42,19 +42,6 @@ expected_image="ghcr.io/${GITHUB_REPOSITORY,,}"
   exit 1
 }
 
-owner=${GITHUB_REPOSITORY%%/*}
-package=${GITHUB_REPOSITORY#*/}
-package=${package,,}
-owner_type=$(gh api "repos/${GITHUB_REPOSITORY}" --jq '.owner.type')
-case "$owner_type" in
-  Organization) packages_endpoint="orgs/${owner}/packages?package_type=container&per_page=100" ;;
-  User) packages_endpoint="users/${owner}/packages?package_type=container&per_page=100" ;;
-  *)
-    echo "error: unsupported GitHub repository owner type: $owner_type" >&2
-    exit 1
-    ;;
-esac
-
 source_date_epoch=$(git show -s --format=%ct "$source_revision")
 [[ "$source_date_epoch" =~ ^[0-9]+$ ]] || {
   echo "error: could not resolve the source commit timestamp" >&2
@@ -63,8 +50,6 @@ source_date_epoch=$(git show -s --format=%ct "$source_revision")
 export SOURCE_DATE_EPOCH=$source_date_epoch
 
 work=$(mktemp -d)
-versions_json="$work/versions.json"
-packages_json="$work/packages.json"
 candidate_manifest="$work/candidate-manifest.json"
 verification_containers=()
 cleanup() {
@@ -220,58 +205,43 @@ candidate_digest="sha256:$(sha256sum "$candidate_manifest" | awk '{print $1}')"
   exit 1
 }
 
-package_resolved=0
-for _attempt in 1 2 3 4 5 6 7 8 9 10; do
-  gh api --paginate "$packages_endpoint" --slurp | jq 'add' > "$packages_json"
-  package_count=$(jq --arg package "$package" '[.[] | select(.name == $package and .package_type == "container")] | length' "$packages_json")
-  if [[ "$package_count" -eq 1 ]]; then
-    package_resolved=1
+existing_manifest="$work/existing-manifest.json"
+existing_error="$work/existing-manifest.error"
+existing_state=unknown
+# Repository-scoped Actions tokens can publish GHCR images but cannot reliably
+# list every package owned by the user or organization. The registry manifest
+# is the authoritative, repository-local state for this immutable tag.
+for _attempt in 1 2 3 4 5; do
+  if docker buildx imagetools inspect "$image:$version" \
+    --format '{{json .Manifest}}' > "$existing_manifest" 2> "$existing_error"; then
+    existing_state=present
     break
   fi
-  if [[ "$package_count" -gt 1 ]]; then
-    echo "error: multiple accessible GitHub container packages are named ${package}" >&2
-    exit 1
+  if grep -Eiq 'manifest unknown|not found' "$existing_error"; then
+    existing_state=absent
+    break
   fi
   sleep 2
 done
-if [[ "$package_resolved" -ne 1 ]]; then
-  echo "error: the pushed GitHub container package ${package} was not visible after the bounded retry" >&2
-  exit 1
-fi
-package_url=$(jq -er --arg package "$package" '.[] | select(.name == $package and .package_type == "container") | .url' "$packages_json")
-case "$package_url" in
-  https://api.github.com/*) versions_endpoint="${package_url#https://api.github.com/}/versions?per_page=100" ;;
+case "$existing_state" in
+  present)
+    existing_digest=$(jq -er '.digest' "$existing_manifest")
+    if [[ "$existing_digest" != "$candidate_digest" ]]; then
+      echo "error: verified image tag ${version} already points to ${existing_digest}, expected ${candidate_digest}" >&2
+      exit 1
+    fi
+    ;;
+  absent)
+    docker buildx imagetools create \
+      --tag "$image:$version" \
+      "${image_sources[@]}"
+    ;;
   *)
-    echo "error: GitHub returned an unexpected package API URL" >&2
+    echo "error: registry state for immutable image tag ${version} could not be determined" >&2
+    cat "$existing_error" >&2
     exit 1
     ;;
 esac
-
-load_versions() {
-  gh api --paginate "$versions_endpoint" --slurp | jq 'add' > "$versions_json"
-  jq -e 'type == "array"' "$versions_json" >/dev/null
-}
-
-# The per-architecture digest pushes above create the package before this
-# lookup. Therefore any API error is an authentication/transient failure, not
-# evidence that the process-protected version tag is absent.
-load_versions
-tag_count=$(jq --arg tag "$version" '[.[] | select(.metadata.container.tags | index($tag))] | length' "$versions_json")
-if [[ "$tag_count" -gt 1 ]]; then
-  echo "error: multiple container versions claim tag ${version}" >&2
-  exit 1
-fi
-if [[ "$tag_count" -eq 1 ]]; then
-  existing_digest=$(jq -er --arg tag "$version" '.[] | select(.metadata.container.tags | index($tag)) | .name' "$versions_json")
-  if [[ "$existing_digest" != "$candidate_digest" ]]; then
-    echo "error: verified image tag ${version} already points to ${existing_digest}, expected ${candidate_digest}" >&2
-    exit 1
-  fi
-else
-  docker buildx imagetools create \
-    --tag "$image:$version" \
-    "${image_sources[@]}"
-fi
 
 published_manifest="$work/published-manifest.json"
 manifest_visible=0
@@ -298,22 +268,6 @@ jq -e \
     any(.manifests[]; .platform.os == "linux" and .platform.architecture == "amd64" and .digest == $amd64) and
     any(.manifests[]; .platform.os == "linux" and .platform.architecture == "arm64" and .digest == $arm64)
   ' "$published_manifest" >/dev/null
-
-verified=0
-for _attempt in 1 2 3 4 5 6 7 8 9 10; do
-  load_versions
-  tag_count=$(jq --arg tag "$version" '[.[] | select(.metadata.container.tags | index($tag))] | length' "$versions_json")
-  if [[ "$tag_count" -eq 1 ]] &&
-    [[ "$(jq -er --arg tag "$version" '.[] | select(.metadata.container.tags | index($tag)) | .name' "$versions_json")" == "$candidate_digest" ]]; then
-    verified=1
-    break
-  fi
-  sleep 2
-done
-if [[ "$verified" -ne 1 ]]; then
-  echo "error: GitHub Packages did not expose the exact verified image tag" >&2
-  exit 1
-fi
 
 printf 'IMAGE_DIGEST=%s\n' "$candidate_digest" >> "$GITHUB_ENV"
 echo "process-protected OCI image verified: $image:$version@$candidate_digest"

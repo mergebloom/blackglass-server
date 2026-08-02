@@ -36,25 +36,11 @@ if [[ "$version" == *-* ]]; then
   exit 0
 fi
 
-owner=${GITHUB_REPOSITORY%%/*}
-package=${GITHUB_REPOSITORY#*/}
-package=${package,,}
-owner_type=$(gh api "repos/${GITHUB_REPOSITORY}" --jq '.owner.type')
-case "$owner_type" in
-  Organization) packages_endpoint="orgs/${owner}/packages?package_type=container&per_page=100" ;;
-  User) packages_endpoint="users/${owner}/packages?package_type=container&per_page=100" ;;
-  *)
-    echo "error: unsupported GitHub repository owner type: $owner_type" >&2
-    exit 1
-    ;;
-esac
-
-versions_json=$(mktemp)
-packages_json="${versions_json}.packages"
-manifest_json="${versions_json}.manifest"
-release_json="${versions_json}.release"
-latest_release_json="${versions_json}.latest-release"
-trap 'rm -f "$versions_json" "$packages_json" "$manifest_json" "$release_json" "$latest_release_json"' EXIT
+release_list_json=$(mktemp)
+manifest_json="${release_list_json}.manifest"
+release_json="${release_list_json}.release"
+latest_release_json="${release_list_json}.latest-release"
+trap 'rm -f "$release_list_json" "$manifest_json" "$release_json" "$latest_release_json"' EXIT
 
 wait_for_registry_digest() {
   local reference=$1
@@ -84,48 +70,35 @@ wait_for_github_latest_release() {
   return 1
 }
 
-gh api --paginate "$packages_endpoint" --slurp | jq 'add' > "$packages_json"
-package_count=$(jq --arg package "$package" '[.[] | select(.name == $package and .package_type == "container")] | length' "$packages_json")
-if [[ "$package_count" -ne 1 ]]; then
-  echo "error: expected one accessible GitHub container package named ${package}, found ${package_count}" >&2
-  exit 1
-fi
-package_url=$(jq -er --arg package "$package" '.[] | select(.name == $package and .package_type == "container") | .url' "$packages_json")
-case "$package_url" in
-  https://api.github.com/*) versions_endpoint="${package_url#https://api.github.com/}/versions?per_page=100" ;;
-  *)
-    echo "error: GitHub returned an unexpected package API URL" >&2
-    exit 1
-    ;;
-esac
-
-load_versions() {
-  gh api --paginate "$versions_endpoint" --slurp | jq 'add' > "$versions_json"
-  jq -e 'type == "array"' "$versions_json" >/dev/null
-}
-
-load_versions
-version_count=$(jq --arg tag "$version" '[.[] | select(.metadata.container.tags | index($tag))] | length' "$versions_json")
-if [[ "$version_count" -ne 1 ]] ||
-  [[ "$(jq -er --arg tag "$version" '.[] | select(.metadata.container.tags | index($tag)) | .name' "$versions_json")" != "$expected_digest" ]]; then
+if ! wait_for_registry_digest "$image:$version" "$expected_digest"; then
   echo "error: refusing latest promotion without the exact verified version tag" >&2
   exit 1
 fi
 
-highest_stable=$(jq -r '[.[].metadata.container.tags[] | select(test("^(0|[1-9][0-9]*)\\.(0|[1-9][0-9]*)\\.(0|[1-9][0-9]*)$"))] | unique[]' "$versions_json" | sort -V | tail -n 1)
+# Stable ordering belongs to this repository's releases, while exact image
+# identity belongs to GHCR. Avoid owner-wide Packages endpoints: the release
+# job's repository-scoped token is intentionally narrower than that API.
+gh api --paginate "repos/${GITHUB_REPOSITORY}/releases?per_page=100" --slurp \
+  | jq 'add' > "$release_list_json"
+jq -e 'type == "array"' "$release_list_json" >/dev/null
+highest_stable=$(jq -r '
+  [
+    .[]
+    | select(.draft == false and .prerelease == false)
+    | .tag_name
+    | select(test("^v(0|[1-9][0-9]*)\\.(0|[1-9][0-9]*)\\.(0|[1-9][0-9]*)$"))
+    | ltrimstr("v")
+  ]
+  | unique[]
+' "$release_list_json" | sort -V | tail -n 1)
+[[ -n "$highest_stable" ]] || {
+  echo "error: no stable GitHub release is available for latest promotion" >&2
+  exit 1
+}
 if [[ "$highest_stable" != "$version" ]]; then
-  highest_count=$(jq --arg tag "$highest_stable" '[.[] | select(.metadata.container.tags | index($tag))] | length' "$versions_json")
-  latest_count=$(jq '[.[] | select(.metadata.container.tags | index("latest"))] | length' "$versions_json")
-  [[ "$highest_count" -eq 1 && "$latest_count" -eq 1 ]] || {
-    echo "error: newer stable version exists without one exact latest alias" >&2
-    exit 1
-  }
-  highest_digest=$(jq -er --arg tag "$highest_stable" '.[] | select(.metadata.container.tags | index($tag)) | .name' "$versions_json")
-  latest_digest=$(jq -er '.[] | select(.metadata.container.tags | index("latest")) | .name' "$versions_json")
-  [[ "$latest_digest" == "$highest_digest" ]] || {
-    echo "error: latest does not point to newer stable version $highest_stable" >&2
-    exit 1
-  }
+  docker buildx imagetools inspect "$image:$highest_stable" \
+    --format '{{json .Manifest}}' > "$manifest_json"
+  highest_digest=$(jq -er '.digest' "$manifest_json")
   wait_for_registry_digest "$image:latest" "$highest_digest"
   gh api "repos/${GITHUB_REPOSITORY}/releases/tags/v${highest_stable}" > "$release_json"
   highest_release_id=$(jq -er \
@@ -137,35 +110,15 @@ if [[ "$highest_stable" != "$version" ]]; then
   exit 0
 fi
 
-latest_count=$(jq '[.[] | select(.metadata.container.tags | index("latest"))] | length' "$versions_json")
-if [[ "$latest_count" -gt 1 ]]; then
-  echo "error: multiple container versions claim latest" >&2
-  exit 1
-fi
-if [[ "$latest_count" -eq 1 ]] &&
-  [[ "$(jq -er '.[] | select(.metadata.container.tags | index("latest")) | .name' "$versions_json")" == "$expected_digest" ]]; then
-  echo "latest already has the expected Packages API digest; verifying the registry"
+if docker buildx imagetools inspect "$image:latest" \
+  --format '{{json .Manifest}}' > "$manifest_json" 2>/dev/null &&
+  [[ "$(jq -er '.digest' "$manifest_json")" == "$expected_digest" ]]; then
+  echo "latest already has the expected registry digest"
 else
   docker buildx imagetools create --tag "$image:latest" "$image@$expected_digest"
 fi
 
 wait_for_registry_digest "$image:latest" "$expected_digest"
-
-verified=0
-for _attempt in 1 2 3 4 5 6 7 8 9 10; do
-  load_versions
-  latest_count=$(jq '[.[] | select(.metadata.container.tags | index("latest"))] | length' "$versions_json")
-  if [[ "$latest_count" -eq 1 ]] &&
-    [[ "$(jq -er '.[] | select(.metadata.container.tags | index("latest")) | .name' "$versions_json")" == "$expected_digest" ]]; then
-    verified=1
-    break
-  fi
-  sleep 2
-done
-if [[ "$verified" -ne 1 ]]; then
-  echo "error: GitHub Packages did not expose the exact latest alias" >&2
-  exit 1
-fi
 
 gh api "repos/${GITHUB_REPOSITORY}/releases/tags/v${version}" > "$release_json"
 release_id=$(jq -er \

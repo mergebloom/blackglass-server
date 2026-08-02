@@ -1,5 +1,5 @@
 import { describe, expect, test } from "bun:test";
-import { chmod, mkdtemp, rm, writeFile } from "node:fs/promises";
+import { chmod, mkdtemp, readFile, rm, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { basename, join, resolve } from "node:path";
 
@@ -62,6 +62,19 @@ describe("supported release versions", () => {
       expect(result.exitCode, `${script}: ${result.stderr.toString()}`).toBe(1);
       expect(result.stderr.toString()).toMatch(/semantic version|invalid image version/);
     }
+  });
+
+  test("OCI publishing verifies repository releases and registry digests without owner-wide package listing", async () => {
+    const publish = await readFile(join(root, "ops/publish-oci-version.sh"), "utf8");
+    const promote = await readFile(join(root, "ops/promote-oci-latest.sh"), "utf8");
+
+    for (const source of [publish, promote]) {
+      expect(source).not.toContain("packages?package_type=container");
+      expect(source).toContain("docker buildx imagetools inspect");
+    }
+    expect(promote).toContain(
+      'repos/${GITHUB_REPOSITORY}/releases?per_page=100',
+    );
   });
 
   test("accepts only v-prefixed supported release tags", () => {
