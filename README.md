@@ -30,14 +30,14 @@ same tests, artifact hashes, and release gates as any other contribution.
 
 | Area | Current support |
 | --- | --- |
-| Deployment | One owner, one server node, local SQLite storage |
-| Sync | Account, vault, history, upload, download, and recovery |
+| Deployment | Multiple administrator-provisioned accounts, one server node, local SQLite storage |
+| Sync | Vault collaboration, history, upload, download, and recovery |
 | Encryption | Client-managed and server-managed encrypted vaults |
 | Client target | macOS desktop on Apple Silicon; Obsidian renderer 1.12.7 first |
 | Server hosts | 64-bit Linux on amd64 or arm64; native binary or OCI image |
 
-Publish, public registration, sharing, high availability,
-mobile clients, Windows servers, and 32-bit hosts are not supported yet.
+Publish, public registration, high availability, mobile clients, Windows
+servers, and 32-bit hosts are not supported yet.
 
 ## Architecture
 

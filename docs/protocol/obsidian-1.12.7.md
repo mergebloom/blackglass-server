@@ -32,9 +32,8 @@ Observed Sync vault routes:
 
 The server implements sign-in, sign-out, user information, Sync subscription
 information, region listing, vault list/create/access/migrate/rename/delete,
-and an empty share list. Registration, password recovery, business
-subscriptions, and share mutations return explicit JSON errors for the
-single-owner deployment. Account responses use `license:null`; Sync entitlement
+and owner/collaborator sharing. Registration, password recovery, and business
+subscriptions return explicit JSON errors. Account responses use `license:null`; Sync entitlement
 comes only from `/subscription/list.sync`, avoiding unrelated Catalyst/Insider
 UI.
 
@@ -173,7 +172,7 @@ device name, and account identity.
 | destructive encryption upgrade (`/vault/migrate`) | Atomic empty-v3 replacement, old-history removal, old-socket invalidation, and managed/custom recovery tested |
 | registration/recovery/business account UI | Explicit administrator-managed JSON errors; no public account lifecycle |
 | two-device convergence | Bidirectional byte-identical E2E pass |
-| multi-user sharing | Deliberately unsupported in `0.2.2`; the validated client contract and staged design are documented in [`phase-3-4-client-demands.md`](phase-3-4-client-demands.md) and [`../plans/2026-07-30-phase-3-4-implementation.md`](../plans/2026-07-30-phase-3-4-implementation.md) |
+| multi-user sharing | Owner invite/list/remove, collaborator inventory/access/leave, attribution, revocation, migration, and resource bounds are implemented and protocol-tested; exact-client qualification is release-specific |
 
 ### History response contracts
 

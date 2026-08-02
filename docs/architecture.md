@@ -9,14 +9,16 @@ and adaptation live separately in Blackglass.
 ## Control plane
 
 The Rust service provides durable SQLite-backed local users and the account and
-vault operations required to create, connect, migrate encryption, rename, and
-delete a Sync vault. Each vault and session is bound to one user; serving never
+vault operations required to create, connect, migrate encryption, rename,
+delete, and share a Sync vault. Each vault has one durable owner and may have
+bounded active collaborators; every session is bound to one user. Serving never
 loads account credentials from environment variables. Registration,
 password-recovery, and business-subscription routes return explicit
-administrator-managed JSON errors instead of transport errors. Sharing reports
-an empty list and invite/remove operations fail cleanly. Passwords are verified
-with Argon2id. Successful sign-in creates a random 256-bit bearer session whose
-digest, user, expiry, and revocation state live in SQLite.
+administrator-managed JSON errors instead of transport errors. Owners may
+invite existing active local accounts and remove collaborators; collaborators
+may leave using their own membership ID. Passwords are verified with Argon2id.
+Successful sign-in creates a random 256-bit bearer session whose digest, user,
+expiry, and revocation state live in SQLite.
 
 ## Data plane
 
@@ -36,11 +38,11 @@ and releases memory admission after every notice, so slow readers cannot hold
 the pool indefinitely.
 
 Each authenticated connection has a registry-owned cancellation channel bound
-to its session and vault. Online signout and destructive vault replacement
-signal that channel directly. Every data mutation also revalidates the exact
-session, active user, and vault ownership inside the same immediate SQLite
-transaction that commits the change, making transaction order authoritative
-for revoke-versus-write races.
+to its session and vault. Online signout, membership removal, and destructive
+vault replacement signal that channel directly. Every data mutation also
+revalidates the exact session, active user, and owner-or-collaborator access
+inside the same immediate SQLite transaction that commits the change, making
+transaction order authoritative for revoke-versus-write races.
 
 ## Persistence
 

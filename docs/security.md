@@ -31,6 +31,7 @@ E2EE does not hide those facts.
 | Endpoint rotation | Canonical data-host validation, startup equality gate across persisted vaults, and a verified-backup-first transactional rebind command |
 | Data leakage through logs | Structured events omit credentials, tokens, ciphertext paths/hashes/bodies, and managed vault recovery passwords |
 | Data leakage through metrics | Authorization and SQLite counters use fixed operation/reason labels only; no tenant, account, vault, session, database error, or payload value becomes a label |
+| Sharing enumeration/abuse | Invitations accept only existing active local accounts, return a uniform unavailable error, use bounded keyed target digests in memory, and enforce source, user, distinct-target, and global rolling-hour budgets |
 | Privilege escalation | Static unprivileged systemd user, empty capabilities, strict filesystem/device/kernel protections, syscall and address-family restrictions |
 | Client drift | Version-specific deterministic patch anchors, upstream/generated hashes, updates disabled in the copied profile, and official-client E2E qualification |
 | Dependency supply chain | Locked crates, a checksum-pinned advisory/license/source scanner, explicit license allowlist, Cargo plus native/runtime notices, digest-pinned build images, and commit-pinned CI actions |
@@ -41,11 +42,17 @@ E2EE does not hide those facts.
 
 This is an authorized compatibility implementation, not an Obsidian-supported
 server. The client protocol can change without notice. The server does not
-yet provide shared-vault collaboration, public registration, high
+provide public registration, fine-grained collaborator roles, high
 availability, object storage, mobile qualification, malware
 scanning, quotas per vault, or protection against a compromised desktop
 client. A malicious or stolen authenticated client can read and mutate every
 vault authorized for that user.
+
+Removing a collaborator stops future server access and closes that user's live
+vault connections, but it cannot erase ciphertext or plaintext already
+synchronized to the collaborator's device. The stock sharing protocol also has
+no member-specific key wrapping. Restoring confidentiality after a compromise
+requires a new remote vault encryption key and complete re-encryption.
 
 A compromise of a managed-encryption deployment can expose its stored recovery
 password and therefore its vault plaintext. A custom-password deployment does

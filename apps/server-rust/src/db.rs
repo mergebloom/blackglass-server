@@ -1,6 +1,9 @@
 use crate::{
     auth,
-    model::{AuthContext, NewRevision, PullInfo, PushNotice, Revision, UserCredential, Vault},
+    model::{
+        AuthContext, NewRevision, PullInfo, PushNotice, Revision, SharedVault, UserCredential,
+        Vault, VaultAccess, VaultShareItem,
+    },
 };
 use anyhow::{Context, Result, bail};
 use rusqlite::{Connection, OptionalExtension, TransactionBehavior, params, types::Value};
@@ -16,8 +19,8 @@ use std::{
 };
 use uuid::Uuid;
 
-const CURRENT_SCHEMA_VERSION: i64 = 5;
-const SUPPORTED_MIGRATIONS: &[i64] = &[1, 2, 3, 4, 5];
+const CURRENT_SCHEMA_VERSION: i64 = 6;
+const SUPPORTED_MIGRATIONS: &[i64] = &[1, 2, 3, 4, 5, 6];
 pub(crate) const MAX_VAULTS: i64 = 100;
 pub(crate) const MAX_JS_SAFE_INTEGER: i64 = 9_007_199_254_740_991;
 pub(crate) const MAX_USERS: i64 = 256;
@@ -25,6 +28,9 @@ const MAX_RETIRED_VAULTS: i64 = 8_192;
 const MAX_RETIRED_VAULTS_PER_OWNER: i64 = 512;
 const MAX_SESSIONS: i64 = 1024;
 const MAX_SESSIONS_PER_USER: i64 = 64;
+pub(crate) const MAX_ACTIVE_COLLABORATORS_PER_VAULT: i64 = 20;
+const MAX_REVOKED_MEMBERSHIPS_PER_VAULT: i64 = 64;
+const MAX_MEMBERSHIPS: i64 = 8_192;
 pub(crate) const CURRENT_SCHEMA_VERSION_PUBLIC: i64 = CURRENT_SCHEMA_VERSION;
 
 #[derive(Clone, Debug)]
@@ -78,6 +84,7 @@ pub(crate) struct AdminVault {
     pub latest_activity_at: Option<i64>,
     pub latest_device: Option<String>,
     pub owner_user_id: i64,
+    pub active_collaborators: i64,
 }
 #[derive(Clone, Debug, serde::Serialize)]
 #[serde(rename_all = "camelCase")]
@@ -108,6 +115,7 @@ pub(crate) struct AdminUser {
     pub name: String,
     pub status: String,
     pub owned_vaults: i64,
+    pub shared_vaults: i64,
     pub sessions: i64,
     pub retained_bytes: i64,
 }
@@ -127,6 +135,8 @@ pub(crate) struct AdminDatabaseSnapshot {
     pub retained_bytes: i64,
     pub vault_count: i64,
     pub activity_count: i64,
+    pub membership_count: i64,
+    pub active_memberships: i64,
     pub mismatched_data_hosts: i64,
 }
 
@@ -448,7 +458,7 @@ impl Db {
         c.progress_handler(1_000, Some(move || std::time::Instant::now() >= deadline));
         let result = (|| {
             let mut vault_query = c.prepare(
-                "WITH latest_path AS (SELECT vault_id,path,MAX(uid) uid FROM revisions GROUP BY vault_id,path), per_vault AS (SELECT r.vault_id,SUM(r.size) retained_bytes,SUM(CASE WHEN lp.uid=r.uid AND r.deleted=0 AND r.folder=0 THEN 1 ELSE 0 END) file_count,SUM(CASE WHEN lp.uid=r.uid AND r.deleted=1 THEN 1 ELSE 0 END) deleted_count FROM revisions r LEFT JOIN latest_path lp ON lp.uid=r.uid GROUP BY r.vault_id), latest_revision AS (SELECT r.vault_id,r.ts,r.device FROM revisions r JOIN (SELECT vault_id,MAX(uid) uid FROM revisions GROUP BY vault_id) x ON x.uid=r.uid) SELECT v.id,v.name,v.created,CASE WHEN v.password IS NULL THEN 'custom-password' ELSE 'managed' END,v.encryption_version,v.version,v.size,COALESCE(p.retained_bytes,0),COALESCE(p.file_count,0),COALESCE(p.deleted_count,0),l.ts,l.device,v.owner_user_id FROM vaults v LEFT JOIN per_vault p ON p.vault_id=v.id LEFT JOIN latest_revision l ON l.vault_id=v.id ORDER BY v.created ASC LIMIT 100"
+                "WITH latest_path AS (SELECT vault_id,path,MAX(uid) uid FROM revisions GROUP BY vault_id,path), per_vault AS (SELECT r.vault_id,SUM(r.size) retained_bytes,SUM(CASE WHEN lp.uid=r.uid AND r.deleted=0 AND r.folder=0 THEN 1 ELSE 0 END) file_count,SUM(CASE WHEN lp.uid=r.uid AND r.deleted=1 THEN 1 ELSE 0 END) deleted_count FROM revisions r LEFT JOIN latest_path lp ON lp.uid=r.uid GROUP BY r.vault_id), latest_revision AS (SELECT r.vault_id,r.ts,r.device FROM revisions r JOIN (SELECT vault_id,MAX(uid) uid FROM revisions GROUP BY vault_id) x ON x.uid=r.uid) SELECT v.id,v.name,v.created,CASE WHEN v.password IS NULL THEN 'custom-password' ELSE 'managed' END,v.encryption_version,v.version,v.size,COALESCE(p.retained_bytes,0),COALESCE(p.file_count,0),COALESCE(p.deleted_count,0),l.ts,l.device,v.owner_user_id,(SELECT COUNT(*) FROM memberships m WHERE m.vault_id=v.id AND m.revoked_at IS NULL) FROM vaults v LEFT JOIN per_vault p ON p.vault_id=v.id LEFT JOIN latest_revision l ON l.vault_id=v.id ORDER BY v.created ASC LIMIT 100"
             )?;
             let vaults = vault_query
                 .query_map([], |r| {
@@ -466,6 +476,7 @@ impl Db {
                         latest_activity_at: r.get(10)?,
                         latest_device: r.get(11)?,
                         owner_user_id: r.get(12)?,
+                        active_collaborators: r.get(13)?,
                     })
                 })?
                 .collect::<rusqlite::Result<Vec<_>>>()?;
@@ -499,6 +510,7 @@ impl Db {
             let mut user_query = c.prepare(
                 "SELECT u.id,u.email,u.name,u.status,
                         (SELECT COUNT(*) FROM vaults v WHERE v.owner_user_id=u.id),
+                        (SELECT COUNT(*) FROM memberships m WHERE m.user_id=u.id AND m.revoked_at IS NULL),
                         (SELECT COUNT(*) FROM sessions s WHERE s.user_id=u.id),
                         COALESCE((SELECT SUM(r.size) FROM revisions r JOIN vaults v ON v.id=r.vault_id WHERE v.owner_user_id=u.id),0)
                    FROM users u ORDER BY u.id LIMIT ?",
@@ -511,8 +523,9 @@ impl Db {
                         name: r.get(2)?,
                         status: r.get(3)?,
                         owned_vaults: r.get(4)?,
-                        sessions: r.get(5)?,
-                        retained_bytes: r.get(6)?,
+                        shared_vaults: r.get(5)?,
+                        sessions: r.get(6)?,
+                        retained_bytes: r.get(7)?,
                     })
                 })?
                 .collect::<rusqlite::Result<Vec<_>>>()?;
@@ -532,6 +545,11 @@ impl Db {
             )?;
             let vault_count = c.query_row("SELECT COUNT(*) FROM vaults", [], |r| r.get(0))?;
             let activity_count = c.query_row("SELECT COUNT(*) FROM revisions", [], |r| r.get(0))?;
+            let (membership_count, active_memberships) = c.query_row(
+                "SELECT COUNT(*),COALESCE(SUM(revoked_at IS NULL),0) FROM memberships",
+                [],
+                |r| Ok((r.get(0)?, r.get(1)?)),
+            )?;
             Ok(AdminDatabaseSnapshot {
                 schema_version: CURRENT_SCHEMA_VERSION_PUBLIC,
                 max_sessions: MAX_SESSIONS,
@@ -548,6 +566,8 @@ impl Db {
                 retained_bytes,
                 vault_count,
                 activity_count,
+                membership_count,
+                active_memberships,
                 mismatched_data_hosts,
             })
         })();
@@ -682,11 +702,15 @@ impl Db {
                 "SELECT EXISTS(
                     SELECT 1 FROM sessions s
                     JOIN users u ON u.id=s.user_id AND u.status='active'
-                    JOIN vaults v ON v.owner_user_id=s.user_id
+                    JOIN vaults v ON v.id=?
                      WHERE s.token_hash=? AND s.expires_at>? AND s.revoked_at IS NULL
-                       AND v.id=?
+                       AND (v.owner_user_id=s.user_id OR EXISTS(
+                           SELECT 1 FROM memberships m
+                            WHERE m.vault_id=v.id AND m.user_id=s.user_id
+                              AND m.revoked_at IS NULL
+                       ))
                  )",
-                params![hash, now, vault],
+                params![vault, hash, now],
                 |row| row.get::<_, i64>(0),
             )? == 1)
         })
@@ -802,6 +826,27 @@ impl Db {
     pub fn list_vaults_for_user(&self, user_id: i64) -> Result<Vec<Vault>> {
         self.with(|c| { let mut q=c.prepare("SELECT id,name,keyhash,salt,host,region,encryption_version,size,created,password FROM vaults WHERE owner_user_id=? ORDER BY created ASC,id ASC LIMIT ?")?; Ok(q.query_map(params![user_id,MAX_VAULTS], vault_row)?.collect::<rusqlite::Result<Vec<_>>>()?) })
     }
+    pub fn list_shared_vaults_for_user(&self, user_id: i64) -> Result<Vec<SharedVault>> {
+        self.with(|c| {
+            let mut query = c.prepare(
+                "SELECT v.id,v.name,v.keyhash,v.salt,v.host,v.region,v.encryption_version,
+                        v.size,v.created,v.password,m.id,v.owner_user_id
+                   FROM memberships m JOIN vaults v ON v.id=m.vault_id
+                   JOIN users u ON u.id=m.user_id AND u.status='active'
+                  WHERE m.user_id=? AND m.revoked_at IS NULL
+                  ORDER BY m.created_at,m.id LIMIT ?",
+            )?;
+            Ok(query
+                .query_map(params![user_id, MAX_MEMBERSHIPS], |row| {
+                    Ok(SharedVault {
+                        vault: vault_row(row)?,
+                        share_uid: row.get(10)?,
+                        owner_user_id: row.get(11)?,
+                    })
+                })?
+                .collect::<rusqlite::Result<Vec<_>>>()?)
+        })
+    }
     pub fn mismatched_data_hosts(&self, expected: &str) -> Result<Vec<String>> {
         self.with(|c| {
             let mut query =
@@ -817,6 +862,213 @@ impl Db {
     }
     pub fn find_owned_vault(&self, user_id: i64, id: &str) -> Result<Option<Vault>> {
         self.with(|c| Ok(c.query_row("SELECT id,name,keyhash,salt,host,region,encryption_version,size,created,password FROM vaults WHERE id=? AND owner_user_id=?",params![id,user_id],vault_row).optional()?))
+    }
+    pub fn find_authorized_vault(
+        &self,
+        user_id: i64,
+        id: &str,
+    ) -> Result<Option<(Vault, VaultAccess)>> {
+        self.with(|c| {
+            let Some(access) = vault_access(c, user_id, id)? else {
+                return Ok(None);
+            };
+            let vault = c.query_row(
+                "SELECT id,name,keyhash,salt,host,region,encryption_version,size,created,password FROM vaults WHERE id=?",
+                [id],
+                vault_row,
+            )?;
+            Ok(Some((vault, access)))
+        })
+    }
+    pub fn vault_owner_user_id(&self, id: &str) -> Result<Option<i64>> {
+        self.with(|c| {
+            Ok(
+                c.query_row("SELECT owner_user_id FROM vaults WHERE id=?", [id], |row| {
+                    row.get(0)
+                })
+                .optional()?,
+            )
+        })
+    }
+    pub fn stored_ciphertext_size_for_vault_owner(&self, vault_id: &str) -> Result<Option<i64>> {
+        self.with(|c| {
+            let owner = c
+                .query_row(
+                    "SELECT owner_user_id FROM vaults WHERE id=?",
+                    [vault_id],
+                    |row| row.get::<_, i64>(0),
+                )
+                .optional()?;
+            owner
+                .map(|owner_user_id| owner_stored_ciphertext_size(c, owner_user_id))
+                .transpose()
+        })
+    }
+    pub fn list_shares_for_owner(
+        &self,
+        owner_user_id: i64,
+        vault_id: &str,
+    ) -> Result<Option<Vec<VaultShareItem>>> {
+        self.with(|c| {
+            let owned: bool = c.query_row(
+                "SELECT EXISTS(SELECT 1 FROM vaults WHERE id=? AND owner_user_id=?)",
+                params![vault_id, owner_user_id],
+                |row| Ok(row.get::<_, i64>(0)? == 1),
+            )?;
+            if !owned {
+                return Ok(None);
+            }
+            let mut query = c.prepare(
+                "SELECT m.id,u.email,u.name FROM memberships m
+                   JOIN users u ON u.id=m.user_id
+                  WHERE m.vault_id=? AND m.revoked_at IS NULL
+                  ORDER BY m.created_at,m.id LIMIT ?",
+            )?;
+            Ok(Some(
+                query
+                    .query_map(
+                        params![vault_id, MAX_ACTIVE_COLLABORATORS_PER_VAULT],
+                        |row| {
+                            Ok(VaultShareItem {
+                                uid: row.get(0)?,
+                                email: row.get(1)?,
+                                name: Some(row.get(2)?),
+                                accepted: true,
+                            })
+                        },
+                    )?
+                    .collect::<rusqlite::Result<Vec<_>>>()?,
+            ))
+        })
+    }
+
+    pub fn invite_collaborator_for_session(
+        &self,
+        owner_user_id: i64,
+        token_hash: &str,
+        vault_id: &str,
+        target_email: &str,
+    ) -> Result<VaultShareItem> {
+        let email = auth::canonicalize_email(target_email)?;
+        self.with(|c| {
+            let tx = c.transaction_with_behavior(TransactionBehavior::Immediate)?;
+            authorize_account_mutation(&tx, Some(token_hash), owner_user_id)?;
+            let owned: bool = tx.query_row(
+                "SELECT EXISTS(SELECT 1 FROM vaults WHERE id=? AND owner_user_id=?)",
+                params![vault_id, owner_user_id],
+                |row| Ok(row.get::<_, i64>(0)? == 1),
+            )?;
+            if !owned {
+                bail!("sharing vault unavailable")
+            }
+            let target: Option<(i64, String, String)> = tx
+                .query_row(
+                    "SELECT id,email,name FROM users WHERE email_canonical=? AND status='active'",
+                    [email.canonical],
+                    |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+                )
+                .optional()?;
+            let Some((target_user_id, display_email, name)) = target else {
+                bail!("sharing user unavailable")
+            };
+            if target_user_id == owner_user_id {
+                bail!("sharing user unavailable")
+            }
+            if let Some(uid) = tx
+                .query_row(
+                    "SELECT id FROM memberships WHERE vault_id=? AND user_id=? AND revoked_at IS NULL",
+                    params![vault_id, target_user_id],
+                    |row| row.get(0),
+                )
+                .optional()?
+            {
+                tx.commit()?;
+                return Ok(VaultShareItem {
+                    uid,
+                    email: display_email,
+                    name: Some(name),
+                    accepted: true,
+                });
+            }
+            let active: i64 = tx.query_row(
+                "SELECT COUNT(*) FROM memberships WHERE vault_id=? AND revoked_at IS NULL",
+                [vault_id],
+                |row| row.get(0),
+            )?;
+            if active >= MAX_ACTIVE_COLLABORATORS_PER_VAULT {
+                bail!("collaborator limit reached")
+            }
+            tx.execute(
+                "DELETE FROM memberships WHERE id IN (
+                    SELECT id FROM memberships WHERE vault_id=? AND revoked_at IS NOT NULL
+                    ORDER BY revoked_at,id LIMIT MAX(0,(SELECT COUNT(*) FROM memberships WHERE vault_id=? AND revoked_at IS NOT NULL)-?+1)
+                 )",
+                params![vault_id, vault_id, MAX_REVOKED_MEMBERSHIPS_PER_VAULT],
+            )?;
+            let total: i64 = tx.query_row("SELECT COUNT(*) FROM memberships", [], |row| row.get(0))?;
+            if total >= MAX_MEMBERSHIPS {
+                bail!("membership capacity reached")
+            }
+            let sequence: i64 = tx
+                .query_row(
+                    "SELECT seq FROM sqlite_sequence WHERE name='memberships'",
+                    [],
+                    |row| row.get(0),
+                )
+                .optional()?
+                .unwrap_or(0);
+            if sequence >= MAX_JS_SAFE_INTEGER {
+                bail!("membership sequence exhausted")
+            }
+            let now = now_ms();
+            tx.execute(
+                "INSERT INTO memberships(vault_id,user_id,invited_by_user_id,accepted_at,created_at,revoked_at) VALUES(?,?,?,?,?,NULL)",
+                params![vault_id, target_user_id, owner_user_id, now, now],
+            )?;
+            let uid = tx.last_insert_rowid();
+            tx.commit()?;
+            Ok(VaultShareItem {
+                uid,
+                email: display_email,
+                name: Some(name),
+                accepted: true,
+            })
+        })
+    }
+
+    pub fn remove_collaborator_for_session(
+        &self,
+        acting_user_id: i64,
+        token_hash: &str,
+        vault_id: &str,
+        share_uid: i64,
+    ) -> Result<Option<i64>> {
+        self.with(|c| {
+            let tx = c.transaction_with_behavior(TransactionBehavior::Immediate)?;
+            authorize_account_mutation(&tx, Some(token_hash), acting_user_id)?;
+            let row: Option<(i64, i64)> = tx
+                .query_row(
+                    "SELECT v.owner_user_id,m.user_id FROM memberships m
+                       JOIN vaults v ON v.id=m.vault_id
+                      WHERE m.id=? AND m.vault_id=? AND m.revoked_at IS NULL",
+                    params![share_uid, vault_id],
+                    |row| Ok((row.get(0)?, row.get(1)?)),
+                )
+                .optional()?;
+            let Some((owner_user_id, collaborator_user_id)) = row else {
+                return Ok(None);
+            };
+            if acting_user_id != owner_user_id && acting_user_id != collaborator_user_id {
+                return Ok(None);
+            }
+            let now = now_ms();
+            let changed = tx.execute(
+                "UPDATE memberships SET revoked_at=? WHERE id=? AND vault_id=? AND revoked_at IS NULL",
+                params![now, share_uid, vault_id],
+            )? == 1;
+            tx.commit()?;
+            Ok(changed.then_some(collaborator_user_id))
+        })
     }
     pub fn bind_managed_keyhash_for_session(
         &self,
@@ -944,6 +1196,10 @@ impl Db {
                     replacement.password,
                     user_id
                 ],
+            )?;
+            tx.execute(
+                "UPDATE memberships SET vault_id=? WHERE vault_id=? AND revoked_at IS NULL",
+                params![replacement.id, source_id],
             )?;
             retire_vault_identity(&tx, source_id, now_ms())?;
             tx.execute("DELETE FROM vaults WHERE id=? AND owner_user_id=?", params![source_id,user_id])?;
@@ -1322,7 +1578,7 @@ impl Db {
         self.with(|c|{
         let tx=c.transaction_with_behavior(TransactionBehavior::Immediate)?;
         authorize_mutation(&tx, token_hash, user_id, vault)?;
-        let target:Option<(String,bool)>=tx.query_row("SELECT r.path,r.deleted FROM revisions r JOIN vaults v ON v.id=r.vault_id WHERE r.uid=? AND r.vault_id=? AND v.owner_user_id=?",params![uid,vault,user_id],|r|Ok((r.get(0)?,r.get::<_,i64>(1)?==1))).optional()?;
+        let target:Option<(String,bool)>=tx.query_row("SELECT path,deleted FROM revisions WHERE uid=? AND vault_id=?",params![uid,vault],|r|Ok((r.get(0)?,r.get::<_,i64>(1)?==1))).optional()?;
         let Some((path,deleted))=target else{return Ok(None)};
         let source_uid=if deleted {tx.query_row("SELECT uid FROM revisions WHERE vault_id=? AND path=? AND uid<? AND deleted=0 ORDER BY uid DESC LIMIT 1",params![vault,path,uid],|r|r.get(0)).optional()?}else{Some(uid)};
         let Some(source_uid)=source_uid else{return Ok(None)}; let ts=now_ms();
@@ -1450,15 +1706,35 @@ fn authorize_mutation(
     vault_id: &str,
 ) -> Result<()> {
     authorize_account_mutation(c, token_hash, user_id)?;
-    let owned: bool = c.query_row(
-        "SELECT EXISTS(SELECT 1 FROM vaults WHERE id=? AND owner_user_id=?)",
-        params![vault_id, user_id],
-        |row| Ok(row.get::<_, i64>(0)? == 1),
-    )?;
-    if !owned {
+    if vault_access(c, user_id, vault_id)?.is_none() {
         bail!("mutation authorization expired or was revoked")
     }
     Ok(())
+}
+
+fn vault_access(c: &Connection, user_id: i64, vault_id: &str) -> Result<Option<VaultAccess>> {
+    let relationship = c
+        .query_row(
+            "SELECT v.owner_user_id,
+                    (SELECT m.id FROM memberships m
+                      WHERE m.vault_id=v.id AND m.user_id=? AND m.revoked_at IS NULL)
+               FROM vaults v WHERE v.id=?",
+            params![user_id, vault_id],
+            |row| Ok((row.get::<_, i64>(0)?, row.get::<_, Option<i64>>(1)?)),
+        )
+        .optional()?;
+    Ok(match relationship {
+        Some((owner, _)) if owner == user_id => Some(VaultAccess::Owner {
+            user_id,
+            vault_id: vault_id.to_owned(),
+        }),
+        Some((_, Some(share_uid))) => Some(VaultAccess::Collaborator {
+            user_id,
+            vault_id: vault_id.to_owned(),
+            share_uid,
+        }),
+        _ => None,
+    })
 }
 
 fn authorize_account_mutation(
@@ -1523,7 +1799,7 @@ fn initialize_runtime_storage_usage(c: &Connection) -> Result<()> {
 fn enforce_storage_quotas(
     c: &Connection,
     vault_id: &str,
-    acting_user_id: i64,
+    _acting_user_id: i64,
     additional: i64,
     global_limit: i64,
     owner_limit: i64,
@@ -1533,8 +1809,8 @@ fn enforce_storage_quotas(
     }
     let owner_user_id = c
         .query_row(
-            "SELECT owner_user_id FROM vaults WHERE id=? AND owner_user_id=?",
-            params![vault_id, acting_user_id],
+            "SELECT owner_user_id FROM vaults WHERE id=?",
+            [vault_id],
             |row| row.get::<_, i64>(0),
         )
         .optional()?
@@ -1631,6 +1907,10 @@ fn migrate(c: &Connection, initial_user: Option<&InitialUser>) -> Result<()> {
             )?;
             continue;
         }
+        if version == 6 {
+            apply_migration(c, version, MIGRATION_6_SQL)?;
+            continue;
+        }
         let sql = match version {
             1 => MIGRATION_1_SQL,
             2 => MIGRATION_2_SQL,
@@ -1667,6 +1947,25 @@ const MIGRATION_4_SQL: &str = "
         id TEXT PRIMARY KEY,
         retired_at INTEGER NOT NULL
     );
+";
+
+const MIGRATION_6_SQL: &str = "
+    CREATE TABLE memberships(
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        vault_id TEXT NOT NULL REFERENCES vaults(id) ON DELETE CASCADE,
+        user_id INTEGER NOT NULL REFERENCES users(id) ON DELETE NO ACTION,
+        invited_by_user_id INTEGER NOT NULL REFERENCES users(id) ON DELETE NO ACTION,
+        accepted_at INTEGER NOT NULL,
+        created_at INTEGER NOT NULL,
+        revoked_at INTEGER
+    );
+    CREATE UNIQUE INDEX memberships_active_vault_user
+        ON memberships(vault_id,user_id) WHERE revoked_at IS NULL;
+    CREATE INDEX memberships_user_vault
+        ON memberships(user_id,vault_id,id);
+    CREATE INDEX memberships_vault_state
+        ON memberships(vault_id,revoked_at,id);
+    DELETE FROM sessions;
 ";
 
 const MIGRATION_5_AFTER_USER_SQL: &str = "
@@ -1894,6 +2193,12 @@ fn verify_schema_at_version(c: &Connection, version: i64) -> Result<()> {
             verify_foreign_keys(c)?;
             verify_logical_invariants(c, true, true)?;
         }
+        6 => {
+            verify_v6_schema(c)?;
+            verify_foreign_keys(c)?;
+            verify_logical_invariants(c, true, true)?;
+            verify_membership_invariants(c)?;
+        }
         _ => bail!("no validator for database schema version {version}"),
     }
     Ok(())
@@ -1953,13 +2258,19 @@ pub fn migrate_versioned_database_with_initial_user(
     initial_user: &InitialUser,
 ) -> Result<()> {
     let _state_lock = crate::server::acquire_database_lock(source)?;
-    migrate_versioned_database_under_lock(source, destination, initial_user)
+    migrate_versioned_database_under_lock(source, destination, Some(initial_user))
+}
+
+pub(crate) fn versioned_migration_source_version(source: &Path) -> Result<i64> {
+    let source = open_existing_read_only(source, "versioned migration source")?;
+    verify_sqlite_integrity(&source).context("versioned migration source validation failed")?;
+    verify_recorded_schema(&source).context("versioned migration source validation failed")
 }
 
 pub(crate) fn migrate_versioned_database_under_lock(
     source: &Path,
     destination: &Path,
-    initial_user: &InitialUser,
+    initial_user: Option<&InitialUser>,
 ) -> Result<()> {
     let source = open_existing_read_only(source, "versioned migration source")?;
     verify_sqlite_integrity(&source).context("versioned migration source validation failed")?;
@@ -1976,7 +2287,7 @@ pub(crate) fn migrate_versioned_database_under_lock(
         verify_sqlite_integrity(target).context("copied migration source validation failed")?;
         verify_recorded_schema(target).context("copied migration source validation failed")?;
         target.pragma_update(None, "foreign_keys", "ON")?;
-        migrate(target, Some(initial_user))?;
+        migrate(target, initial_user)?;
         if source_version < 3 {
             rotate_recovery_epoch(target)?;
         }
@@ -2432,34 +2743,48 @@ fn verify_v4_schema(c: &Connection) -> Result<()> {
 }
 
 fn verify_v5_schema(c: &Connection) -> Result<()> {
-    verify_schema_objects(
-        c,
-        &[
-            ("index", "retired_vaults_owner", "retired_vaults"),
-            ("index", "revisions_vault_path", "revisions"),
-            ("index", "revisions_vault_uid", "revisions"),
-            ("index", "sessions_expiry", "sessions"),
-            ("index", "sessions_user", "sessions"),
-            (
-                "index",
-                "sqlite_autoindex_retired_vaults_1",
-                "retired_vaults",
-            ),
-            ("index", "sqlite_autoindex_sessions_1", "sessions"),
-            ("index", "sqlite_autoindex_users_1", "users"),
-            ("index", "sqlite_autoindex_vaults_1", "vaults"),
-            ("index", "vaults_owner", "vaults"),
-            ("table", "retired_vaults", "retired_vaults"),
-            ("table", "revision_content", "revision_content"),
-            ("table", "revisions", "revisions"),
-            ("table", "schema_migrations", "schema_migrations"),
-            ("table", "sessions", "sessions"),
-            ("table", "sqlite_sequence", "sqlite_sequence"),
-            ("table", "users", "users"),
-            ("table", "vaults", "vaults"),
-        ],
-        "Blackglass",
-    )?;
+    verify_v5_or_v6_schema(c, false)
+}
+
+fn verify_v6_schema(c: &Connection) -> Result<()> {
+    verify_v5_or_v6_schema(c, true)
+}
+
+fn verify_v5_or_v6_schema(c: &Connection, memberships: bool) -> Result<()> {
+    let mut objects = vec![
+        ("index", "retired_vaults_owner", "retired_vaults"),
+        ("index", "revisions_vault_path", "revisions"),
+        ("index", "revisions_vault_uid", "revisions"),
+        ("index", "sessions_expiry", "sessions"),
+        ("index", "sessions_user", "sessions"),
+        (
+            "index",
+            "sqlite_autoindex_retired_vaults_1",
+            "retired_vaults",
+        ),
+        ("index", "sqlite_autoindex_sessions_1", "sessions"),
+        ("index", "sqlite_autoindex_users_1", "users"),
+        ("index", "sqlite_autoindex_vaults_1", "vaults"),
+        ("index", "vaults_owner", "vaults"),
+        ("table", "retired_vaults", "retired_vaults"),
+        ("table", "revision_content", "revision_content"),
+        ("table", "revisions", "revisions"),
+        ("table", "schema_migrations", "schema_migrations"),
+        ("table", "sessions", "sessions"),
+        ("table", "sqlite_sequence", "sqlite_sequence"),
+        ("table", "users", "users"),
+        ("table", "vaults", "vaults"),
+    ];
+    if memberships {
+        objects.extend([
+            ("index", "memberships_active_vault_user", "memberships"),
+            ("index", "memberships_user_vault", "memberships"),
+            ("index", "memberships_vault_state", "memberships"),
+            ("table", "memberships", "memberships"),
+        ]);
+        objects.sort_unstable();
+    }
+    verify_schema_objects(c, &objects, "Blackglass")?;
     verify_exact_table(
         c,
         "schema_migrations",
@@ -2477,6 +2802,9 @@ fn verify_v5_schema(c: &Connection) -> Result<()> {
     )?;
     verify_exact_table(c, "sessions", SESSION_V5_COLUMNS, "Blackglass")?;
     verify_exact_table(c, "retired_vaults", RETIRED_VAULT_V5_COLUMNS, "Blackglass")?;
+    if memberships {
+        verify_exact_table(c, "memberships", MEMBERSHIP_COLUMNS, "Blackglass")?;
+    }
     verify_exact_table(c, "sqlite_sequence", SQLITE_SEQUENCE_COLUMNS, "Blackglass")?;
 
     verify_exact_indexes(c, "schema_migrations", &[], "Blackglass")?;
@@ -2531,6 +2859,27 @@ fn verify_v5_schema(c: &Connection) -> Result<()> {
         "Blackglass",
     )?;
     verify_exact_indexes(c, "sqlite_sequence", &[], "Blackglass")?;
+    if memberships {
+        verify_exact_indexes(
+            c,
+            "memberships",
+            &[
+                IndexExpectation::partial_unique(
+                    "memberships_active_vault_user",
+                    &["vault_id", "user_id"],
+                ),
+                IndexExpectation::ordinary(
+                    "memberships_user_vault",
+                    &["user_id", "vault_id", "id"],
+                ),
+                IndexExpectation::ordinary(
+                    "memberships_vault_state",
+                    &["vault_id", "revoked_at", "id"],
+                ),
+            ],
+            "Blackglass",
+        )?;
+    }
 
     verify_exact_foreign_keys(c, "schema_migrations", &[], "Blackglass")?;
     verify_exact_foreign_keys(c, "users", &[], "Blackglass")?;
@@ -2576,6 +2925,18 @@ fn verify_v5_schema(c: &Connection) -> Result<()> {
         "Blackglass",
     )?;
     verify_exact_foreign_keys(c, "sqlite_sequence", &[], "Blackglass")?;
+    if memberships {
+        verify_exact_foreign_keys(
+            c,
+            "memberships",
+            &[
+                ForeignKeyExpectation::no_action("users", "invited_by_user_id", "id"),
+                ForeignKeyExpectation::no_action("users", "user_id", "id"),
+                ForeignKeyExpectation::cascade("vaults", "vault_id", "id"),
+            ],
+            "Blackglass",
+        )?;
+    }
     Ok(())
 }
 
@@ -2846,6 +3207,15 @@ const RETIRED_VAULT_V5_COLUMNS: &[ExpectedColumn] = &[
     ("owner_user_id", "INTEGER", true, None, 0),
     ("retired_at", "INTEGER", true, None, 0),
 ];
+const MEMBERSHIP_COLUMNS: &[ExpectedColumn] = &[
+    ("id", "INTEGER", false, None, 1),
+    ("vault_id", "TEXT", true, None, 0),
+    ("user_id", "INTEGER", true, None, 0),
+    ("invited_by_user_id", "INTEGER", true, None, 0),
+    ("accepted_at", "INTEGER", true, None, 0),
+    ("created_at", "INTEGER", true, None, 0),
+    ("revoked_at", "INTEGER", false, None, 0),
+];
 const SQLITE_SEQUENCE_COLUMNS: &[ExpectedColumn] =
     &[("name", "", false, None, 0), ("seq", "", false, None, 0)];
 
@@ -2981,6 +3351,16 @@ impl IndexExpectation {
             unique: true,
             origin: "u",
             partial: false,
+            columns,
+        }
+    }
+
+    const fn partial_unique(name: &'static str, columns: &'static [&'static str]) -> Self {
+        Self {
+            name,
+            unique: true,
+            origin: "c",
+            partial: true,
             columns,
         }
     }
@@ -3167,6 +3547,72 @@ fn verify_exact_foreign_keys(
     Ok(())
 }
 
+fn verify_membership_invariants(c: &Connection) -> Result<()> {
+    let invalid: bool = c.query_row(
+        &format!(
+            "SELECT EXISTS(
+                SELECT 1 FROM memberships m
+                 WHERE typeof(m.id)<>'integer'
+                    OR m.id NOT BETWEEN 1 AND {MAX_JS_SAFE_INTEGER}
+                    OR typeof(m.vault_id)<>'text' OR length(m.vault_id)=0
+                    OR typeof(m.user_id)<>'integer'
+                    OR typeof(m.invited_by_user_id)<>'integer'
+                    OR typeof(m.accepted_at)<>'integer'
+                    OR typeof(m.created_at)<>'integer'
+                    OR (m.revoked_at IS NOT NULL AND typeof(m.revoked_at)<>'integer')
+                    OR m.user_id=(SELECT owner_user_id FROM vaults WHERE id=m.vault_id)
+            )"
+        ),
+        [],
+        |row| row.get(0),
+    )?;
+    if invalid {
+        bail!("membership invariant violation")
+    }
+    let total: i64 = c.query_row("SELECT COUNT(*) FROM memberships", [], |row| row.get(0))?;
+    if total > MAX_MEMBERSHIPS {
+        bail!("membership row limit exceeded")
+    }
+    let over_active: bool = c.query_row(
+        "SELECT EXISTS(SELECT 1 FROM memberships WHERE revoked_at IS NULL GROUP BY vault_id HAVING COUNT(*)>?)",
+        [MAX_ACTIVE_COLLABORATORS_PER_VAULT],
+        |row| row.get(0),
+    )?;
+    let over_revoked: bool = c.query_row(
+        "SELECT EXISTS(SELECT 1 FROM memberships WHERE revoked_at IS NOT NULL GROUP BY vault_id HAVING COUNT(*)>?)",
+        [MAX_REVOKED_MEMBERSHIPS_PER_VAULT],
+        |row| row.get(0),
+    )?;
+    if over_active || over_revoked {
+        bail!("per-vault membership row limit exceeded")
+    }
+    let sequence: Option<i64> = c
+        .query_row(
+            "SELECT seq FROM sqlite_sequence WHERE name='memberships'",
+            [],
+            |row| row.get(0),
+        )
+        .optional()?;
+    if sequence.is_some_and(|value| !(0..=MAX_JS_SAFE_INTEGER).contains(&value)) {
+        bail!("membership sequence exceeds the JavaScript safe integer range")
+    }
+    let max_id: i64 = c.query_row("SELECT COALESCE(MAX(id),0) FROM memberships", [], |row| {
+        row.get(0)
+    })?;
+    if sequence.unwrap_or(0) < max_id {
+        bail!("membership sequence is below an issued share UID")
+    }
+    let sequence_rows: i64 = c.query_row(
+        "SELECT COUNT(*) FROM sqlite_sequence WHERE name='memberships'",
+        [],
+        |row| row.get(0),
+    )?;
+    if sequence_rows > 1 || (max_id > 0 && sequence_rows != 1) {
+        bail!("membership sequence shape is invalid")
+    }
+    Ok(())
+}
+
 fn verify_logical_invariants(
     c: &Connection,
     external_content: bool,
@@ -3348,13 +3794,15 @@ fn verify_logical_invariants(
                  OR seq NOT BETWEEN 0 AND {}
               LIMIT 1",
             MAX_JS_SAFE_INTEGER,
-            allowed_sequences = if multi_user {
+            allowed_sequences = if table_exists(c, "memberships")? {
+                "'revisions','users','memberships'"
+            } else if multi_user {
                 "'revisions','users'"
             } else {
                 "'revisions'"
             },
         ),
-        "revision sequence",
+        "AUTOINCREMENT sequence",
     )?;
     reject_invalid_row(
         c,
@@ -3715,6 +4163,210 @@ mod tests {
                 size: 0,
                 created: 1,
                 password: None,
+            })
+            .unwrap();
+    }
+
+    #[test]
+    fn vault_access_and_membership_lifecycle_are_transactional_and_bounded() {
+        let dir = tempfile::tempdir().unwrap();
+        let database = Db::open(&dir.path().join("memberships.sqlite")).unwrap();
+        create_test_vault(&database, "shared-vault");
+        database
+            .with(|connection| {
+                let now = now_ms();
+                for id in 2..=23 {
+                    let email = format!("member-{id}@example.test");
+                    connection.execute(
+                        "INSERT INTO users(id,email_canonical,email,name,password_hash,status,created_at,updated_at)
+                         VALUES(?,?,?,?,?,'active',?,?)",
+                        params![id, email, email, format!("Member {id}"), "test-only", now, now],
+                    )?;
+                }
+                Ok(())
+            })
+            .unwrap();
+        let owner_token = database.issue_session_for_user(1, 3600).unwrap();
+        let owner_hash = auth::token_hash(&owner_token);
+        let mut shares = Vec::new();
+        for id in 2..=20 {
+            shares.push(
+                database
+                    .invite_collaborator_for_session(
+                        1,
+                        &owner_hash,
+                        "shared-vault",
+                        &format!("member-{id}@example.test"),
+                    )
+                    .unwrap(),
+            );
+        }
+        assert_eq!(shares.len(), 19);
+        assert_eq!(
+            database
+                .invite_collaborator_for_session(
+                    1,
+                    &owner_hash,
+                    "shared-vault",
+                    "member-2@example.test",
+                )
+                .unwrap()
+                .uid,
+            shares[0].uid
+        );
+        let concurrent = std::thread::scope(|scope| {
+            [21, 22]
+                .map(|id| {
+                    let database = database.clone();
+                    let owner_hash = owner_hash.clone();
+                    scope.spawn(move || {
+                        database.invite_collaborator_for_session(
+                            1,
+                            &owner_hash,
+                            "shared-vault",
+                            &format!("member-{id}@example.test"),
+                        )
+                    })
+                })
+                .map(|thread| thread.join().unwrap())
+        });
+        assert_eq!(concurrent.iter().filter(|result| result.is_ok()).count(), 1);
+        assert_eq!(
+            concurrent.iter().filter(|result| result.is_err()).count(),
+            1
+        );
+        assert_eq!(
+            database
+                .list_shares_for_owner(1, "shared-vault")
+                .unwrap()
+                .unwrap()
+                .len(),
+            MAX_ACTIVE_COLLABORATORS_PER_VAULT as usize
+        );
+        assert_error_contains(
+            database.invite_collaborator_for_session(
+                1,
+                &owner_hash,
+                "shared-vault",
+                "member-23@example.test",
+            ),
+            "collaborator limit reached",
+        );
+
+        let member_token = database.issue_session_for_user(2, 3600).unwrap();
+        let member_hash = auth::token_hash(&member_token);
+        assert_eq!(
+            database
+                .remove_collaborator_for_session(2, &member_hash, "shared-vault", shares[1].uid,)
+                .unwrap(),
+            None,
+            "a collaborator cannot remove another collaborator"
+        );
+        assert_eq!(
+            database
+                .remove_collaborator_for_session(1, &owner_hash, "shared-vault", shares[0].uid,)
+                .unwrap(),
+            Some(2)
+        );
+        assert!(!database.valid_session_for_vault(&member_hash, "shared-vault"));
+        let replacement = database
+            .invite_collaborator_for_session(
+                1,
+                &owner_hash,
+                "shared-vault",
+                "member-23@example.test",
+            )
+            .unwrap();
+        assert!(replacement.uid > shares.last().unwrap().uid);
+        assert_eq!(
+            database
+                .remove_collaborator_for_session(2, &member_hash, "shared-vault", shares[0].uid,)
+                .unwrap(),
+            None,
+            "a revoked share UID remains stale"
+        );
+        assert!(matches!(
+            database.find_authorized_vault(23, "shared-vault").unwrap(),
+            Some((_, VaultAccess::Collaborator { share_uid, .. })) if share_uid == replacement.uid
+        ));
+    }
+
+    #[test]
+    fn stale_backup_recovery_rotates_vaults_and_clears_membership_authority() {
+        let dir = tempfile::tempdir().unwrap();
+        let source = dir.path().join("shared-backup.sqlite");
+        let recovered = dir.path().join("shared-recovered.sqlite");
+        let database = Db::open(&source).unwrap();
+        create_test_vault(&database, "old-shared-vault");
+        database
+            .with(|connection| {
+                let now = now_ms();
+                connection.execute(
+                    "INSERT INTO users(id,email_canonical,email,name,password_hash,status,created_at,updated_at)
+                     VALUES(2,'member@example.test','member@example.test','Member',
+                            (SELECT password_hash FROM users WHERE id=1),'active',?,?)",
+                    params![now, now],
+                )?;
+                Ok(())
+            })
+            .unwrap();
+        let owner_token = database.issue_session_for_user(1, 3600).unwrap();
+        let member_token = database.issue_session_for_user(2, 3600).unwrap();
+        let owner_hash = auth::token_hash(&owner_token);
+        let member_hash = auth::token_hash(&member_token);
+        let share = database
+            .invite_collaborator_for_session(
+                1,
+                &owner_hash,
+                "old-shared-vault",
+                "member@example.test",
+            )
+            .unwrap();
+        assert!(share.uid > 0);
+        assert!(database.valid_session_for_vault(&member_hash, "old-shared-vault"));
+        database.checkpoint().unwrap();
+        drop(database);
+
+        let rewound = dir.path().join("membership-sequence-rewound.sqlite");
+        std::fs::copy(&source, &rewound).unwrap();
+        execute_sql(
+            &rewound,
+            "UPDATE sqlite_sequence SET seq=0 WHERE name='memberships'",
+        );
+        assert_error_contains(
+            verify_database(&rewound),
+            "membership sequence is below an issued share UID",
+        );
+        let exhausted = dir.path().join("membership-sequence-exhausted.sqlite");
+        std::fs::copy(&source, &exhausted).unwrap();
+        execute_sql(
+            &exhausted,
+            &format!(
+                "UPDATE sqlite_sequence SET seq={} WHERE name='memberships'",
+                MAX_JS_SAFE_INTEGER + 1
+            ),
+        );
+        assert_error_contains(verify_database(&exhausted), "AUTOINCREMENT sequence");
+
+        recover_stale_backup(&source, &recovered).unwrap();
+        let recovered = Db::open_existing(&recovered).unwrap();
+        assert!(!recovered.valid_session_for_vault(&member_hash, "old-shared-vault"));
+        assert!(
+            recovered
+                .find_authorized_vault(2, "old-shared-vault")
+                .unwrap()
+                .is_none()
+        );
+        assert!(recovered.list_shared_vaults_for_user(2).unwrap().is_empty());
+        recovered
+            .with(|connection| {
+                assert_eq!(
+                    connection.query_row("SELECT COUNT(*) FROM memberships", [], |row| {
+                        row.get::<_, i64>(0)
+                    })?,
+                    0
+                );
+                Ok(())
             })
             .unwrap();
     }
@@ -4321,7 +4973,7 @@ mod tests {
     }
 
     #[test]
-    fn shipped_v3_migrates_to_v5_without_rotating_identity_or_sessions() {
+    fn shipped_v3_migrates_to_v6_without_rotating_identity_and_invalidates_sessions() {
         let dir = tempfile::tempdir().unwrap();
         let source = dir.path().join("shipped-v3.sqlite");
         let destination = dir.path().join("current-v5.sqlite");
@@ -4348,11 +5000,11 @@ mod tests {
         assert_eq!(std::fs::read(&source).unwrap(), source_before);
         let migrated = Db::open(&destination).unwrap();
         assert_eq!(migrated.list_vaults().unwrap()[0].id, "legacy-vault");
-        assert!(migrated.valid_session(&session));
+        assert!(!migrated.valid_session(&session));
         assert!(!migrated.is_retired_vault("legacy-vault").unwrap());
         migrated
             .with(|connection| {
-                assert_eq!(migration_versions(connection)?, vec![1, 2, 3, 4, 5]);
+                assert_eq!(migration_versions(connection)?, vec![1, 2, 3, 4, 5, 6]);
                 Ok(())
             })
             .unwrap();
@@ -4366,7 +5018,7 @@ mod tests {
         create_current_database(&source);
         assert_error_contains(
             migrate_versioned_database(&source, &destination),
-            "already at schema version 5",
+            "already at schema version 6",
         );
         assert!(!destination.exists());
     }
@@ -5361,7 +6013,7 @@ mod tests {
         let connection = Connection::open(&source).unwrap();
         connection
             .execute(
-                "INSERT INTO schema_migrations(version, applied_at) VALUES(6, 6)",
+                "INSERT INTO schema_migrations(version, applied_at) VALUES(7, 7)",
                 [],
             )
             .unwrap();
@@ -5376,7 +6028,7 @@ mod tests {
             revoke_all_sessions(&source).map(|_| ()),
             Db::open(&source).map(|_| ()),
         ] {
-            assert_error_contains(result, "schema version 6 is newer");
+            assert_error_contains(result, "schema version 7 is newer");
         }
         assert!(!backup.exists());
         assert!(!restored.exists());
@@ -5593,7 +6245,7 @@ mod tests {
         let connection = Connection::open(&current).unwrap();
         connection
             .execute(
-                "INSERT INTO schema_migrations(version, applied_at) VALUES(6, 6)",
+                "INSERT INTO schema_migrations(version, applied_at) VALUES(7, 7)",
                 [],
             )
             .unwrap();
@@ -5601,7 +6253,7 @@ mod tests {
         let future_destination = dir.path().join("future-destination.sqlite");
         assert_error_contains(
             migrate_legacy_database(&current, &future_destination),
-            "schema version 6 is newer",
+            "schema version 7 is newer",
         );
         assert!(!future_destination.exists());
     }

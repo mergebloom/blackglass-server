@@ -190,6 +190,15 @@ impl LiveRegistry {
             }
         }
     }
+    pub(crate) fn cancel_user_vault(&self, user_id: i64, vault_id: &str) {
+        if let Ok(map) = self.inner.lock() {
+            for entry in map.values().filter(|entry| {
+                entry.connection.user_id == user_id && entry.connection.vault_id == vault_id
+            }) {
+                let _ = entry.cancellation.send(true);
+            }
+        }
+    }
     pub(crate) fn snapshot(&self) -> Vec<LiveConnection> {
         let Ok(map) = self.inner.lock() else {
             return vec![];
@@ -287,6 +296,8 @@ struct Counts {
     users_visible: usize,
     users_active: i64,
     users_disabled: i64,
+    memberships_total: i64,
+    memberships_active: i64,
 }
 #[derive(Serialize)]
 #[serde(rename_all = "camelCase")]
@@ -538,6 +549,8 @@ fn build_snapshot(s: &AppState, data: AdminDatabaseSnapshot) -> Snapshot {
         users_visible: data.users.len(),
         users_active: data.active_users,
         users_disabled: data.disabled_users,
+        memberships_total: data.membership_count,
+        memberships_active: data.active_memberships,
     };
     Snapshot {
         generated_at: now_ms(),

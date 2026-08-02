@@ -95,7 +95,9 @@ describe("release metadata consistency", () => {
     for (const mutate of [
       (contract: any) => (contract.serverVersion = mismatchedVersion),
       (contract: any) => contract.database.destinationSchema++,
-      (contract: any) => (contract.sharingEnabled = true),
+      (contract: any) => (contract.database.supportedSourceSchemas = [4]),
+      (contract: any) => (contract.previousRollbackTag = "v0.2.5"),
+      (contract: any) => (contract.sharingEnabled = false),
     ]) {
       const fixture = await copyMetadataFixture();
       try {

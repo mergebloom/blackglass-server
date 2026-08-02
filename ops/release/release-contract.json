@@ -1,12 +1,12 @@
 {
   "schemaVersion": 1,
-  "serverVersion": "0.3.0",
+  "serverVersion": "0.4.0",
   "database": {
-    "supportedSourceSchemas": [1, 2, 3, 4],
-    "destinationSchema": 5
+    "supportedSourceSchemas": [5],
+    "destinationSchema": 6
   },
-  "previousRollbackTag": "v0.2.5",
-  "bridgeToolingRevision": "7b95bbf6b073e7c7dd77f9759b8961b11c7547bb",
+  "previousRollbackTag": "v0.3.0",
+  "bridgeToolingRevision": "5c2f318da314187c748e6118032fb62e976fe4a2",
   "qualifiedRenderers": [
     {
       "version": "1.12.7",
@@ -21,5 +21,5 @@
     "prometheusJobSelector": "job=\"blackglass-server\"",
     "requiredBackends": ["primary", "recovery"]
   },
-  "sharingEnabled": false
+  "sharingEnabled": true
 }

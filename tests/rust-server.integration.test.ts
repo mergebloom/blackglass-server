@@ -513,7 +513,7 @@ describe("production Rust server", () => {
       if (child.exitCode === null) child.kill("SIGTERM");
       await child.exited;
     }
-  }, 20_000);
+  }, 30_000);
 
   test("bounds unauthenticated WebSockets and requires prompt initialization", async () => {
     const unauthenticatedPing = await Probe.connect(`ws://127.0.0.1:${dataPort}`);

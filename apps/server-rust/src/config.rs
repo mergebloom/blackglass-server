@@ -8,6 +8,10 @@ use std::{
 };
 
 pub(crate) const MAX_WS_CONNECTIONS_LIMIT: usize = 16;
+pub(crate) const MAX_SHARE_INVITES_PER_SOURCE: usize = 60;
+pub(crate) const MAX_SHARE_INVITES_PER_USER: usize = 30;
+pub(crate) const MAX_SHARE_INVITE_TARGETS_PER_USER: usize = 20;
+pub(crate) const MAX_SHARE_INVITES_GLOBAL: usize = 300;
 pub(crate) const DEFAULT_MAX_WS_CONNECTIONS: usize = 16;
 pub(crate) const MAX_CONCURRENT_UPLOADS_LIMIT: usize = 4;
 pub(crate) const MAX_PER_FILE_BYTES: u64 = 900 * 1024 * 1024;
@@ -42,6 +46,12 @@ pub struct Config {
     pub trusted_proxy: Option<IpAddr>,
     pub admin: Option<crate::admin::AdminConfig>,
     pub json_logs: bool,
+    pub sharing_enabled: bool,
+    pub sharing_canary_owner_ids: Vec<i64>,
+    pub share_invites_per_source: usize,
+    pub share_invites_per_user: usize,
+    pub share_invite_targets_per_user: usize,
+    pub share_invites_global: usize,
 }
 
 impl Config {
@@ -149,6 +159,33 @@ impl Config {
             control_port,
             data_port,
         )?;
+        let sharing_enabled = boolean("SELFHOST_SHARING_ENABLED", false)?;
+        let sharing_canary_owner_ids = parse_owner_ids(
+            value("SELFHOST_SHARING_CANARY_OWNER_IDS")
+                .as_deref()
+                .unwrap_or(""),
+        )?;
+        if sharing_enabled && !sharing_canary_owner_ids.is_empty() {
+            bail!(
+                "SELFHOST_SHARING_CANARY_OWNER_IDS must be empty when sharing is globally enabled"
+            )
+        }
+        let share_invites_per_source = bounded_budget(
+            "SELFHOST_SHARE_INVITES_PER_SOURCE_HOUR",
+            MAX_SHARE_INVITES_PER_SOURCE,
+        )?;
+        let share_invites_per_user = bounded_budget(
+            "SELFHOST_SHARE_INVITES_PER_USER_HOUR",
+            MAX_SHARE_INVITES_PER_USER,
+        )?;
+        let share_invite_targets_per_user = bounded_budget(
+            "SELFHOST_SHARE_INVITE_TARGETS_PER_USER_HOUR",
+            MAX_SHARE_INVITE_TARGETS_PER_USER,
+        )?;
+        let share_invites_global = bounded_budget(
+            "SELFHOST_SHARE_INVITES_GLOBAL_HOUR",
+            MAX_SHARE_INVITES_GLOBAL,
+        )?;
         Ok(Self {
             bind_host,
             control_port,
@@ -169,6 +206,12 @@ impl Config {
             trusted_proxy,
             admin,
             json_logs: value("SELFHOST_LOG_FORMAT").as_deref() != Some("pretty"),
+            sharing_enabled,
+            sharing_canary_owner_ids,
+            share_invites_per_source,
+            share_invites_per_user,
+            share_invite_targets_per_user,
+            share_invites_global,
         })
     }
 
@@ -194,7 +237,17 @@ impl Config {
             trusted_proxy: None,
             admin: None,
             json_logs: false,
+            sharing_enabled: true,
+            sharing_canary_owner_ids: Vec::new(),
+            share_invites_per_source: MAX_SHARE_INVITES_PER_SOURCE,
+            share_invites_per_user: MAX_SHARE_INVITES_PER_USER,
+            share_invite_targets_per_user: MAX_SHARE_INVITE_TARGETS_PER_USER,
+            share_invites_global: MAX_SHARE_INVITES_GLOBAL,
         })
+    }
+
+    pub fn sharing_allowed_for_owner(&self, owner_user_id: i64) -> bool {
+        self.sharing_enabled || self.sharing_canary_owner_ids.contains(&owner_user_id)
     }
 }
 
@@ -207,6 +260,43 @@ fn private_or_loopback(address: IpAddr) -> bool {
 
 fn value(name: &str) -> Option<String> {
     env::var(name).ok().filter(|v| !v.is_empty())
+}
+
+fn boolean(name: &str, default: bool) -> Result<bool> {
+    match value(name).as_deref() {
+        None => Ok(default),
+        Some("true") => Ok(true),
+        Some("false") => Ok(false),
+        Some(_) => bail!("{name} must be exactly true or false"),
+    }
+}
+
+fn bounded_budget(name: &str, maximum: usize) -> Result<usize> {
+    let value = number(name, maximum)?;
+    if !(1..=maximum).contains(&value) {
+        bail!("{name} must be between 1 and {maximum}")
+    }
+    Ok(value)
+}
+
+fn parse_owner_ids(value: &str) -> Result<Vec<i64>> {
+    if value.is_empty() {
+        return Ok(Vec::new());
+    }
+    let mut ids = Vec::new();
+    for raw in value.split(',') {
+        let id = raw
+            .parse::<i64>()
+            .with_context(|| "SELFHOST_SHARING_CANARY_OWNER_IDS must contain decimal user IDs")?;
+        if !(1..=MAX_JS_SAFE_INTEGER).contains(&id) || ids.contains(&id) {
+            bail!("SELFHOST_SHARING_CANARY_OWNER_IDS contains an invalid or duplicate user ID")
+        }
+        ids.push(id);
+    }
+    if ids.len() > 8 {
+        bail!("SELFHOST_SHARING_CANARY_OWNER_IDS accepts at most 8 user IDs")
+    }
+    Ok(ids)
 }
 
 fn validate_bind_host(bind_host: IpAddr, external_bind_acknowledged: bool) -> Result<()> {

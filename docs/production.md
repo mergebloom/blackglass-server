@@ -3,9 +3,9 @@
 ## Supported production shape
 
 The production target is deliberately narrow: administrator-provisioned local
-accounts with isolated end-to-end-encrypted vaults, one Rust process, one
-SQLite database, and one static node. Publish, public registration, sharing,
-high availability, and mobile clients are not supported in this phase. Both
+accounts with isolated or explicitly shared end-to-end-encrypted vaults, one
+Rust process, one SQLite database, and one static node. Publish, public
+registration, high availability, and mobile clients are not supported. Both
 custom-password and managed-encryption vaults are compatible. Prefer a custom
 vault password when the server operator must not be able to derive the vault
 key; managed mode stores its generated recovery password in SQLite and backups.
@@ -116,6 +116,24 @@ value may exceed its corresponding global limit. Retained ciphertext is
 admitted against both `SELFHOST_STORAGE_QUOTA_BYTES` and the uniform
 `SELFHOST_STORAGE_QUOTA_BYTES_PER_OWNER` ceiling.
 
+Shared-vault collaboration is disabled by default. For a controlled canary,
+leave `SELFHOST_SHARING_ENABLED=false` and set
+`SELFHOST_SHARING_CANARY_OWNER_IDS` to at most eight numeric owner IDs. Set
+`SELFHOST_SHARING_ENABLED=true` only for global enablement; startup rejects an
+ambiguous global-plus-canary configuration. Invitation attempts use bounded
+rolling-hour source, owner, distinct-target, and deployment budgets. The four
+`SELFHOST_SHARE_INVITE*` values may be lowered but cannot be disabled or raised
+above the qualified defaults. Target addresses are represented in limiter
+memory only by process-local keyed digests and reset on restart.
+
+The first sharing release immediately accepts existing active local accounts;
+it does not send email or implement pending invitations. Owners invite and
+remove collaborators. Collaborators can sync, inspect history, restore, purge,
+and leave with their own share ID, but cannot rename, delete, migrate, list, or
+manage other collaborators. Revocation closes matching live sockets and
+discards staged uploads. It cannot erase an already-downloaded local copy or
+make a previously disclosed custom encryption password secret again.
+
 ## Read-only admin console
 
 The optional Phase 1 admin console is observation-only: it has no mutation,
@@ -182,9 +200,11 @@ in `blackglass_sqlite_busy_total` or `blackglass_sqlite_deadlines_total`.
 Those counters use only the fixed `request` and `admin_snapshot` operation
 labels. A single busy event can be transient; a continuing increase indicates
 storage contention, an undersized host, or an unexpectedly expensive query.
+Alert on `blackglass_share_invites_total{outcome="rate_limited"}`. The fixed
+outcome labels contain no email address, user ID, vault ID, or target digest.
 
-The `v0.3.0` archive includes `release-contract.json`. Release automation
-checks that it binds server 0.3.0 to schema 5, the supported migration sources,
+The `v0.4.0` archive includes `release-contract.json`. Release automation
+checks that it binds server 0.4.0 to schema 6 and schema-5 migration input,
 the previous rollback tag, the exact Bridge tooling revision, both qualified
 renderer baselines, and the required primary/recovery monitoring selectors.
 
@@ -266,10 +286,12 @@ blackglass-server migrate server-vOLD.sqlite server-vNEW.sqlite
 
 Only after `verify server-vNEW.sqlite` succeeds should configuration point at
 the new file. The source stays unchanged. Each migration step validates its
-input/output inside the transaction and rolls back on failure. Migration from
-the shipped schema v3 to v4 preserves vault IDs and sessions; migrations from
-schemas older than v3 establish a new recovery epoch and require the same
-fresh-client procedure as restore.
+input/output inside the transaction and rolls back on failure. The Phase 4
+migration accepts a schema-v5 source, creates a new schema-v6 file, starts with
+no memberships, and invalidates existing sessions for one required re-login.
+Keep the exact v0.3.0 binary and untouched v5 source until activation. After
+the first accepted v6 write, recovery is roll-forward only; never run the
+v0.3.0 binary against schema v6.
 
 A pre-v4/pre-0.2.2 rollback is safe only before activation, while the untouched
 old database has received no client writes. After the new database has served

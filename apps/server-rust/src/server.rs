@@ -19,6 +19,7 @@ use axum::{
 };
 use futures_util::{SinkExt, StreamExt, stream::SplitSink};
 use serde_json::{Value, json};
+use sha2::{Digest, Sha256};
 use std::{
     collections::{HashMap, VecDeque},
     fs,
@@ -57,6 +58,8 @@ const SIGNIN_QUEUE_TIMEOUT: Duration = Duration::from_secs(10);
 const DB_WORKER_QUEUE_DEADLINE: Duration = Duration::from_secs(5);
 const SIGNIN_RATE_WINDOW: Duration = Duration::from_secs(60);
 const SIGNIN_ATTEMPTS_PER_SOURCE: usize = 6;
+const SHARE_INVITE_WINDOW: Duration = Duration::from_secs(60 * 60);
+const MAX_SHARE_INVITE_USER_ENTRIES: usize = 256;
 const MAX_SIGNIN_WAITERS: usize = 8;
 const MAX_UNAUTHENTICATED_WS_PER_SOURCE: usize = 4;
 const MAX_SOURCE_LIMIT_ENTRIES: usize = 4096;
@@ -95,6 +98,7 @@ pub struct Metrics {
     authorization_denials: [AtomicU64; AuthorizationOperation::COUNT],
     database_busy: [AtomicU64; DatabaseOperation::COUNT],
     database_deadlines: [AtomicU64; DatabaseOperation::COUNT],
+    share_invites: [AtomicU64; ShareInviteOutcome::COUNT],
 }
 
 #[derive(Clone, Copy)]
@@ -104,6 +108,24 @@ enum AuthorizationOperation {
     Rename,
     Delete,
     DataInit,
+}
+
+#[derive(Clone, Copy)]
+enum ShareInviteOutcome {
+    Success,
+    Unavailable,
+    Capacity,
+    RateLimited,
+}
+
+impl ShareInviteOutcome {
+    const COUNT: usize = 4;
+    const ALL: [(Self, &'static str); Self::COUNT] = [
+        (Self::Success, "success"),
+        (Self::Unavailable, "unavailable"),
+        (Self::Capacity, "capacity"),
+        (Self::RateLimited, "rate_limited"),
+    ];
 }
 
 impl AuthorizationOperation {
@@ -134,6 +156,10 @@ impl DatabaseOperation {
 impl Metrics {
     fn deny(&self, operation: AuthorizationOperation) {
         self.authorization_denials[operation as usize].fetch_add(1, Ordering::Relaxed);
+    }
+
+    fn share_invite(&self, outcome: ShareInviteOutcome) {
+        self.share_invites[outcome as usize].fetch_add(1, Ordering::Relaxed);
     }
 
     fn database_deadline(&self, operation: DatabaseOperation) {
@@ -180,6 +206,7 @@ pub struct AppState {
     auth_checks: Arc<Semaphore>,
     auth_waiters: Arc<Semaphore>,
     source_limits: Arc<StdMutex<SourceLimits>>,
+    share_invite_limits: Arc<StdMutex<ShareInviteLimits>>,
     control_body_readers: Arc<Semaphore>,
     control_requests: Arc<Semaphore>,
     db_workers: Arc<Semaphore>,
@@ -278,6 +305,90 @@ impl SourceLimits {
     }
 }
 
+struct ShareInviteAttempt {
+    source: IpAddr,
+    user_id: i64,
+    target_digest: [u8; 32],
+    at: Instant,
+}
+
+struct ShareInviteLimits {
+    secret: [u8; 32],
+    attempts: VecDeque<ShareInviteAttempt>,
+}
+
+impl ShareInviteLimits {
+    fn new() -> Self {
+        Self {
+            secret: rand::random(),
+            attempts: VecDeque::new(),
+        }
+    }
+
+    fn admit(
+        &mut self,
+        source: IpAddr,
+        user_id: i64,
+        canonical_target: &str,
+        config: &Config,
+        now: Instant,
+    ) -> bool {
+        while self
+            .attempts
+            .front()
+            .is_some_and(|attempt| now.duration_since(attempt.at) >= SHARE_INVITE_WINDOW)
+        {
+            self.attempts.pop_front();
+        }
+
+        let mut digest = Sha256::new();
+        digest.update(self.secret);
+        digest.update(canonical_target.as_bytes());
+        let target_digest: [u8; 32] = digest.finalize().into();
+        let source_attempts = self
+            .attempts
+            .iter()
+            .filter(|attempt| attempt.source == source)
+            .count();
+        let user_attempts = self
+            .attempts
+            .iter()
+            .filter(|attempt| attempt.user_id == user_id)
+            .count();
+        let known_user = user_attempts > 0;
+        let user_entries = self
+            .attempts
+            .iter()
+            .map(|attempt| attempt.user_id)
+            .collect::<std::collections::HashSet<_>>()
+            .len();
+        let distinct_targets = self
+            .attempts
+            .iter()
+            .filter(|attempt| attempt.user_id == user_id)
+            .map(|attempt| attempt.target_digest)
+            .collect::<std::collections::HashSet<_>>();
+        let adds_distinct_target = !distinct_targets.contains(&target_digest);
+
+        if self.attempts.len() >= config.share_invites_global
+            || source_attempts >= config.share_invites_per_source
+            || user_attempts >= config.share_invites_per_user
+            || (adds_distinct_target
+                && distinct_targets.len() >= config.share_invite_targets_per_user)
+            || (!known_user && user_entries >= MAX_SHARE_INVITE_USER_ENTRIES)
+        {
+            return false;
+        }
+        self.attempts.push_back(ShareInviteAttempt {
+            source,
+            user_id,
+            target_digest,
+            at: now,
+        });
+        true
+    }
+}
+
 struct SourceConnectionPermit {
     source: IpAddr,
     limits: Arc<StdMutex<SourceLimits>>,
@@ -326,6 +437,7 @@ pub async fn run(config: Config) -> Result<()> {
         auth_checks: Arc::new(Semaphore::new(auth::MAX_CONCURRENT_PASSWORD_CHECKS)),
         auth_waiters: Arc::new(Semaphore::new(MAX_SIGNIN_WAITERS)),
         source_limits: Arc::new(StdMutex::new(SourceLimits::default())),
+        share_invite_limits: Arc::new(StdMutex::new(ShareInviteLimits::new())),
         control_body_readers: Arc::new(Semaphore::new(MAX_CONTROL_BODY_READERS)),
         control_requests: Arc::new(Semaphore::new(MAX_CONTROL_REQUESTS)),
         db_workers: Arc::new(Semaphore::new(MAX_DB_WORKERS)),
@@ -584,6 +696,12 @@ async fn metrics(State(s): State<AppState>) -> Response {
             m.database_deadlines[operation as usize].load(Ordering::Relaxed)
         ));
     }
+    for (outcome, label) in ShareInviteOutcome::ALL {
+        body.push_str(&format!(
+            "blackglass_share_invites_total{{outcome=\"{label}\"}} {}\n",
+            m.share_invites[outcome as usize].load(Ordering::Relaxed)
+        ));
+    }
     (
         [
             (header::CONTENT_TYPE, "text/plain; version=0.0.4"),
@@ -648,7 +766,7 @@ async fn control(
         | "/user/signup"
         | "/user/forgetpass"
         | "/user/resendconfirmation" => Err(ADMIN_MANAGED_ACCOUNT_ERROR.into()),
-        _ => authorized_control(&s, uri.path(), value).await,
+        _ => authorized_control(&s, uri.path(), source, value).await,
     };
     match result {
         Ok(v) => api_for_origin(&s, v, StatusCode::OK, request_origin),
@@ -749,6 +867,7 @@ async fn signin(s: &AppState, source: IpAddr, v: Value) -> std::result::Result<V
 async fn authorized_control(
     s: &AppState,
     path: &str,
+    source: IpAddr,
     v: Value,
 ) -> std::result::Result<Value, String> {
     let token = v
@@ -803,7 +922,7 @@ async fn authorized_control(
         }
         "/vault/list" => Ok(json!({
             "vaults":db_task(s, move |db| db.list_vaults_for_user(auth_context.user_id)).await.map_err(internal)?,
-            "shared":[],
+            "shared":shared_inventory(s, auth_context.user_id).await?,
             "limit":100
         })),
         "/vault/create" => create_vault(s, auth_context.user_id, auth_context.token_hash, v).await,
@@ -813,12 +932,137 @@ async fn authorized_control(
         }
         "/vault/rename" => rename_vault(s, auth_context.user_id, auth_context.token_hash, v).await,
         "/vault/delete" => delete_vault(s, auth_context.user_id, auth_context.token_hash, v).await,
-        "/vault/share/list" => Ok(json!({"shares":[]})),
-        "/vault/share/invite" | "/vault/share/remove" => {
-            Err("Sharing is unavailable in single-user mode".into())
+        "/vault/share/list" => share_list(s, auth_context.user_id, v).await,
+        "/vault/share/invite" => {
+            share_invite(s, source, auth_context.user_id, auth_context.token_hash, v).await
+        }
+        "/vault/share/remove" => {
+            share_remove(s, auth_context.user_id, auth_context.token_hash, v).await
         }
         _ => Err("Not found".into()),
     }
+}
+
+async fn shared_inventory(
+    s: &AppState,
+    user_id: i64,
+) -> std::result::Result<Vec<SharedVault>, String> {
+    let mut shared = db_task(s, move |db| db.list_shared_vaults_for_user(user_id))
+        .await
+        .map_err(internal)?;
+    shared.retain(|vault| s.config.sharing_allowed_for_owner(vault.owner_user_id));
+    Ok(shared)
+}
+
+async fn share_list(s: &AppState, user_id: i64, v: Value) -> std::result::Result<Value, String> {
+    if !s.config.sharing_allowed_for_owner(user_id) {
+        return Err("Sharing is unavailable".into());
+    }
+    let request: VaultShareListRequest =
+        serde_json::from_value(v).map_err(|_| "Unable to list collaborators".to_string())?;
+    let vault_id = request.vault_uid.ok_or("Unable to list collaborators")?;
+    let shares = db_task(s, move |db| db.list_shares_for_owner(user_id, &vault_id))
+        .await
+        .map_err(internal)?
+        .ok_or("Unable to list collaborators")?;
+    Ok(json!({"shares": shares}))
+}
+
+async fn share_invite(
+    s: &AppState,
+    source: IpAddr,
+    user_id: i64,
+    token_hash: String,
+    v: Value,
+) -> std::result::Result<Value, String> {
+    if !s.config.sharing_allowed_for_owner(user_id) {
+        return Err("Sharing is unavailable".into());
+    }
+    let request: VaultShareInviteRequest =
+        serde_json::from_value(v).map_err(|_| "Unable to invite collaborator".to_string())?;
+    let vault_id = request.vault_uid.ok_or("Unable to invite collaborator")?;
+    let email = request.email.ok_or("User unavailable for sharing")?;
+    let canonical =
+        auth::canonicalize_email(&email).map_err(|_| "User unavailable for sharing".to_string())?;
+    let admitted = s
+        .share_invite_limits
+        .lock()
+        .map_err(|_| "Share invitation rate limit reached".to_string())?
+        .admit(
+            source,
+            user_id,
+            &canonical.canonical,
+            &s.config,
+            Instant::now(),
+        );
+    if !admitted {
+        s.metrics.share_invite(ShareInviteOutcome::RateLimited);
+        return Err("Share invitation rate limit reached".into());
+    }
+    let result = db_task(s, move |db| {
+        db.invite_collaborator_for_session(user_id, &token_hash, &vault_id, &email)
+    })
+    .await;
+    match result {
+        Ok(item) => {
+            s.metrics.share_invite(ShareInviteOutcome::Success);
+            serde_json::to_value(item).map_err(internal)
+        }
+        Err(error) => {
+            let message = error.to_string();
+            if message.contains("sharing user unavailable") {
+                s.metrics.share_invite(ShareInviteOutcome::Unavailable);
+                Err("User unavailable for sharing".to_string())
+            } else if message.contains("collaborator limit reached") {
+                s.metrics.share_invite(ShareInviteOutcome::Capacity);
+                Err("Collaborator limit reached".to_string())
+            } else if message.contains("membership capacity reached")
+                || message.contains("membership sequence exhausted")
+            {
+                s.metrics.share_invite(ShareInviteOutcome::Capacity);
+                Err("Sharing capacity reached".to_string())
+            } else if message.contains("sharing vault unavailable") {
+                Err("Unable to invite collaborator".to_string())
+            } else {
+                Err(internal(error))
+            }
+        }
+    }
+}
+
+async fn share_remove(
+    s: &AppState,
+    user_id: i64,
+    token_hash: String,
+    v: Value,
+) -> std::result::Result<Value, String> {
+    let request: VaultShareRemoveRequest =
+        serde_json::from_value(v).map_err(|_| "Unable to remove collaborator".to_string())?;
+    let vault_id = request.vault_uid.ok_or("Unable to remove collaborator")?;
+    let owner_lookup = vault_id.clone();
+    let owner_user_id = db_task(s, move |db| db.vault_owner_user_id(&owner_lookup))
+        .await
+        .map_err(internal)?
+        .ok_or("Unable to remove collaborator")?;
+    if !s.config.sharing_allowed_for_owner(owner_user_id) {
+        return Err("Sharing is unavailable".into());
+    }
+    let share_uid = request
+        .share_uid
+        .filter(|uid| (1..=MAX_JS_SAFE_INTEGER).contains(uid))
+        .ok_or("Unable to remove collaborator")?;
+    let removed_vault_id = vault_id.clone();
+    let removed = db_task(s, move |db| {
+        db.remove_collaborator_for_session(user_id, &token_hash, &vault_id, share_uid)
+    })
+    .await
+    .map_err(internal)?;
+    if removed.is_none() {
+        return Err("Unable to remove collaborator".into());
+    }
+    s.live_connections
+        .cancel_user_vault(removed.expect("checked above"), &removed_vault_id);
+    Ok(json!({}))
 }
 
 async fn create_vault(
@@ -876,17 +1120,28 @@ async fn access_vault(
     token_hash: String,
     v: Value,
 ) -> std::result::Result<Value, String> {
-    let r: VaultAccess =
+    let r: VaultAccessRequest =
         serde_json::from_value(v).map_err(|_| "Unable to access vault".to_string())?;
     let id = r.vault_uid.ok_or("Unable to access vault")?;
     let lookup_id = id.clone();
-    let Some(mut vault) = db_task(s, move |db| db.find_owned_vault(user_id, &lookup_id))
-        .await
-        .map_err(internal)?
+    let Some((mut vault, access)) =
+        db_task(s, move |db| db.find_authorized_vault(user_id, &lookup_id))
+            .await
+            .map_err(internal)?
     else {
         s.metrics.deny(AuthorizationOperation::Access);
         return Err("Unable to access vault".into());
     };
+    if matches!(access, crate::model::VaultAccess::Collaborator { .. }) {
+        let owner_lookup = id.clone();
+        let owner_user_id = db_task(s, move |db| db.vault_owner_user_id(&owner_lookup))
+            .await
+            .map_err(internal)?
+            .ok_or("Unable to access vault")?;
+        if !s.config.sharing_allowed_for_owner(owner_user_id) {
+            return Err("Sharing is unavailable".into());
+        }
+    }
     if r.host.as_deref() != Some(&vault.host)
         || r.encryption_version != Some(vault.encryption_version)
     {
@@ -1103,6 +1358,7 @@ struct Session {
     user_id: Option<i64>,
     expires_at: Option<i64>,
     vault: Option<String>,
+    vault_owner_user_id: Option<i64>,
     device: String,
     pending: Option<Pending>,
     live: Option<crate::admin::LiveGuard>,
@@ -1287,6 +1543,7 @@ async fn socket_loop(
         user_id: None,
         expires_at: None,
         vault: None,
+        vault_owner_user_id: None,
         device: "Unknown device".into(),
         pending: None,
         live: None,
@@ -1485,21 +1742,25 @@ async fn handle_message(
                 "ping" => send(tx, json!({"op":"pong"})).await?,
                 "size" => {
                     let vault = session.vault.clone().unwrap();
-                    let user_id = session
-                        .user_id
-                        .context("authenticated session has no user ID")?;
                     let (size, vault_size) = db_task(s, move |db| {
                         Ok((
-                            db.stored_ciphertext_size_for_owner(user_id)?,
+                            db.stored_ciphertext_size_for_vault_owner(&vault)?
+                                .context("authorized vault has no owner")?,
                             db.vault_size(&vault)?,
                         ))
                     })
                     .await?;
+                    if !session_active(s, session).await {
+                        return close(tx, 1008, "Authorization revoked").await;
+                    }
                     send(tx,json!({"res":"ok","size":size,"limit":s.config.storage_quota_bytes_per_owner,"vault_size":vault_size})).await?
                 }
                 "usernames" => {
                     let vault = session.vault.clone().unwrap();
                     let usernames = db_task(s, move |db| db.usernames_for_vault(&vault)).await?;
+                    if !session_active(s, session).await {
+                        return close(tx, 1008, "Authorization revoked").await;
+                    }
                     send(tx, serde_json::to_value(usernames)?).await?
                 }
                 "push" => begin_push(s, session, events, tx, v).await?,
@@ -1593,17 +1854,22 @@ async fn init(
             .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte));
     let keyhash = v.get("keyhash").and_then(Value::as_str).map(str::to_owned);
     let enc = v.get("encryption_version").and_then(Value::as_i64);
-    let (auth_context, vault, retired_vault) = db_task(s, move |db| {
+    let (auth_context, vault, access, owner_user_id, retired_vault) = db_task(s, move |db| {
         let auth_context = token_has_session_shape
             .then(|| db.auth_context_hash(&validation_hash))
             .transpose()?
             .flatten();
         let Some(auth_context) = auth_context else {
-            return Ok((None, None, false));
+            return Ok((None, None, None, None, false));
         };
-        let vault = db.find_owned_vault(auth_context.user_id, &lookup_id)?;
+        let authorized = db.find_authorized_vault(auth_context.user_id, &lookup_id)?;
+        let (vault, access) = match authorized {
+            Some((vault, access)) => (Some(vault), Some(access)),
+            None => (None, None),
+        };
+        let owner_user_id = db.vault_owner_user_id(&lookup_id)?;
         let retired = db.is_retired_vault_for_user(auth_context.user_id, &lookup_id)?;
-        Ok((Some(auth_context), vault, retired))
+        Ok((Some(auth_context), vault, access, owner_user_id, retired))
     })
     .await?;
     let valid_session = auth_context.is_some();
@@ -1618,6 +1884,12 @@ async fn init(
         send(tx, json!({"res":"err","msg":"Unable to authenticate"})).await?;
         return Ok(());
     };
+    if matches!(access, Some(crate::model::VaultAccess::Collaborator { .. }))
+        && !owner_user_id.is_some_and(|owner| s.config.sharing_allowed_for_owner(owner))
+    {
+        send(tx, json!({"res":"err","msg":"Vault not found"})).await?;
+        return close(tx, 1008, "Vault not found").await;
+    }
     if !valid_session
         || keyhash.as_deref() != vault.keyhash.as_deref()
         || enc != Some(vault.encryption_version)
@@ -1655,6 +1927,7 @@ async fn init(
     session.expires_at = Some(auth_context.expires_at);
     session._user_connection_permit = Some(user_connection_permit);
     session.vault = Some(vault.id.clone());
+    session.vault_owner_user_id = owner_user_id;
     session.device = bounded(
         v.get("device")
             .and_then(Value::as_str)
@@ -1720,6 +1993,9 @@ async fn init(
             if shutting_down(s) {
                 return Ok(());
             }
+            if !session_active(s, session).await {
+                return close(tx, 1008, "Authorization revoked").await;
+            }
             cursor = revision.uid;
             // Retain at most a small, explicitly bounded DB page per client,
             // then admit each wire item separately. A trickle reader releases
@@ -1734,6 +2010,9 @@ async fn init(
         if page_len < REPLAY_PAGE_SIZE as usize {
             break;
         }
+    }
+    if !session_active(s, session).await {
+        return close(tx, 1008, "Authorization revoked").await;
     }
     send(tx, json!({"op":"ready","version":ready_version})).await?;
     if let Some(live) = &session.live {
@@ -1851,6 +2130,9 @@ async fn begin_push(
         }
     };
     let user_id = revision.user_id;
+    let owner_user_id = session
+        .vault_owner_user_id
+        .context("authorized vault has no owner")?;
     let Some(user_upload_permit) = s.user_concurrency.try_acquire(
         user_id,
         UserConcurrencyKind::Upload,
@@ -1869,14 +2151,14 @@ async fn begin_push(
         let (committed_global, committed_owner) = db_task(s, move |db| {
             Ok((
                 db.stored_ciphertext_size()?,
-                db.stored_ciphertext_size_for_owner(user_id)?,
+                db.stored_ciphertext_size_for_owner(owner_user_id)?,
             ))
         })
         .await?;
         s.storage_reservations.try_reserve(
             committed_global,
             committed_owner,
-            user_id,
+            owner_user_id,
             revision.size,
             s.config.storage_quota_bytes,
             s.config.storage_quota_bytes_per_owner,
@@ -2025,6 +2307,9 @@ async fn pull(
         send(tx, json!({"err":"Revision not found"})).await?;
         return Ok(());
     }
+    if !session_active(s, session).await {
+        return close(tx, 1008, "Authorization revoked").await;
+    }
     if info.deleted || info.folder || !info.has_content {
         send(
             tx,
@@ -2063,6 +2348,9 @@ async fn pull(
         }
         let len = (info.size - offset).min(PIECE_SIZE);
         let chunk = db_task(s, move |db| db.content_chunk(uid, offset, len)).await?;
+        if !session_active(s, session).await {
+            return close(tx, 1008, "Authorization revoked").await;
+        }
         socket_send(tx, Message::Binary(chunk.into())).await?;
         offset += len
     }
@@ -2146,6 +2434,9 @@ async fn history(
         .take(100)
         .map(notice_item)
         .collect::<Vec<_>>();
+    if !session_active(s, session).await {
+        return close(tx, 1008, "Authorization revoked").await;
+    }
     if !send_with_limit(
         tx,
         json!({"items":items,"more":more}),
@@ -2222,6 +2513,9 @@ async fn deleted(
     }
     response.extend_from_slice(b"]}");
     drop(_commit);
+    if !session_active(s, session).await {
+        return close(tx, 1008, "Authorization revoked").await;
+    }
     let response = String::from_utf8(response).context("serialize deleted response")?;
     socket_send(tx, Message::Text(response.into())).await?;
     Ok(())
@@ -2251,7 +2545,10 @@ async fn restore(
         let storage_quota_bytes = s.config.storage_quota_bytes;
         let owner_storage_quota_bytes = s.config.storage_quota_bytes_per_owner;
         let reserved_global = s.storage_reservations.reserved();
-        let reserved_owner = s.storage_reservations.reserved_for_owner(user_id);
+        let owner_user_id = session
+            .vault_owner_user_id
+            .context("authorized vault has no owner")?;
+        let reserved_owner = s.storage_reservations.reserved_for_owner(owner_user_id);
         let restore_global_quota_bytes = storage_quota_bytes.saturating_sub(reserved_global);
         let restore_owner_quota_bytes = owner_storage_quota_bytes.saturating_sub(reserved_owner);
         match db_task(s, move |db| {
@@ -2935,6 +3232,42 @@ mod tests {
     use sha2::{Digest, Sha256};
     use tower::ServiceExt;
 
+    #[test]
+    fn share_invite_limits_are_bounded_keyed_and_uniform() {
+        let directory = tempfile::tempdir().unwrap();
+        let mut config = Config::test(directory.path(), 3000, 3003).unwrap();
+        config.share_invites_per_source = 3;
+        config.share_invites_per_user = 3;
+        config.share_invite_targets_per_user = 1;
+        config.share_invites_global = 3;
+        let source: IpAddr = "192.0.2.1".parse().unwrap();
+        let now = Instant::now();
+        let mut limits = ShareInviteLimits::new();
+
+        assert!(limits.admit(source, 1, "first@example.test", &config, now));
+        assert!(limits.admit(source, 1, "first@example.test", &config, now));
+        assert!(!limits.admit(source, 1, "second@example.test", &config, now));
+        assert_eq!(limits.attempts.len(), 2);
+        let unkeyed: [u8; 32] = Sha256::digest(b"first@example.test").into();
+        assert!(
+            limits
+                .attempts
+                .iter()
+                .all(|attempt| attempt.target_digest != unkeyed)
+        );
+
+        config.share_invite_targets_per_user = 3;
+        assert!(limits.admit(source, 1, "second@example.test", &config, now));
+        assert!(!limits.admit(
+            "192.0.2.2".parse().unwrap(),
+            2,
+            "third@example.test",
+            &config,
+            now
+        ));
+        assert_eq!(limits.attempts.len(), config.share_invites_global);
+    }
+
     fn admin_test_state(
         directory: &std::path::Path,
         admin_port: u16,
@@ -2965,6 +3298,7 @@ mod tests {
                 auth_checks: Arc::new(Semaphore::new(auth::MAX_CONCURRENT_PASSWORD_CHECKS)),
                 auth_waiters: Arc::new(Semaphore::new(MAX_SIGNIN_WAITERS)),
                 source_limits: Arc::new(StdMutex::new(SourceLimits::default())),
+                share_invite_limits: Arc::new(StdMutex::new(ShareInviteLimits::new())),
                 control_body_readers: Arc::new(Semaphore::new(MAX_CONTROL_BODY_READERS)),
                 control_requests: Arc::new(Semaphore::new(MAX_CONTROL_REQUESTS)),
                 db_workers: Arc::new(Semaphore::new(MAX_DB_WORKERS)),

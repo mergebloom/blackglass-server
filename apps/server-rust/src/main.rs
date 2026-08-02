@@ -179,8 +179,15 @@ async fn main() -> Result<()> {
             let source = PathBuf::from(source);
             let destination = PathBuf::from(destination);
             let _database_lock = server::acquire_database_lock(&source)?;
-            let initial_user = configured_initial_user()?;
-            db::migrate_versioned_database_under_lock(&source, &destination, &initial_user)?;
+            let source_version = db::versioned_migration_source_version(&source)?;
+            let initial_user = (source_version < 5)
+                .then(configured_initial_user)
+                .transpose()?;
+            db::migrate_versioned_database_under_lock(
+                &source,
+                &destination,
+                initial_user.as_ref(),
+            )?;
             println!(
                 "versioned migration verified: {} -> {}",
                 source.display(),
