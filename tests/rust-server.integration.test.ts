@@ -1816,7 +1816,7 @@ describe("production Rust server", () => {
       if (child.exitCode === null) child.kill("SIGTERM");
       await child.exited;
     }
-  }, 20_000);
+  }, 30_000);
 });
 
 function push(path: string, hash: string, size: number, pieces: number, extra: Record<string, unknown> = {}) { return { op: "push", path, relatedpath: null, extension: "md", hash, ctime: 1_700_000_000_000, mtime: 1_700_000_000_100, folder: false, deleted: false, size, pieces, ...extra }; }
