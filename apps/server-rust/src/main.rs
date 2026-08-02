@@ -53,13 +53,73 @@ async fn main() -> Result<()> {
             Ok(())
         }
         [command] if command == "hash-password" => {
-            let mut password = String::new();
-            io::stdin().read_to_string(&mut password)?;
-            let password = password.trim_end_matches(['\r', '\n']);
-            if password.is_empty() {
-                bail!("read a non-empty password from stdin")
-            }
-            println!("{}", auth::hash_password(password)?);
+            let password = read_password()?;
+            println!("{}", auth::hash_password(&password)?);
+            Ok(())
+        }
+        [scope, command, database] if scope == "user" && command == "list" => {
+            let database = PathBuf::from(database);
+            let _database_lock = server::acquire_database_lock(&database)?;
+            let db = db::Db::open_offline_under_lock(&database)?;
+            println!("{}", serde_json::to_string(&db.list_users()?)?);
+            Ok(())
+        }
+        [scope, command, database, email, name] if scope == "user" && command == "create" => {
+            let database = PathBuf::from(database);
+            let _database_lock = server::acquire_database_lock(&database)?;
+            let db = db::Db::open_offline_under_lock(&database)?;
+            let password = read_password()?;
+            let password_hash = auth::hash_password(&password)?;
+            let user_id = db.create_user(email, name, &password_hash)?;
+            println!("created user: {user_id}");
+            Ok(())
+        }
+        [scope, command, database, user_id] if scope == "user" && command == "set-password" => {
+            let database = PathBuf::from(database);
+            let user_id = parse_user_id(user_id)?;
+            let _database_lock = server::acquire_database_lock(&database)?;
+            let db = db::Db::open_offline_under_lock(&database)?;
+            let password = read_password()?;
+            let password_hash = auth::hash_password(&password)?;
+            db.set_user_password(user_id, &password_hash)?;
+            println!("updated user: {user_id}");
+            Ok(())
+        }
+        [scope, command, database, user_id, email] if scope == "user" && command == "set-email" => {
+            let database = PathBuf::from(database);
+            let user_id = parse_user_id(user_id)?;
+            let _database_lock = server::acquire_database_lock(&database)?;
+            let db = db::Db::open_offline_under_lock(&database)?;
+            db.set_user_email(user_id, email)?;
+            println!("updated user: {user_id}");
+            Ok(())
+        }
+        [scope, command, database, user_id, name] if scope == "user" && command == "set-name" => {
+            let database = PathBuf::from(database);
+            let user_id = parse_user_id(user_id)?;
+            let _database_lock = server::acquire_database_lock(&database)?;
+            let db = db::Db::open_offline_under_lock(&database)?;
+            db.set_user_name(user_id, name)?;
+            println!("updated user: {user_id}");
+            Ok(())
+        }
+        [scope, command, database, user_id, status]
+            if scope == "user" && command == "set-status" =>
+        {
+            let database = PathBuf::from(database);
+            let user_id = parse_user_id(user_id)?;
+            let _database_lock = server::acquire_database_lock(&database)?;
+            let db = db::Db::open_offline_under_lock(&database)?;
+            db.set_user_status(user_id, status)?;
+            println!("updated user: {user_id}");
+            Ok(())
+        }
+        [scope, command, database, user_id] if scope == "user" && command == "revoke-sessions" => {
+            let database = PathBuf::from(database);
+            let user_id = parse_user_id(user_id)?;
+            let _database_lock = server::acquire_database_lock(&database)?;
+            let db = db::Db::open_offline_under_lock(&database)?;
+            println!("revoked sessions: {}", db.revoke_user_sessions(user_id)?);
             Ok(())
         }
         [command, source, output] if command == "backup" => {
@@ -85,7 +145,8 @@ async fn main() -> Result<()> {
         [command, source, destination] if command == "migrate-legacy" => {
             let source = PathBuf::from(source);
             let destination = PathBuf::from(destination);
-            db::migrate_legacy_database(&source, &destination)?;
+            let initial_user = configured_initial_user()?;
+            db::migrate_legacy_database_with_initial_user(&source, &destination, &initial_user)?;
             println!(
                 "legacy migration verified: {} -> {}",
                 source.display(),
@@ -96,7 +157,9 @@ async fn main() -> Result<()> {
         [command, source, destination] if command == "migrate" => {
             let source = PathBuf::from(source);
             let destination = PathBuf::from(destination);
-            db::migrate_versioned_database(&source, &destination)?;
+            let _database_lock = server::acquire_database_lock(&source)?;
+            let initial_user = configured_initial_user()?;
+            db::migrate_versioned_database_under_lock(&source, &destination, &initial_user)?;
             println!(
                 "versioned migration verified: {} -> {}",
                 source.display(),
@@ -133,10 +196,46 @@ async fn main() -> Result<()> {
     }
 }
 
+fn configured_initial_user() -> Result<db::InitialUser> {
+    let email = std::env::var("SELFHOST_EMAIL")
+        .map_err(|_| anyhow::anyhow!("SELFHOST_EMAIL is required for schema v5 migration"))?;
+    let password_hash = std::env::var("SELFHOST_PASSWORD_HASH").map_err(|_| {
+        anyhow::anyhow!("SELFHOST_PASSWORD_HASH is required for schema v5 migration")
+    })?;
+    let name = std::env::var("SELFHOST_NAME").unwrap_or_else(|_| "Blackglass user".into());
+    db::InitialUser::new(&email, &name, &password_hash)
+}
+
+fn read_password() -> Result<String> {
+    let mut password = String::new();
+    io::stdin().read_to_string(&mut password)?;
+    let password = password.trim_end_matches(['\r', '\n']);
+    if password.is_empty() {
+        bail!("read a non-empty password from stdin")
+    }
+    Ok(password.to_owned())
+}
+
+fn parse_user_id(value: &str) -> Result<i64> {
+    let user_id = value
+        .parse::<i64>()
+        .map_err(|_| anyhow::anyhow!("user ID must be a positive safe integer"))?;
+    if !(1..=db::MAX_JS_SAFE_INTEGER).contains(&user_id) {
+        bail!("user ID must be a positive safe integer")
+    }
+    Ok(user_id)
+}
+
 fn print_help() {
     println!(
         "{NAME} {VERSION}\n\n\
 Usage:\n  {NAME} serve\n  {NAME} hash-password\n  {NAME} backup <database> <output>\n  \
+{NAME} user list <database>\n  {NAME} user create <database> <email> <name>\n  \
+{NAME} user set-password <database> <user-id>\n  \
+{NAME} user set-email <database> <user-id> <email>\n  \
+{NAME} user set-name <database> <user-id> <name>\n  \
+{NAME} user set-status <database> <user-id> <active|disabled>\n  \
+{NAME} user revoke-sessions <database> <user-id>\n  \
 {NAME} verify <database>\n  {NAME} restore <backup> <new-database>\n  \
 {NAME} migrate <versioned-database> <new-database>\n  \
 {NAME} migrate-legacy <legacy-database> <new-database>\n  \

@@ -1,5 +1,23 @@
 use serde::{Deserialize, Serialize};
 
+#[derive(Clone, Debug)]
+pub struct UserCredential {
+    pub id: i64,
+    pub email: String,
+    pub name: String,
+    pub password_hash: String,
+    pub active: bool,
+}
+
+#[derive(Clone, Debug)]
+pub struct AuthContext {
+    pub user_id: i64,
+    pub email: String,
+    pub name: String,
+    pub token_hash: String,
+    pub expires_at: i64,
+}
+
 #[derive(Clone, Debug, Serialize)]
 pub struct Vault {
     pub id: String,

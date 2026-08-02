@@ -1,4 +1,4 @@
-use anyhow::Result;
+use anyhow::{Result, bail};
 use argon2::{Argon2, PasswordHash, PasswordHasher, PasswordVerifier};
 use password_hash::SaltString;
 use rand::{RngCore, rngs::OsRng};
@@ -11,6 +11,8 @@ const MAX_ARGON2_TIME_COST: u32 = 5;
 const MIN_ARGON2_PARALLELISM: u32 = 1;
 const MAX_ARGON2_PARALLELISM: u32 = 4;
 const MAX_PASSWORD_HASH_LENGTH: usize = 512;
+pub(crate) const MAX_EMAIL_BYTES: usize = 254;
+pub(crate) const MAX_DISPLAY_NAME_BYTES: usize = 128;
 pub(crate) const MAX_CONCURRENT_PASSWORD_CHECKS: usize = 1;
 const SERVICE_MEMORY_LIMIT_KIB: usize = 384 * 1024;
 const MAX_WS_FRAME_MEMORY_KIB: usize = crate::config::MAX_WS_CONNECTIONS_LIMIT * 2 * 1024;
@@ -54,6 +56,44 @@ pub fn verify_password(password: &str, encoded: &str) -> bool {
 
 pub fn password_hash_is_production_grade(encoded: &str) -> bool {
     accepted_password_hash(encoded).is_some()
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(crate) struct CanonicalEmail {
+    pub display: String,
+    pub canonical: String,
+}
+
+pub(crate) fn canonicalize_email(value: &str) -> Result<CanonicalEmail> {
+    let display = value.trim_matches(|character: char| character.is_ascii_whitespace());
+    if display.is_empty() || display.len() > MAX_EMAIL_BYTES {
+        bail!("email must be between 1 and {MAX_EMAIL_BYTES} ASCII bytes")
+    }
+    if !display.bytes().all(|byte| (b'!'..=b'~').contains(&byte)) {
+        bail!("email must contain printable ASCII without whitespace")
+    }
+    let mut separators = display.match_indices('@');
+    let Some((separator, _)) = separators.next() else {
+        bail!("email must contain exactly one non-edge @")
+    };
+    if separator == 0 || separator + 1 == display.len() || separators.next().is_some() {
+        bail!("email must contain exactly one non-edge @")
+    }
+    Ok(CanonicalEmail {
+        display: display.to_owned(),
+        canonical: display.to_ascii_lowercase(),
+    })
+}
+
+pub(crate) fn normalize_display_name(value: &str) -> Result<String> {
+    let name = value.trim_matches(|character: char| character.is_ascii_whitespace());
+    if name.is_empty() || name.len() > MAX_DISPLAY_NAME_BYTES {
+        bail!("name must be between 1 and {MAX_DISPLAY_NAME_BYTES} bytes")
+    }
+    if name.chars().any(char::is_control) {
+        bail!("name must not contain control characters")
+    }
+    Ok(name.to_owned())
 }
 
 fn accepted_password_hash(encoded: &str) -> Option<PasswordHash<'_>> {
@@ -140,6 +180,43 @@ mod tests {
             MAX_ARGON2_PARALLELISM,
         );
         assert!(password_hash_is_production_grade(&bounded));
+    }
+
+    #[test]
+    fn email_canonicalization_is_shared_bounded_and_ascii_only() {
+        assert_eq!(
+            canonicalize_email("\tOwner+Sync@Example.TEST\r\n").unwrap(),
+            CanonicalEmail {
+                display: "Owner+Sync@Example.TEST".into(),
+                canonical: "owner+sync@example.test".into(),
+            }
+        );
+        for rejected in [
+            "",
+            "owner",
+            "@example.test",
+            "owner@",
+            "owner@@example.test",
+            "owner @example.test",
+            "ownér@example.test",
+        ] {
+            assert!(
+                canonicalize_email(rejected).is_err(),
+                "accepted {rejected:?}"
+            );
+        }
+        assert!(canonicalize_email(&format!("{}@x.test", "a".repeat(248))).is_err());
+    }
+
+    #[test]
+    fn display_names_are_trimmed_and_bounded_without_controls() {
+        assert_eq!(
+            normalize_display_name("  Alice Example \n").unwrap(),
+            "Alice Example"
+        );
+        assert!(normalize_display_name("").is_err());
+        assert!(normalize_display_name("Alice\u{0000}Example").is_err());
+        assert!(normalize_display_name(&"a".repeat(MAX_DISPLAY_NAME_BYTES + 1)).is_err());
     }
 
     #[test]

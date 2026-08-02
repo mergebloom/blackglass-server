@@ -1371,12 +1371,11 @@ describe("production Rust server", () => {
 
       const stale = await Probe.connect(`ws://127.0.0.1:${recoveredDataPort}`);
       // This token was issued after the backup and is therefore not a valid
-      // session in the restored database. The exact recovery signal is
-      // intentionally keyed by its 64-lowercase-hex session shape plus the
-      // recorded retired vault ID, not by a valid session lookup.
+      // session in the restored database. Merely having token shape must not
+      // disclose a tenant's retired-vault marker.
       stale.json(initFor(postBackupSignin.token, originalVault, "Post-backup stale client", 1, false));
-      expect(await stale.nextJson()).toEqual({ res: "err", msg: "Vault not found" });
-      expect((await waitForClose(stale, 2_000)).code).toBe(1008);
+      expect(await stale.nextJson()).toEqual({ res: "err", msg: "Unable to authenticate" });
+      stale.socket.close();
 
       const malformedToken = await Probe.connect(`ws://127.0.0.1:${recoveredDataPort}`);
       malformedToken.json(

@@ -99,6 +99,7 @@ struct Event {
     vault: String,
     text: String,
     invalidated: bool,
+    invalidated_session_hash: Option<String>,
 }
 #[derive(Clone)]
 pub struct AppState {
@@ -230,7 +231,9 @@ pub async fn run(config: Config) -> Result<()> {
     let _database_lock = acquire_database_lock(&config.database_path)?;
     let _staging_lock = acquire_path_lock(&config.staging_dir, "staging")?;
     prepare_staging(&config.staging_dir)?;
-    let db = Db::open(&config.database_path)?;
+    let initial_user =
+        crate::db::InitialUser::new(&config.email, &config.display_name, &config.password_hash)?;
+    let db = Db::open_with_initial_user(&config.database_path, &initial_user)?;
     let configured_host = config.public_data_host.clone();
     let mismatched_hosts = db
         .mismatched_data_hosts(&configured_host)
@@ -621,12 +624,24 @@ async fn signin(s: &AppState, source: IpAddr, v: Value) -> std::result::Result<V
         warn!(event = "signin_memory_capacity_reached");
         return Err("Try again later".into());
     };
-    let email_ok = req
+    let canonical_email = req
         .email
         .as_deref()
-        .is_some_and(|e| e.eq_ignore_ascii_case(&s.config.email));
+        .and_then(|email| auth::canonicalize_email(email).ok())
+        .map(|email| email.canonical);
+    let candidate = if let Some(canonical_email) = canonical_email {
+        db_task(s, move |db| db.signin_candidate(&canonical_email))
+            .await
+            .map_err(internal)?
+    } else {
+        None
+    };
     let password = req.password.unwrap_or_default();
-    let encoded = s.config.password_hash.clone();
+    let encoded = candidate
+        .as_ref()
+        .filter(|user| user.active)
+        .map(|user| user.password_hash.clone())
+        .unwrap_or_else(|| s.config.password_hash.clone());
     let password_ok = tokio::task::spawn_blocking(move || {
         let valid = auth::verify_password(&password, &encoded);
         drop((permit, bulk_memory));
@@ -634,21 +649,22 @@ async fn signin(s: &AppState, source: IpAddr, v: Value) -> std::result::Result<V
     })
     .await
     .map_err(internal)?;
-    if !email_ok || !password_ok {
+    let Some(user) = candidate.filter(|user| user.active && password_ok) else {
         s.metrics.auth_failures.fetch_add(1, Ordering::Relaxed);
         warn!(event = "signin_failed");
         return Err("Invalid email or password".into());
-    }
+    };
     if let Ok(mut limits) = s.source_limits.lock() {
         limits.refund_successful_signin(source);
     }
     let ttl = s.config.session_ttl.as_secs() as i64;
-    let token = db_task(s, move |db| db.issue_session(ttl))
+    let user_id = user.id;
+    let token = db_task(s, move |db| db.issue_session_for_user(user_id, ttl))
         .await
         .map_err(internal)?;
     s.metrics.signins.fetch_add(1, Ordering::Relaxed);
     info!(event = "signin_succeeded");
-    Ok(json!({"email":s.config.email,"name":s.config.display_name,"license":null,"token":token}))
+    Ok(json!({"email":user.email,"name":user.name,"license":null,"token":token}))
 }
 
 async fn authorized_control(
@@ -662,22 +678,30 @@ async fn authorized_control(
         .ok_or("Not logged in")?
         .to_owned();
     let validation_token = token.clone();
-    if !db_task(s, move |db| Ok(db.valid_session(&validation_token)))
+    let Some(auth_context) = db_task(s, move |db| db.auth_context(&validation_token))
         .await
         .map_err(internal)?
-    {
+    else {
         s.metrics.auth_failures.fetch_add(1, Ordering::Relaxed);
         return Err("Not logged in".into());
-    }
+    };
     match path {
         "/user/signout" => {
+            let invalidated_session_hash = auth_context.token_hash.clone();
             db_task(s, move |db| db.revoke_session(&token))
                 .await
                 .map_err(internal)?;
+            let _ = s.events.send(Event {
+                uid: 0,
+                vault: String::new(),
+                text: String::new(),
+                invalidated: false,
+                invalidated_session_hash: Some(invalidated_session_hash),
+            });
             Ok(json!({}))
         }
         "/user/info" => {
-            Ok(json!({"email":s.config.email,"name":s.config.display_name,"license":null}))
+            Ok(json!({"email":auth_context.email,"name":auth_context.name,"license":null}))
         }
         "/subscription/list" => Ok(json!({"sync":true,"publish":false})),
         "/subscription/business" => {
@@ -698,15 +722,15 @@ async fn authorized_control(
             Ok(json!({"regions":[{"value":"selfhost","name":"Blackglass Server"}]}))
         }
         "/vault/list" => Ok(json!({
-            "vaults":db_task(s, |db| db.list_vaults()).await.map_err(internal)?,
+            "vaults":db_task(s, move |db| db.list_vaults_for_user(auth_context.user_id)).await.map_err(internal)?,
             "shared":[],
             "limit":100
         })),
-        "/vault/create" => create_vault(s, v).await,
-        "/vault/access" => access_vault(s, v).await,
-        "/vault/migrate" => migrate_vault(s, v).await,
-        "/vault/rename" => rename_vault(s, v).await,
-        "/vault/delete" => delete_vault(s, v).await,
+        "/vault/create" => create_vault(s, auth_context.user_id, v).await,
+        "/vault/access" => access_vault(s, auth_context.user_id, v).await,
+        "/vault/migrate" => migrate_vault(s, auth_context.user_id, v).await,
+        "/vault/rename" => rename_vault(s, auth_context.user_id, v).await,
+        "/vault/delete" => delete_vault(s, auth_context.user_id, v).await,
         "/vault/share/list" => Ok(json!({"shares":[]})),
         "/vault/share/invite" | "/vault/share/remove" => {
             Err("Sharing is unavailable in single-user mode".into())
@@ -715,7 +739,7 @@ async fn authorized_control(
     }
 }
 
-async fn create_vault(s: &AppState, v: Value) -> std::result::Result<Value, String> {
+async fn create_vault(s: &AppState, user_id: i64, v: Value) -> std::result::Result<Value, String> {
     let r: VaultCreate =
         serde_json::from_value(v).map_err(|_| "Invalid vault request".to_string())?;
     let name = r
@@ -747,7 +771,7 @@ async fn create_vault(s: &AppState, v: Value) -> std::result::Result<Value, Stri
         password,
     };
     let stored = vault.clone();
-    if let Err(error) = db_task(s, move |db| db.create_vault(&stored)).await {
+    if let Err(error) = db_task(s, move |db| db.create_vault_for_user(user_id, &stored)).await {
         if error.to_string().contains("vault limit reached") {
             return Err("Vault limit reached".into());
         }
@@ -755,12 +779,12 @@ async fn create_vault(s: &AppState, v: Value) -> std::result::Result<Value, Stri
     }
     serde_json::to_value(vault).map_err(internal)
 }
-async fn access_vault(s: &AppState, v: Value) -> std::result::Result<Value, String> {
+async fn access_vault(s: &AppState, user_id: i64, v: Value) -> std::result::Result<Value, String> {
     let r: VaultAccess =
         serde_json::from_value(v).map_err(|_| "Unable to access vault".to_string())?;
     let id = r.vault_uid.ok_or("Unable to access vault")?;
     let lookup_id = id.clone();
-    let mut vault = db_task(s, move |db| db.find_vault(&lookup_id))
+    let mut vault = db_task(s, move |db| db.find_owned_vault(user_id, &lookup_id))
         .await
         .map_err(internal)?
         .ok_or("Unable to access vault")?;
@@ -777,16 +801,18 @@ async fn access_vault(s: &AppState, v: Value) -> std::result::Result<Value, Stri
             .ok_or("Unable to access vault")?;
         let bind_id = vault.id.clone();
         let requested = requested.to_owned();
-        vault.keyhash = db_task(s, move |db| db.bind_managed_keyhash(&bind_id, &requested))
-            .await
-            .map_err(internal)?;
+        vault.keyhash = db_task(s, move |db| {
+            db.bind_managed_keyhash_for_user(user_id, &bind_id, &requested)
+        })
+        .await
+        .map_err(internal)?;
     }
     if r.keyhash != vault.keyhash {
         return Err("Unable to access vault".into());
     }
     Ok(json!({}))
 }
-async fn migrate_vault(s: &AppState, v: Value) -> std::result::Result<Value, String> {
+async fn migrate_vault(s: &AppState, user_id: i64, v: Value) -> std::result::Result<Value, String> {
     let r: VaultMigrate =
         serde_json::from_value(v).map_err(|_| "Unable to migrate vault".to_string())?;
     let source_id = r.vault_uid.ok_or("Unable to migrate vault")?;
@@ -800,7 +826,7 @@ async fn migrate_vault(s: &AppState, v: Value) -> std::result::Result<Value, Str
     } = vault_credentials(r.keyhash, r.salt)?;
     let _commit = s.commit_order.lock().await;
     let lookup_id = source_id.clone();
-    let source = db_task(s, move |db| db.find_vault(&lookup_id))
+    let source = db_task(s, move |db| db.find_owned_vault(user_id, &lookup_id))
         .await
         .map_err(internal)?
         .ok_or("Unable to migrate vault")?;
@@ -821,16 +847,18 @@ async fn migrate_vault(s: &AppState, v: Value) -> std::result::Result<Value, Str
     };
     let stored = replacement.clone();
     let migrate_source_id = source_id.clone();
-    if !db_task(s, move |db| db.migrate_vault(&migrate_source_id, &stored))
-        .await
-        .map_err(internal)?
+    if !db_task(s, move |db| {
+        db.migrate_vault_for_user(user_id, &migrate_source_id, &stored)
+    })
+    .await
+    .map_err(internal)?
     {
         return Err("Unable to migrate vault".into());
     }
     invalidate_vault(s, source_id);
     serde_json::to_value(replacement).map_err(internal)
 }
-async fn rename_vault(s: &AppState, v: Value) -> std::result::Result<Value, String> {
+async fn rename_vault(s: &AppState, user_id: i64, v: Value) -> std::result::Result<Value, String> {
     let r: VaultRename =
         serde_json::from_value(v).map_err(|_| "Unable to rename vault".to_string())?;
     let id = r.vault_uid.ok_or("Unable to rename vault")?;
@@ -842,7 +870,7 @@ async fn rename_vault(s: &AppState, v: Value) -> std::result::Result<Value, Stri
         .ok_or("Unable to rename vault")?
         .to_owned();
     let _commit = s.commit_order.lock().await;
-    if !db_task(s, move |db| db.rename_vault(&id, &name))
+    if !db_task(s, move |db| db.rename_vault_for_user(user_id, &id, &name))
         .await
         .map_err(internal)?
     {
@@ -850,13 +878,13 @@ async fn rename_vault(s: &AppState, v: Value) -> std::result::Result<Value, Stri
     }
     Ok(json!({}))
 }
-async fn delete_vault(s: &AppState, v: Value) -> std::result::Result<Value, String> {
+async fn delete_vault(s: &AppState, user_id: i64, v: Value) -> std::result::Result<Value, String> {
     let r: VaultDelete =
         serde_json::from_value(v).map_err(|_| "Unable to delete vault".to_string())?;
     let id = r.vault_uid.unwrap_or_default();
     let _commit = s.commit_order.lock().await;
     let delete_id = id.clone();
-    if !db_task(s, move |db| db.delete_vault(&delete_id))
+    if !db_task(s, move |db| db.delete_vault_for_user(user_id, &delete_id))
         .await
         .map_err(internal)?
     {
@@ -907,6 +935,7 @@ fn invalidate_vault(s: &AppState, vault: String) {
         vault,
         text: String::new(),
         invalidated: true,
+        invalidated_session_hash: None,
     });
 }
 
@@ -946,6 +975,8 @@ async fn upgrade(
 struct Session {
     authenticated: bool,
     token_hash: Option<String>,
+    user_id: Option<i64>,
+    expires_at: Option<i64>,
     vault: Option<String>,
     device: String,
     pending: Option<Pending>,
@@ -1037,6 +1068,8 @@ async fn socket_loop(
     let mut session = Session {
         authenticated: false,
         token_hash: None,
+        user_id: None,
+        expires_at: None,
         vault: None,
         device: "Unknown device".into(),
         pending: None,
@@ -1116,6 +1149,13 @@ async fn socket_loop(
                 _ => break,
             },
             event = events.recv() => match event {
+                Ok(event) if event.invalidated_session_hash.as_deref() == session.token_hash.as_deref() => {
+                    let _ = socket_send(&mut tx, Message::Close(Some(CloseFrame {
+                        code: 1008,
+                        reason: "Session revoked".into(),
+                    }))).await;
+                    break
+                },
                 Ok(event) if session.vault.as_deref() == Some(&event.vault) && event.invalidated => {
                     let _ = socket_send(&mut tx, Message::Close(Some(CloseFrame {
                         code: 1008,
@@ -1225,7 +1265,11 @@ async fn handle_message(
                     .await?;
                     send(tx,json!({"res":"ok","size":size,"limit":s.config.storage_quota_bytes,"vault_size":vault_size})).await?
                 }
-                "usernames" => send(tx, json!({"1":s.config.display_name})).await?,
+                "usernames" => {
+                    let vault = session.vault.clone().unwrap();
+                    let usernames = db_task(s, move |db| db.usernames_for_vault(&vault)).await?;
+                    send(tx, serde_json::to_value(usernames)?).await?
+                }
                 "push" => begin_push(s, session, events, tx, v).await?,
                 "pull" => pull(s, session, tx, v).await?,
                 "deleted" => deleted(s, session, tx, v).await?,
@@ -1307,14 +1351,20 @@ async fn init(
             .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte));
     let keyhash = v.get("keyhash").and_then(Value::as_str).map(str::to_owned);
     let enc = v.get("encryption_version").and_then(Value::as_i64);
-    let (vault, valid_session, retired_vault) = db_task(s, move |db| {
-        Ok((
-            db.find_vault(&lookup_id)?,
-            token_has_session_shape && db.valid_session_hash(&validation_hash),
-            db.is_retired_vault(&lookup_id)?,
-        ))
+    let (auth_context, vault, retired_vault) = db_task(s, move |db| {
+        let auth_context = token_has_session_shape
+            .then(|| db.auth_context_hash(&validation_hash))
+            .transpose()?
+            .flatten();
+        let Some(auth_context) = auth_context else {
+            return Ok((None, None, false));
+        };
+        let vault = db.find_owned_vault(auth_context.user_id, &lookup_id)?;
+        let retired = db.is_retired_vault_for_user(auth_context.user_id, &lookup_id)?;
+        Ok((Some(auth_context), vault, retired))
     })
     .await?;
+    let valid_session = auth_context.is_some();
     let Some(vault) = vault else {
         if valid_session || (token_has_session_shape && retired_vault) {
             send(tx, json!({"res":"err","msg":"Vault not found"})).await?;
@@ -1341,8 +1391,11 @@ async fn init(
             }
         },
     };
+    let auth_context = auth_context.unwrap();
     session.authenticated = true;
-    session.token_hash = Some(token_hash);
+    session.token_hash = Some(auth_context.token_hash.clone());
+    session.user_id = Some(auth_context.user_id);
+    session.expires_at = Some(auth_context.expires_at);
     session.vault = Some(vault.id.clone());
     session.device = bounded(
         v.get("device")
@@ -1376,7 +1429,7 @@ async fn init(
     }
     send(
         tx,
-        json!({"res":"ok","userId":1,"perFileMax":s.config.per_file_max}),
+        json!({"res":"ok","userId":auth_context.user_id,"perFileMax":s.config.per_file_max}),
     )
     .await?;
     let mut cursor = if initial { 0 } else { version };
@@ -1483,7 +1536,9 @@ async fn begin_push(
         size,
         pieces,
         device: session.device.clone(),
-        user_id: 1,
+        user_id: session
+            .user_id
+            .context("authenticated session has no user ID")?,
     };
     if serialized_notice_size(&revision)? > MAX_EVENT_BYTES {
         send(tx, json!({"err":"Push metadata is too large"})).await?;
@@ -1874,11 +1929,14 @@ async fn restore(
         let _commit = s.commit_order.lock().await;
         let vault = session.vault.clone().unwrap();
         let device = session.device.clone();
+        let user_id = session
+            .user_id
+            .context("authenticated session has no user ID")?;
         let storage_quota_bytes = s.config.storage_quota_bytes;
         let reserved = s.storage_reservations.reserved();
         let restore_quota_bytes = storage_quota_bytes.saturating_sub(reserved);
         match db_task(s, move |db| {
-            db.restore(&vault, uid, &device, restore_quota_bytes)
+            db.restore_for_user(user_id, &vault, uid, &device, restore_quota_bytes)
         })
         .await
         {
@@ -1921,6 +1979,7 @@ fn publish_committed(s: &AppState, r: Revision) -> Result<Event> {
         vault,
         text,
         invalidated: false,
+        invalidated_session_hash: None,
     };
     let _ = s.events.send(event.clone());
     Ok(event)
@@ -2193,6 +2252,12 @@ where
 }
 
 async fn session_active(s: &AppState, session: &Session) -> bool {
+    if session
+        .expires_at
+        .is_none_or(|expires_at| expires_at <= now_ms())
+    {
+        return false;
+    }
     let Some(token_hash) = session.token_hash.clone() else {
         return false;
     };
