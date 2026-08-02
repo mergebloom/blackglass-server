@@ -203,12 +203,21 @@ current-schema file into another new path:
 
 ```sh
 blackglass-server migrate old-backup.sqlite migrated-backup.sqlite
-blackglass-server restore migrated-backup.sqlite recovered.sqlite
+blackglass-server recover-stale-backup migrated-backup.sqlite recovered.sqlite
 ```
 
-Restore always establishes a new recovery epoch: every remote vault ID rotates
-and every session is cleared. Point `SELFHOST_DATABASE` at the recovered file,
-start the service, and require `/ready`. Every desktop must then sign in again,
+Both recovery commands establish a new recovery epoch: every remote vault ID
+rotates and every session is cleared. Use `recover-stale-backup` for disaster
+recovery from an older point in time; it additionally disables every account so
+the backup cannot resurrect access that was removed after it was created.
+Review `user list`, replace passwords as appropriate, and explicitly run
+`user set-status <database> <user-id> active` for each intended account while
+the service remains stopped. The narrower `restore` command preserves account
+status and is reserved for a verified current-state copy when no authorization
+rollback is possible.
+
+Point `SELFHOST_DATABASE` at the recovered file, start the service, and require
+`/ready`. Every desktop must then sign in again,
 reselect the replacement remote vault, and recover into a fresh empty local
 vault. Do not let a pre-restore local profile resume against its retired remote
 identity. Complete a fresh-client recovery test before discarding old files.

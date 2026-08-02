@@ -156,6 +156,13 @@ async fn main() -> Result<()> {
             println!("restore verified: {}", destination.display());
             Ok(())
         }
+        [command, source, destination] if command == "recover-stale-backup" => {
+            let source = PathBuf::from(source);
+            let destination = PathBuf::from(destination);
+            db::recover_stale_backup(&source, &destination)?;
+            println!("stale-backup recovery verified: {}", destination.display());
+            Ok(())
+        }
         [command, source, destination] if command == "migrate-legacy" => {
             let source = PathBuf::from(source);
             let destination = PathBuf::from(destination);
@@ -250,7 +257,7 @@ Usage:\n  {NAME} serve\n  {NAME} hash-password\n  {NAME} backup <database> <outp
 {NAME} user set-name <database> <user-id> <name>\n  \
 {NAME} user set-status <database> <user-id> <active|disabled>\n  \
 {NAME} user revoke-sessions <database> <user-id>\n  \
-{NAME} verify <database>\n  {NAME} restore <backup> <new-database>\n  \
+{NAME} verify <database>\n  {NAME} restore <backup> <new-database>\n  {NAME} recover-stale-backup <backup> <new-database>\n  \
 {NAME} migrate <versioned-database> <new-database>\n  \
 {NAME} migrate-legacy <legacy-database> <new-database>\n  \
 {NAME} rebind-data-host <database> <new-host> <backup>\n  \

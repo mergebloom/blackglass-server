@@ -46,6 +46,9 @@ describe("production Rust server", () => {
     const help = Bun.spawnSync([binary, "--help"], { stdout: "pipe", stderr: "pipe" });
     expect(help.exitCode, help.stderr.toString()).toBe(0);
     expect(help.stdout.toString()).toContain("backup <database> <output>");
+    expect(help.stdout.toString()).toContain(
+      "recover-stale-backup <backup> <new-database>",
+    );
     expect(help.stdout.toString()).toContain("migrate <versioned-database> <new-database>");
     expect(help.stdout.toString()).toContain("migrate-legacy <legacy-database> <new-database>");
     expect(help.stdout.toString()).toContain("rebind-data-host <database> <new-host> <backup>");

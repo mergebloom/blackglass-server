@@ -1926,6 +1926,26 @@ pub fn restore_database(source: &Path, destination: &Path) -> Result<()> {
     })
 }
 
+pub fn recover_stale_backup(source: &Path, destination: &Path) -> Result<()> {
+    let src = open_existing_read_only(source, "stale-backup recovery source")?;
+    verify_connection(&src).context("stale-backup recovery source validation failed")?;
+    with_new_database(destination, "stale-backup recovery destination", |target| {
+        run_online_backup(&src, target)?;
+        verify_connection(target)
+            .context("copied stale-backup recovery source validation failed")?;
+        rotate_recovery_epoch(target)?;
+        let transaction = target.transaction_with_behavior(TransactionBehavior::Immediate)?;
+        transaction.execute("DELETE FROM sessions", [])?;
+        transaction.execute(
+            "UPDATE users SET status='disabled',updated_at=MAX(updated_at,?)",
+            [now_ms()],
+        )?;
+        transaction.commit()?;
+        set_portable_journal(target)?;
+        verify_connection(target)
+    })
+}
+
 #[cfg(test)]
 pub fn migrate_versioned_database_with_initial_user(
     source: &Path,
@@ -4854,6 +4874,64 @@ mod tests {
         assert!(copy.is_retired_vault("v1").unwrap());
         assert!(!copy.valid_session(&backup_active));
         assert!(db.valid_session(&backup_active));
+    }
+
+    #[test]
+    fn stale_backup_recovery_disables_every_user_and_preserves_tenant_ownership() {
+        let dir = tempfile::tempdir().unwrap();
+        let source = dir.path().join("stale-source.sqlite");
+        let database = Db::open(&source).unwrap();
+        create_test_vault(&database, "owner-one");
+        let owner_two = database
+            .create_user(
+                "owner-two@example.test",
+                "Owner two",
+                &auth::hash_password("owner-two-password").unwrap(),
+            )
+            .unwrap();
+        database
+            .create_vault_for_user(
+                owner_two,
+                &Vault {
+                    id: "owner-two".into(),
+                    name: "Owner two vault".into(),
+                    keyhash: Some("key".into()),
+                    salt: Some("salt".into()),
+                    host: "localhost:3003".into(),
+                    region: "Blackglass Server".into(),
+                    encryption_version: 3,
+                    size: 0,
+                    created: 2,
+                    password: None,
+                },
+            )
+            .unwrap();
+        let owner_one_session = database.issue_session_for_user(1, 3600).unwrap();
+        let owner_two_session = database.issue_session_for_user(owner_two, 3600).unwrap();
+        database.checkpoint().unwrap();
+
+        let recovered = dir.path().join("stale-recovered.sqlite");
+        recover_stale_backup(&source, &recovered).unwrap();
+        let copy = Db::open(&recovered).unwrap();
+        let users = copy.list_users().unwrap();
+        assert_eq!(users.len(), 2);
+        assert!(
+            users
+                .iter()
+                .all(|user| user.status == "disabled" && user.sessions == 0)
+        );
+        assert_eq!(users[0].owned_vaults, 1);
+        assert_eq!(users[1].owned_vaults, 1);
+        assert!(!copy.valid_session(&owner_one_session));
+        assert!(!copy.valid_session(&owner_two_session));
+        assert_eq!(copy.list_vaults_for_user(1).unwrap().len(), 1);
+        assert_eq!(copy.list_vaults_for_user(owner_two).unwrap().len(), 1);
+
+        copy.set_user_password(1, &auth::hash_password("replacement").unwrap())
+            .unwrap();
+        copy.set_user_status(1, "active").unwrap();
+        assert!(copy.issue_session_for_user(1, 3600).is_ok());
+        assert!(copy.issue_session_for_user(owner_two, 3600).is_err());
     }
 
     #[test]
