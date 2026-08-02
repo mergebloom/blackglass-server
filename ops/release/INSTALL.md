@@ -4,8 +4,9 @@ This archive contains a statically linked Linux binary. It does not require
 glibc, SQLite, OpenSSL, or another shared userspace library.
 
 Choose either the archive or the separately published raw binary. Verify its
-adjacent checksum. Archives also carry `INSTALL.md`, `LICENSE`, and an embedded
-manifest; both forms contain byte-identical executables. Install as root while
+adjacent checksum. Archives also carry `INSTALL.md`, `LICENSE`, an embedded
+manifest, and `release-contract.json`; both forms contain byte-identical
+executables. Install as root while
 keeping the service process unprivileged:
 
 ```sh

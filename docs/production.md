@@ -160,9 +160,9 @@ endpoints. Scrape them over loopback or a private administration network. If you
 publish them, add an explicit authentication and network policy first.
 
 Metrics use the `blackglass_` prefix. The equivalent legacy
-`obsidian_sync_` names are emitted during the 0.2 compatibility window so
-existing dashboards keep working; migrate alerts before those aliases are
-removed in a future major release.
+`obsidian_sync_` names remain aliases in 0.3 so existing dashboards keep
+working; migrate alerts before those aliases are removed in a future major
+release.
 
 Keep all three endpoints behind the control hostname's normal network policy.
 Alert on readiness failures, restarts, sign-in failures/rate limits, WebSocket
@@ -173,6 +173,11 @@ that stopped making progress during an upload.
 Alert on `blackglass_storage_quota_rejections_total` and record
 `blackglass_storage_quota_bytes` alongside host disk capacity. A quota
 rejection is an expected bounded client error, not a server fault.
+
+The `v0.3.0` archive includes `release-contract.json`. Release automation
+checks that it binds server 0.3.0 to schema 5, the supported migration sources,
+the previous rollback tag, the exact Bridge tooling revision, both qualified
+renderer baselines, and the required primary/recovery monitoring selectors.
 
 ## Backup and recovery
 

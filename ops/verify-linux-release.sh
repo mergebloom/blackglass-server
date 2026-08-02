@@ -95,7 +95,8 @@ expected=$(printf '%s\n' \
     "$bundle/blackglass-server.env.example" \
     "$bundle/blackglass-server.service" \
     "$bundle/blackglass-server.sysusers.conf" \
-    "$bundle/manifest.json")
+    "$bundle/manifest.json" \
+    "$bundle/release-contract.json")
 actual=$(tar -tzf "$archive")
 test "$actual" = "$expected" || {
     echo "unexpected archive contents" >&2
@@ -123,10 +124,12 @@ for relative_path in \
     blackglass-server.env.example \
     blackglass-server.service \
     blackglass-server.sysusers.conf \
-    manifest.json; do
+    manifest.json \
+    release-contract.json; do
     test -f "$bundle_directory/$relative_path"
     test ! -L "$bundle_directory/$relative_path"
 done
+cmp "$bundle_directory/release-contract.json" "$project_root/ops/release/release-contract.json"
 test -x "$binary"
 file "$binary" | grep -q 'ELF 64-bit'
 file "$binary" | grep -q "$file_architecture"

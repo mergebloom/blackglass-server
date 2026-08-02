@@ -48,6 +48,7 @@ COPY ops/blackglass-server.service ./ops/blackglass-server.service
 COPY LICENSE /metadata/LICENSE
 COPY THIRD_PARTY_NOTICES.md /metadata/THIRD_PARTY_NOTICES.md
 COPY ops/release/INSTALL.md /metadata/INSTALL.md
+COPY ops/release/release-contract.json /metadata/release-contract.json
 COPY ops/blackglass-server.env.example /metadata/blackglass-server.env.example
 COPY ops/blackglass-server.service /metadata/blackglass-server.service
 COPY ops/blackglass-server.sysusers.conf /metadata/blackglass-server.sysusers.conf
@@ -103,6 +104,7 @@ RUN set -eu; \
     cp /target/release/blackglass-server "/package/$bundle/blackglass-server"; \
     chmod 0755 "/package/$bundle/blackglass-server"; \
     cp /metadata/INSTALL.md "/package/$bundle/INSTALL.md"; \
+    cp /metadata/release-contract.json "/package/$bundle/release-contract.json"; \
     cp /metadata/LICENSE "/package/$bundle/LICENSE"; \
     cp /metadata/THIRD_PARTY_NOTICES.md "/package/$bundle/THIRD_PARTY_NOTICES.md"; \
     cp /metadata/blackglass-server.env.example "/package/$bundle/blackglass-server.env.example"; \

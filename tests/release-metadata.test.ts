@@ -14,6 +14,8 @@ const metadataFiles = [
   "package-lock.json",
   "apps/server-rust/Cargo.toml",
   "apps/server-rust/Cargo.lock",
+  "apps/server-rust/src/db.rs",
+  "ops/release/release-contract.json",
 ];
 
 describe("release metadata consistency", () => {
@@ -86,6 +88,29 @@ describe("release metadata consistency", () => {
       );
     } finally {
       await rm(fixture, { recursive: true, force: true });
+    }
+  });
+
+  test("rejects a tag or schema disagreement in the release contract", async () => {
+    for (const mutate of [
+      (contract: any) => (contract.serverVersion = mismatchedVersion),
+      (contract: any) => contract.database.destinationSchema++,
+      (contract: any) => (contract.sharingEnabled = true),
+    ]) {
+      const fixture = await copyMetadataFixture();
+      try {
+        const path = join(fixture, "ops/release/release-contract.json");
+        const contract = JSON.parse(await readFile(path, "utf8"));
+        mutate(contract);
+        await writeFile(path, `${JSON.stringify(contract, null, 2)}\n`);
+        const result = verify(fixture);
+        expect(result.exitCode).toBe(1);
+        expect(result.stderr.toString()).toContain(
+          "release contract does not match the package and schema boundary",
+        );
+      } finally {
+        await rm(fixture, { recursive: true, force: true });
+      }
     }
   });
 });
