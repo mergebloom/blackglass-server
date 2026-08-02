@@ -77,6 +77,7 @@ pub(crate) struct AdminVault {
     pub deleted_count: i64,
     pub latest_activity_at: Option<i64>,
     pub latest_device: Option<String>,
+    pub owner_user_id: i64,
 }
 #[derive(Clone, Debug, serde::Serialize)]
 #[serde(rename_all = "camelCase")]
@@ -89,13 +90,26 @@ pub(crate) struct AdminActivity {
     pub extension: String,
     pub size: i64,
     pub revision: i64,
+    pub user_id: i64,
 }
 #[derive(Clone, Debug, serde::Serialize)]
 #[serde(rename_all = "camelCase")]
 pub(crate) struct AdminSession {
+    pub user_id: i64,
     pub created_at: i64,
     pub expires_at: i64,
     pub revoked_at: Option<i64>,
+}
+#[derive(Clone, Debug, serde::Serialize)]
+#[serde(rename_all = "camelCase")]
+pub(crate) struct AdminUser {
+    pub id: i64,
+    pub email: String,
+    pub name: String,
+    pub status: String,
+    pub owned_vaults: i64,
+    pub sessions: i64,
+    pub retained_bytes: i64,
 }
 pub(crate) struct AdminDatabaseSnapshot {
     pub schema_version: i64,
@@ -103,6 +117,10 @@ pub(crate) struct AdminDatabaseSnapshot {
     pub vaults: Vec<AdminVault>,
     pub activity: Vec<AdminActivity>,
     pub sessions: Vec<AdminSession>,
+    pub users: Vec<AdminUser>,
+    pub active_users: i64,
+    pub disabled_users: i64,
+    pub user_count: i64,
     pub active_sessions: i64,
     pub session_count: i64,
     pub logical_bytes: i64,
@@ -430,7 +448,7 @@ impl Db {
         c.progress_handler(1_000, Some(move || std::time::Instant::now() >= deadline));
         let result = (|| {
             let mut vault_query = c.prepare(
-                "WITH latest_path AS (SELECT vault_id,path,MAX(uid) uid FROM revisions GROUP BY vault_id,path), per_vault AS (SELECT r.vault_id,SUM(r.size) retained_bytes,SUM(CASE WHEN lp.uid=r.uid AND r.deleted=0 AND r.folder=0 THEN 1 ELSE 0 END) file_count,SUM(CASE WHEN lp.uid=r.uid AND r.deleted=1 THEN 1 ELSE 0 END) deleted_count FROM revisions r LEFT JOIN latest_path lp ON lp.uid=r.uid GROUP BY r.vault_id), latest_revision AS (SELECT r.vault_id,r.ts,r.device FROM revisions r JOIN (SELECT vault_id,MAX(uid) uid FROM revisions GROUP BY vault_id) x ON x.uid=r.uid) SELECT v.id,v.name,v.created,CASE WHEN v.password IS NULL THEN 'custom-password' ELSE 'managed' END,v.encryption_version,v.version,v.size,COALESCE(p.retained_bytes,0),COALESCE(p.file_count,0),COALESCE(p.deleted_count,0),l.ts,l.device FROM vaults v LEFT JOIN per_vault p ON p.vault_id=v.id LEFT JOIN latest_revision l ON l.vault_id=v.id ORDER BY v.created ASC LIMIT 100"
+                "WITH latest_path AS (SELECT vault_id,path,MAX(uid) uid FROM revisions GROUP BY vault_id,path), per_vault AS (SELECT r.vault_id,SUM(r.size) retained_bytes,SUM(CASE WHEN lp.uid=r.uid AND r.deleted=0 AND r.folder=0 THEN 1 ELSE 0 END) file_count,SUM(CASE WHEN lp.uid=r.uid AND r.deleted=1 THEN 1 ELSE 0 END) deleted_count FROM revisions r LEFT JOIN latest_path lp ON lp.uid=r.uid GROUP BY r.vault_id), latest_revision AS (SELECT r.vault_id,r.ts,r.device FROM revisions r JOIN (SELECT vault_id,MAX(uid) uid FROM revisions GROUP BY vault_id) x ON x.uid=r.uid) SELECT v.id,v.name,v.created,CASE WHEN v.password IS NULL THEN 'custom-password' ELSE 'managed' END,v.encryption_version,v.version,v.size,COALESCE(p.retained_bytes,0),COALESCE(p.file_count,0),COALESCE(p.deleted_count,0),l.ts,l.device,v.owner_user_id FROM vaults v LEFT JOIN per_vault p ON p.vault_id=v.id LEFT JOIN latest_revision l ON l.vault_id=v.id ORDER BY v.created ASC LIMIT 100"
             )?;
             let vaults = vault_query
                 .query_map([], |r| {
@@ -447,10 +465,11 @@ impl Db {
                         deleted_count: r.get(9)?,
                         latest_activity_at: r.get(10)?,
                         latest_device: r.get(11)?,
+                        owner_user_id: r.get(12)?,
                     })
                 })?
                 .collect::<rusqlite::Result<Vec<_>>>()?;
-            let mut activity_query = c.prepare("SELECT r.ts,r.vault_id,v.name,r.device,CASE WHEN r.deleted=1 THEN 'deleted' WHEN r.folder=1 THEN 'folder' ELSE 'revision' END,r.extension,r.size,r.uid FROM revisions r JOIN vaults v ON v.id=r.vault_id ORDER BY r.uid DESC LIMIT 100")?;
+            let mut activity_query = c.prepare("SELECT r.ts,r.vault_id,v.name,r.device,CASE WHEN r.deleted=1 THEN 'deleted' WHEN r.folder=1 THEN 'folder' ELSE 'revision' END,r.extension,r.size,r.uid,r.user_id FROM revisions r JOIN vaults v ON v.id=r.vault_id ORDER BY r.uid DESC LIMIT 100")?;
             let activity = activity_query
                 .query_map([], |r| {
                     Ok(AdminActivity {
@@ -462,19 +481,42 @@ impl Db {
                         extension: r.get(5)?,
                         size: r.get(6)?,
                         revision: r.get(7)?,
+                        user_id: r.get(8)?,
                     })
                 })?
                 .collect::<rusqlite::Result<Vec<_>>>()?;
-            let mut session_query=c.prepare("SELECT created_at,expires_at,revoked_at FROM sessions ORDER BY created_at DESC LIMIT 100")?;
+            let mut session_query=c.prepare("SELECT user_id,created_at,expires_at,revoked_at FROM sessions ORDER BY created_at DESC LIMIT 100")?;
             let sessions = session_query
                 .query_map([], |r| {
                     Ok(AdminSession {
-                        created_at: r.get(0)?,
-                        expires_at: r.get(1)?,
-                        revoked_at: r.get(2)?,
+                        user_id: r.get(0)?,
+                        created_at: r.get(1)?,
+                        expires_at: r.get(2)?,
+                        revoked_at: r.get(3)?,
                     })
                 })?
                 .collect::<rusqlite::Result<Vec<_>>>()?;
+            let mut user_query = c.prepare(
+                "SELECT u.id,u.email,u.name,u.status,
+                        (SELECT COUNT(*) FROM vaults v WHERE v.owner_user_id=u.id),
+                        (SELECT COUNT(*) FROM sessions s WHERE s.user_id=u.id),
+                        COALESCE((SELECT SUM(r.size) FROM revisions r JOIN vaults v ON v.id=r.vault_id WHERE v.owner_user_id=u.id),0)
+                   FROM users u ORDER BY u.id LIMIT ?",
+            )?;
+            let users = user_query
+                .query_map([MAX_USERS], |r| {
+                    Ok(AdminUser {
+                        id: r.get(0)?,
+                        email: r.get(1)?,
+                        name: r.get(2)?,
+                        status: r.get(3)?,
+                        owned_vaults: r.get(4)?,
+                        sessions: r.get(5)?,
+                        retained_bytes: r.get(6)?,
+                    })
+                })?
+                .collect::<rusqlite::Result<Vec<_>>>()?;
+            let (user_count,active_users,disabled_users)=c.query_row("SELECT COUNT(*),COALESCE(SUM(status='active'),0),COALESCE(SUM(status='disabled'),0) FROM users",[],|r|Ok((r.get(0)?,r.get(1)?,r.get(2)?)))?;
             let now = now_ms();
             let (session_count,active_sessions)=c.query_row("SELECT COUNT(*),COALESCE(SUM(CASE WHEN revoked_at IS NULL AND expires_at>? THEN 1 ELSE 0 END),0) FROM sessions",[now],|r|Ok((r.get(0)?,r.get(1)?)))?;
             let logical_bytes =
@@ -496,6 +538,10 @@ impl Db {
                 vaults,
                 activity,
                 sessions,
+                users,
+                active_users,
+                disabled_users,
+                user_count,
                 active_sessions,
                 session_count,
                 logical_bytes,
@@ -709,11 +755,29 @@ impl Db {
 
     #[cfg(test)]
     pub fn create_vault(&self, vault: &Vault) -> Result<()> {
-        self.create_vault_for_user(1, vault)
+        self.create_vault_internal(1, None, vault)
     }
+    #[cfg(test)]
     pub fn create_vault_for_user(&self, user_id: i64, vault: &Vault) -> Result<()> {
+        self.create_vault_internal(user_id, None, vault)
+    }
+    pub fn create_vault_for_session(
+        &self,
+        user_id: i64,
+        token_hash: &str,
+        vault: &Vault,
+    ) -> Result<()> {
+        self.create_vault_internal(user_id, Some(token_hash), vault)
+    }
+    fn create_vault_internal(
+        &self,
+        user_id: i64,
+        token_hash: Option<&str>,
+        vault: &Vault,
+    ) -> Result<()> {
         self.with(|c| {
             let tx = c.transaction_with_behavior(TransactionBehavior::Immediate)?;
+            authorize_account_mutation(&tx, token_hash, user_id)?;
             let count: i64 = tx.query_row("SELECT COUNT(*) FROM vaults", [], |row| row.get(0))?;
             if count >= MAX_VAULTS {
                 bail!("vault limit reached")
@@ -754,39 +818,68 @@ impl Db {
     pub fn find_owned_vault(&self, user_id: i64, id: &str) -> Result<Option<Vault>> {
         self.with(|c| Ok(c.query_row("SELECT id,name,keyhash,salt,host,region,encryption_version,size,created,password FROM vaults WHERE id=? AND owner_user_id=?",params![id,user_id],vault_row).optional()?))
     }
-    pub fn bind_managed_keyhash_for_user(
+    pub fn bind_managed_keyhash_for_session(
         &self,
         user_id: i64,
+        token_hash: &str,
         id: &str,
         keyhash: &str,
     ) -> Result<Option<String>> {
         self.with(|c| {
-            c.execute(
+            let tx = c.transaction_with_behavior(TransactionBehavior::Immediate)?;
+            authorize_account_mutation(&tx, Some(token_hash), user_id)?;
+            tx.execute(
                 "UPDATE vaults SET keyhash=? WHERE id=? AND owner_user_id=? AND password IS NOT NULL AND keyhash IS NULL",
                 params![keyhash, id, user_id],
             )?;
-            Ok(c.query_row("SELECT keyhash FROM vaults WHERE id=? AND owner_user_id=?", params![id,user_id], |r| {
+            let keyhash = tx.query_row("SELECT keyhash FROM vaults WHERE id=? AND owner_user_id=?", params![id,user_id], |r| {
                 r.get::<_, Option<String>>(0)
             })
             .optional()?
-            .flatten())
+            .flatten();
+            tx.commit()?;
+            Ok(keyhash)
         })
     }
-    pub fn rename_vault_for_user(&self, user_id: i64, id: &str, name: &str) -> Result<bool> {
+    pub fn rename_vault_for_session(
+        &self,
+        user_id: i64,
+        token_hash: &str,
+        id: &str,
+        name: &str,
+    ) -> Result<bool> {
         self.with(|c| {
-            Ok(c.execute(
+            let tx = c.transaction_with_behavior(TransactionBehavior::Immediate)?;
+            authorize_account_mutation(&tx, Some(token_hash), user_id)?;
+            let updated = tx.execute(
                 "UPDATE vaults SET name=? WHERE id=? AND owner_user_id=?",
                 params![name, id, user_id],
-            )? == 1)
+            )? == 1;
+            tx.commit()?;
+            Ok(updated)
         })
     }
     #[cfg(test)]
     pub fn delete_vault(&self, id: &str) -> Result<bool> {
-        self.delete_vault_for_user(1, id)
+        self.delete_vault_internal(1, None, id)
     }
-    pub fn delete_vault_for_user(&self, user_id: i64, id: &str) -> Result<bool> {
+    pub fn delete_vault_for_session(
+        &self,
+        user_id: i64,
+        token_hash: &str,
+        id: &str,
+    ) -> Result<bool> {
+        self.delete_vault_internal(user_id, Some(token_hash), id)
+    }
+    fn delete_vault_internal(
+        &self,
+        user_id: i64,
+        token_hash: Option<&str>,
+        id: &str,
+    ) -> Result<bool> {
         self.with(|c| {
             let tx = c.transaction_with_behavior(TransactionBehavior::Immediate)?;
+            authorize_account_mutation(&tx, token_hash, user_id)?;
             let exists = tx.query_row(
                 "SELECT EXISTS(SELECT 1 FROM vaults WHERE id=? AND owner_user_id=?)",
                 params![id, user_id],
@@ -806,16 +899,27 @@ impl Db {
     }
     #[cfg(test)]
     pub fn migrate_vault(&self, source_id: &str, replacement: &Vault) -> Result<bool> {
-        self.migrate_vault_for_user(1, source_id, replacement)
+        self.migrate_vault_internal(1, None, source_id, replacement)
     }
-    pub fn migrate_vault_for_user(
+    pub fn migrate_vault_for_session(
         &self,
         user_id: i64,
+        token_hash: &str,
+        source_id: &str,
+        replacement: &Vault,
+    ) -> Result<bool> {
+        self.migrate_vault_internal(user_id, Some(token_hash), source_id, replacement)
+    }
+    fn migrate_vault_internal(
+        &self,
+        user_id: i64,
+        token_hash: Option<&str>,
         source_id: &str,
         replacement: &Vault,
     ) -> Result<bool> {
         self.with(|c| {
             let tx = c.transaction_with_behavior(TransactionBehavior::Immediate)?;
+            authorize_account_mutation(&tx, token_hash, user_id)?;
             let exists = tx.query_row(
                 "SELECT EXISTS(SELECT 1 FROM vaults WHERE id=? AND owner_user_id=?)",
                 params![source_id,user_id],
@@ -866,9 +970,40 @@ impl Db {
         self.with(|c| vault_size(c, id))
     }
 
+    #[cfg(test)]
     pub fn add_empty_revision(
         &self,
         revision: &NewRevision,
+        storage_quota_bytes: i64,
+        owner_storage_quota_bytes: i64,
+    ) -> Result<Revision> {
+        self.add_empty_revision_internal(
+            revision,
+            None,
+            storage_quota_bytes,
+            owner_storage_quota_bytes,
+        )
+    }
+
+    pub fn add_empty_revision_for_session(
+        &self,
+        revision: &NewRevision,
+        token_hash: &str,
+        storage_quota_bytes: i64,
+        owner_storage_quota_bytes: i64,
+    ) -> Result<Revision> {
+        self.add_empty_revision_internal(
+            revision,
+            Some(token_hash),
+            storage_quota_bytes,
+            owner_storage_quota_bytes,
+        )
+    }
+
+    fn add_empty_revision_internal(
+        &self,
+        revision: &NewRevision,
+        token_hash: Option<&str>,
         storage_quota_bytes: i64,
         owner_storage_quota_bytes: i64,
     ) -> Result<Revision> {
@@ -879,6 +1014,7 @@ impl Db {
             add_revision(
                 c,
                 revision,
+                token_hash,
                 None,
                 storage_quota_bytes,
                 owner_storage_quota_bytes,
@@ -886,9 +1022,44 @@ impl Db {
         })
     }
 
+    #[cfg(test)]
     pub fn add_file_revision(
         &self,
         revision: &NewRevision,
+        file_path: &Path,
+        storage_quota_bytes: i64,
+        owner_storage_quota_bytes: i64,
+    ) -> Result<Revision> {
+        self.add_file_revision_internal(
+            revision,
+            None,
+            file_path,
+            storage_quota_bytes,
+            owner_storage_quota_bytes,
+        )
+    }
+
+    pub fn add_file_revision_for_session(
+        &self,
+        revision: &NewRevision,
+        token_hash: &str,
+        file_path: &Path,
+        storage_quota_bytes: i64,
+        owner_storage_quota_bytes: i64,
+    ) -> Result<Revision> {
+        self.add_file_revision_internal(
+            revision,
+            Some(token_hash),
+            file_path,
+            storage_quota_bytes,
+            owner_storage_quota_bytes,
+        )
+    }
+
+    fn add_file_revision_internal(
+        &self,
+        revision: &NewRevision,
+        token_hash: Option<&str>,
         file_path: &Path,
         storage_quota_bytes: i64,
         owner_storage_quota_bytes: i64,
@@ -902,6 +1073,7 @@ impl Db {
         }
         self.with(|c| {
             let tx=c.transaction_with_behavior(TransactionBehavior::Immediate)?; let ts=now_ms();
+            authorize_mutation(&tx, token_hash, revision.user_id, &revision.vault_id)?;
             enforce_storage_quotas(
                 &tx,
                 &revision.vault_id,
@@ -1109,33 +1281,53 @@ impl Db {
         device: &str,
         storage_quota_bytes: i64,
     ) -> Result<Option<Revision>> {
-        self.restore_for_user(
+        self.restore_internal(
             1,
+            None,
             vault,
             uid,
             device,
-            storage_quota_bytes,
-            storage_quota_bytes,
+            (storage_quota_bytes, storage_quota_bytes),
         )
     }
 
-    pub fn restore_for_user(
+    pub fn restore_for_session(
         &self,
         user_id: i64,
+        token_hash: &str,
         vault: &str,
         uid: i64,
         device: &str,
-        storage_quota_bytes: i64,
-        owner_storage_quota_bytes: i64,
+        storage_limits: (i64, i64),
+    ) -> Result<Option<Revision>> {
+        self.restore_internal(
+            user_id,
+            Some(token_hash),
+            vault,
+            uid,
+            device,
+            storage_limits,
+        )
+    }
+
+    fn restore_internal(
+        &self,
+        user_id: i64,
+        token_hash: Option<&str>,
+        vault: &str,
+        uid: i64,
+        device: &str,
+        storage_limits: (i64, i64),
     ) -> Result<Option<Revision>> {
         self.with(|c|{
         let tx=c.transaction_with_behavior(TransactionBehavior::Immediate)?;
+        authorize_mutation(&tx, token_hash, user_id, vault)?;
         let target:Option<(String,bool)>=tx.query_row("SELECT r.path,r.deleted FROM revisions r JOIN vaults v ON v.id=r.vault_id WHERE r.uid=? AND r.vault_id=? AND v.owner_user_id=?",params![uid,vault,user_id],|r|Ok((r.get(0)?,r.get::<_,i64>(1)?==1))).optional()?;
         let Some((path,deleted))=target else{return Ok(None)};
         let source_uid=if deleted {tx.query_row("SELECT uid FROM revisions WHERE vault_id=? AND path=? AND uid<? AND deleted=0 ORDER BY uid DESC LIMIT 1",params![vault,path,uid],|r|r.get(0)).optional()?}else{Some(uid)};
         let Some(source_uid)=source_uid else{return Ok(None)}; let ts=now_ms();
         let source_size:i64=tx.query_row("SELECT size FROM revisions WHERE uid=?",[source_uid],|r|r.get(0))?;
-        enforce_storage_quotas(&tx, vault, user_id, source_size, storage_quota_bytes, owner_storage_quota_bytes)?;
+        enforce_storage_quotas(&tx, vault, user_id, source_size, storage_limits.0, storage_limits.1)?;
         tx.execute("INSERT INTO revisions(vault_id,path,relatedpath,extension,hash,ctime,mtime,folder,deleted,size,pieces,content,device,user_id,ts) SELECT vault_id,?,NULL,extension,hash,ctime,mtime,folder,0,size,pieces,NULL,?,?,? FROM revisions WHERE uid=?",params![path,device,user_id,ts,source_uid])?;
         let new_uid=tx.last_insert_rowid();
         if new_uid > MAX_JS_SAFE_INTEGER {
@@ -1165,10 +1357,13 @@ impl Db {
 
     #[cfg(test)]
     pub fn purge(&self, vault: &str) -> Result<()> {
-        self.purge_for_user(1, vault)
+        self.purge_internal(1, None, vault)
     }
-    pub fn purge_for_user(&self, user_id: i64, vault: &str) -> Result<()> {
-        self.with(|c|{let tx=c.transaction_with_behavior(TransactionBehavior::Immediate)?;let authorized:bool=tx.query_row("SELECT EXISTS(SELECT 1 FROM vaults WHERE id=? AND owner_user_id=?)",params![vault,user_id],|r|Ok(r.get::<_,i64>(0)?==1))?;if !authorized{return Ok(())};tx.execute("DELETE FROM revisions WHERE vault_id=? AND uid NOT IN (SELECT MAX(uid) FROM revisions WHERE vault_id=? GROUP BY path)",params![vault,vault])?;let version: i64=tx.query_row("SELECT version FROM vaults WHERE id=?",[vault],|r|r.get(0))?;refresh_vault(&tx,vault,version)?;tx.commit()?;Ok(())})
+    pub fn purge_for_session(&self, user_id: i64, token_hash: &str, vault: &str) -> Result<()> {
+        self.purge_internal(user_id, Some(token_hash), vault)
+    }
+    fn purge_internal(&self, user_id: i64, token_hash: Option<&str>, vault: &str) -> Result<()> {
+        self.with(|c|{let tx=c.transaction_with_behavior(TransactionBehavior::Immediate)?;authorize_mutation(&tx,token_hash,user_id,vault)?;tx.execute("DELETE FROM revisions WHERE vault_id=? AND uid NOT IN (SELECT MAX(uid) FROM revisions WHERE vault_id=? GROUP BY path)",params![vault,vault])?;let version: i64=tx.query_row("SELECT version FROM vaults WHERE id=?",[vault],|r|r.get(0))?;refresh_vault(&tx,vault,version)?;tx.commit()?;Ok(())})
     }
     pub fn checkpoint(&self) -> Result<()> {
         self.with(|c| {
@@ -1248,6 +1443,51 @@ fn owner_stored_ciphertext_size(c: &Connection, user_id: i64) -> Result<i64> {
     )?)
 }
 
+fn authorize_mutation(
+    c: &Connection,
+    token_hash: Option<&str>,
+    user_id: i64,
+    vault_id: &str,
+) -> Result<()> {
+    authorize_account_mutation(c, token_hash, user_id)?;
+    let owned: bool = c.query_row(
+        "SELECT EXISTS(SELECT 1 FROM vaults WHERE id=? AND owner_user_id=?)",
+        params![vault_id, user_id],
+        |row| Ok(row.get::<_, i64>(0)? == 1),
+    )?;
+    if !owned {
+        bail!("mutation authorization expired or was revoked")
+    }
+    Ok(())
+}
+
+fn authorize_account_mutation(
+    c: &Connection,
+    token_hash: Option<&str>,
+    user_id: i64,
+) -> Result<()> {
+    let Some(token_hash) = token_hash else {
+        #[cfg(test)]
+        return Ok(());
+        #[cfg(not(test))]
+        bail!("mutation authorization is required");
+    };
+    let authorized: bool = c.query_row(
+        "SELECT EXISTS(
+            SELECT 1 FROM sessions s
+            JOIN users u ON u.id=s.user_id AND u.status='active'
+             WHERE s.token_hash=? AND s.user_id=?
+               AND s.expires_at>? AND s.revoked_at IS NULL
+         )",
+        params![token_hash, user_id, now_ms()],
+        |row| Ok(row.get::<_, i64>(0)? == 1),
+    )?;
+    if !authorized {
+        bail!("mutation authorization expired or was revoked")
+    }
+    Ok(())
+}
+
 fn initialize_runtime_storage_usage(c: &Connection) -> Result<()> {
     let ciphertext_bytes =
         c.query_row("SELECT COALESCE(SUM(size),0) FROM revisions", [], |row| {
@@ -1322,11 +1562,13 @@ fn enforce_storage_quotas(
 fn add_revision(
     c: &mut Connection,
     r: &NewRevision,
+    token_hash: Option<&str>,
     content: Option<&[u8]>,
     storage_quota_bytes: i64,
     owner_storage_quota_bytes: i64,
 ) -> Result<Revision> {
     let tx = c.transaction_with_behavior(TransactionBehavior::Immediate)?;
+    authorize_mutation(&tx, token_hash, r.user_id, &r.vault_id)?;
     enforce_storage_quotas(
         &tx,
         &r.vault_id,
@@ -3762,6 +4004,7 @@ mod tests {
                 add_revision(
                     connection,
                     &revision,
+                    None,
                     Some(&content),
                     MAX_JS_SAFE_INTEGER,
                     MAX_JS_SAFE_INTEGER,
@@ -3932,6 +4175,35 @@ mod tests {
                 .unwrap(),
             8
         );
+    }
+
+    #[test]
+    fn session_revocation_serializes_before_control_mutation_authorization() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("control-revocation-race.sqlite");
+        let database = Db::open(&path).unwrap();
+        create_test_vault(&database, "vault");
+        let token = database.issue_session(3600).unwrap();
+        let token_hash = auth::token_hash(&token);
+
+        let lock = Connection::open(&path).unwrap();
+        lock.execute_batch("BEGIN IMMEDIATE").unwrap();
+        let worker_database = database.clone();
+        let worker_hash = token_hash.clone();
+        let worker = std::thread::spawn(move || {
+            worker_database.rename_vault_for_session(1, &worker_hash, "vault", "Denied")
+        });
+        std::thread::sleep(std::time::Duration::from_millis(50));
+        lock.execute(
+            "UPDATE sessions SET revoked_at=MAX(created_at,?) WHERE token_hash=?",
+            params![now_ms(), token_hash],
+        )
+        .unwrap();
+        lock.execute_batch("COMMIT").unwrap();
+
+        let error = worker.join().unwrap().unwrap_err().to_string();
+        assert!(error.contains("authorization expired or was revoked"));
+        assert_eq!(database.find_vault("vault").unwrap().unwrap().name, "Vault");
     }
 
     #[test]

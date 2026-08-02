@@ -35,6 +35,13 @@ replay retains at most 16 notices with at most 512 KiB of event text per client
 and releases memory admission after every notice, so slow readers cannot hold
 the pool indefinitely.
 
+Each authenticated connection has a registry-owned cancellation channel bound
+to its session and vault. Online signout and destructive vault replacement
+signal that channel directly. Every data mutation also revalidates the exact
+session, active user, and vault ownership inside the same immediate SQLite
+transaction that commits the change, making transaction order authoritative
+for revoke-versus-write races.
+
 ## Persistence
 
 SQLite is the supported database for the single-node, multi-account deployment.

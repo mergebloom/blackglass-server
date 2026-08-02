@@ -1474,6 +1474,39 @@ describe("production Rust server", () => {
     writer.socket.close();
   }, 20_000);
 
+  test("a revoked session cannot win a staged-upload commit race", async () => {
+    const raceSignin = await post("/user/signin", {
+      email: "owner@example.test",
+      password: "test-password",
+    });
+    const before = databaseVersion(join(directory, "server.sqlite"), vault.id);
+    const writer = await Probe.connect(`ws://127.0.0.1:${dataPort}`);
+    await initializeFor(writer, raceSignin.token, vault, "Revoked upload race", before, false);
+    writer.json(push("revoked-race", "revoked-race-hash", 1, 1));
+    expect(await writer.nextJson()).toEqual({ res: "next" });
+
+    const lock = new Database(join(directory, "server.sqlite"));
+    lock.exec("BEGIN IMMEDIATE");
+    try {
+      const tokenHash = createHash("sha256").update(raceSignin.token).digest("hex");
+      lock.query(
+        "UPDATE sessions SET revoked_at=MAX(created_at,?) WHERE token_hash=?",
+      ).run(Date.now(), tokenHash);
+      writer.socket.send(new Uint8Array([0x7a]));
+      await Bun.sleep(100);
+      lock.exec("COMMIT");
+    } catch (error) {
+      lock.exec("ROLLBACK");
+      throw error;
+    } finally {
+      lock.close();
+    }
+
+    await waitForClose(writer, 2_000);
+    expect(databaseVersion(join(directory, "server.sqlite"), vault.id)).toBe(before);
+    await waitForDirectoryEmpty(join(directory, "uploads"), 2_000);
+  }, 10_000);
+
   test("fails closed when an existing client is ahead of restored server history", async () => {
     const ahead = await Probe.connect(`ws://127.0.0.1:${dataPort}`);
     const serverVersion = databaseVersion(join(directory, "server.sqlite"), vault.id);

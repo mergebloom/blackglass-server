@@ -691,6 +691,7 @@ async fn authorized_control(
             db_task(s, move |db| db.revoke_session(&token))
                 .await
                 .map_err(internal)?;
+            s.live_connections.cancel_session(&invalidated_session_hash);
             let _ = s.events.send(Event {
                 uid: 0,
                 vault: String::new(),
@@ -726,11 +727,13 @@ async fn authorized_control(
             "shared":[],
             "limit":100
         })),
-        "/vault/create" => create_vault(s, auth_context.user_id, v).await,
-        "/vault/access" => access_vault(s, auth_context.user_id, v).await,
-        "/vault/migrate" => migrate_vault(s, auth_context.user_id, v).await,
-        "/vault/rename" => rename_vault(s, auth_context.user_id, v).await,
-        "/vault/delete" => delete_vault(s, auth_context.user_id, v).await,
+        "/vault/create" => create_vault(s, auth_context.user_id, auth_context.token_hash, v).await,
+        "/vault/access" => access_vault(s, auth_context.user_id, auth_context.token_hash, v).await,
+        "/vault/migrate" => {
+            migrate_vault(s, auth_context.user_id, auth_context.token_hash, v).await
+        }
+        "/vault/rename" => rename_vault(s, auth_context.user_id, auth_context.token_hash, v).await,
+        "/vault/delete" => delete_vault(s, auth_context.user_id, auth_context.token_hash, v).await,
         "/vault/share/list" => Ok(json!({"shares":[]})),
         "/vault/share/invite" | "/vault/share/remove" => {
             Err("Sharing is unavailable in single-user mode".into())
@@ -739,7 +742,12 @@ async fn authorized_control(
     }
 }
 
-async fn create_vault(s: &AppState, user_id: i64, v: Value) -> std::result::Result<Value, String> {
+async fn create_vault(
+    s: &AppState,
+    user_id: i64,
+    token_hash: String,
+    v: Value,
+) -> std::result::Result<Value, String> {
     let r: VaultCreate =
         serde_json::from_value(v).map_err(|_| "Invalid vault request".to_string())?;
     let name = r
@@ -771,7 +779,11 @@ async fn create_vault(s: &AppState, user_id: i64, v: Value) -> std::result::Resu
         password,
     };
     let stored = vault.clone();
-    if let Err(error) = db_task(s, move |db| db.create_vault_for_user(user_id, &stored)).await {
+    if let Err(error) = db_task(s, move |db| {
+        db.create_vault_for_session(user_id, &token_hash, &stored)
+    })
+    .await
+    {
         if error.to_string().contains("vault limit reached") {
             return Err("Vault limit reached".into());
         }
@@ -779,7 +791,12 @@ async fn create_vault(s: &AppState, user_id: i64, v: Value) -> std::result::Resu
     }
     serde_json::to_value(vault).map_err(internal)
 }
-async fn access_vault(s: &AppState, user_id: i64, v: Value) -> std::result::Result<Value, String> {
+async fn access_vault(
+    s: &AppState,
+    user_id: i64,
+    token_hash: String,
+    v: Value,
+) -> std::result::Result<Value, String> {
     let r: VaultAccess =
         serde_json::from_value(v).map_err(|_| "Unable to access vault".to_string())?;
     let id = r.vault_uid.ok_or("Unable to access vault")?;
@@ -802,7 +819,7 @@ async fn access_vault(s: &AppState, user_id: i64, v: Value) -> std::result::Resu
         let bind_id = vault.id.clone();
         let requested = requested.to_owned();
         vault.keyhash = db_task(s, move |db| {
-            db.bind_managed_keyhash_for_user(user_id, &bind_id, &requested)
+            db.bind_managed_keyhash_for_session(user_id, &token_hash, &bind_id, &requested)
         })
         .await
         .map_err(internal)?;
@@ -812,7 +829,12 @@ async fn access_vault(s: &AppState, user_id: i64, v: Value) -> std::result::Resu
     }
     Ok(json!({}))
 }
-async fn migrate_vault(s: &AppState, user_id: i64, v: Value) -> std::result::Result<Value, String> {
+async fn migrate_vault(
+    s: &AppState,
+    user_id: i64,
+    token_hash: String,
+    v: Value,
+) -> std::result::Result<Value, String> {
     let r: VaultMigrate =
         serde_json::from_value(v).map_err(|_| "Unable to migrate vault".to_string())?;
     let source_id = r.vault_uid.ok_or("Unable to migrate vault")?;
@@ -848,7 +870,7 @@ async fn migrate_vault(s: &AppState, user_id: i64, v: Value) -> std::result::Res
     let stored = replacement.clone();
     let migrate_source_id = source_id.clone();
     if !db_task(s, move |db| {
-        db.migrate_vault_for_user(user_id, &migrate_source_id, &stored)
+        db.migrate_vault_for_session(user_id, &token_hash, &migrate_source_id, &stored)
     })
     .await
     .map_err(internal)?
@@ -858,7 +880,12 @@ async fn migrate_vault(s: &AppState, user_id: i64, v: Value) -> std::result::Res
     invalidate_vault(s, source_id);
     serde_json::to_value(replacement).map_err(internal)
 }
-async fn rename_vault(s: &AppState, user_id: i64, v: Value) -> std::result::Result<Value, String> {
+async fn rename_vault(
+    s: &AppState,
+    user_id: i64,
+    token_hash: String,
+    v: Value,
+) -> std::result::Result<Value, String> {
     let r: VaultRename =
         serde_json::from_value(v).map_err(|_| "Unable to rename vault".to_string())?;
     let id = r.vault_uid.ok_or("Unable to rename vault")?;
@@ -870,23 +897,32 @@ async fn rename_vault(s: &AppState, user_id: i64, v: Value) -> std::result::Resu
         .ok_or("Unable to rename vault")?
         .to_owned();
     let _commit = s.commit_order.lock().await;
-    if !db_task(s, move |db| db.rename_vault_for_user(user_id, &id, &name))
-        .await
-        .map_err(internal)?
+    if !db_task(s, move |db| {
+        db.rename_vault_for_session(user_id, &token_hash, &id, &name)
+    })
+    .await
+    .map_err(internal)?
     {
         return Err("Unable to rename vault".into());
     }
     Ok(json!({}))
 }
-async fn delete_vault(s: &AppState, user_id: i64, v: Value) -> std::result::Result<Value, String> {
+async fn delete_vault(
+    s: &AppState,
+    user_id: i64,
+    token_hash: String,
+    v: Value,
+) -> std::result::Result<Value, String> {
     let r: VaultDelete =
         serde_json::from_value(v).map_err(|_| "Unable to delete vault".to_string())?;
     let id = r.vault_uid.unwrap_or_default();
     let _commit = s.commit_order.lock().await;
     let delete_id = id.clone();
-    if !db_task(s, move |db| db.delete_vault_for_user(user_id, &delete_id))
-        .await
-        .map_err(internal)?
+    if !db_task(s, move |db| {
+        db.delete_vault_for_session(user_id, &token_hash, &delete_id)
+    })
+    .await
+    .map_err(internal)?
     {
         return Err("Unable to delete vault".into());
     }
@@ -930,6 +966,7 @@ fn vault_credentials(
 }
 
 fn invalidate_vault(s: &AppState, vault: String) {
+    s.live_connections.cancel_vault(&vault);
     let _ = s.events.send(Event {
         uid: 0,
         vault,
@@ -981,6 +1018,7 @@ struct Session {
     device: String,
     pending: Option<Pending>,
     live: Option<crate::admin::LiveGuard>,
+    cancellation: Option<watch::Receiver<bool>>,
     _user_connection_permit: Option<UserConcurrencyPermit>,
 }
 
@@ -1164,6 +1202,7 @@ async fn socket_loop(
         device: "Unknown device".into(),
         pending: None,
         live: None,
+        cancellation: None,
         _user_connection_permit: None,
     };
     let mut source_permit = Some(source_permit);
@@ -1172,6 +1211,7 @@ async fn socket_loop(
     let mut session_revalidation = interval(SESSION_REVALIDATE_INTERVAL);
     session_revalidation.set_missed_tick_behavior(MissedTickBehavior::Skip);
     loop {
+        let cancellation = session.cancellation.clone();
         let pending_upload_deadline = session
             .pending
             .as_ref()
@@ -1192,6 +1232,13 @@ async fn socket_loop(
                 let _ = socket_send(&mut tx, Message::Close(Some(CloseFrame {
                     code: 1008,
                     reason: "Authentication deadline exceeded".into(),
+                }))).await;
+                break
+            },
+            _ = wait_for_cancellation(cancellation), if session.cancellation.is_some() => {
+                let _ = socket_send(&mut tx, Message::Close(Some(CloseFrame {
+                    code: 1008,
+                    reason: "Authorization revoked".into(),
                 }))).await;
                 break
             },
@@ -1377,8 +1424,15 @@ async fn handle_message(
                     let user_id = session
                         .user_id
                         .context("authenticated session has no user ID")?;
+                    let token_hash = session
+                        .token_hash
+                        .clone()
+                        .context("authenticated session has no token hash")?;
                     let _commit = s.commit_order.lock().await;
-                    db_task(s, move |db| db.purge_for_user(user_id, &vault)).await?;
+                    db_task(s, move |db| {
+                        db.purge_for_session(user_id, &token_hash, &vault)
+                    })
+                    .await?;
                     drop(_commit);
                     send(tx, json!({"res":"ok"})).await?
                 }
@@ -1518,9 +1572,14 @@ async fn init(
     )
     .unwrap_or("Unknown device")
     .into();
-    session.live = s
-        .live_connections
-        .register(&vault.id, &session.device, version);
+    session.live = s.live_connections.register(
+        auth_context.user_id,
+        &auth_context.token_hash,
+        &vault.id,
+        &session.device,
+        version,
+    );
+    session.cancellation = session.live.as_ref().map(|live| live.cancellation());
     let initial = v.get("initial").and_then(Value::as_bool).unwrap_or(false);
     let ready_version = {
         // Establish the replay/live boundary while commits are serialized. Replacing
@@ -1662,8 +1721,17 @@ async fn begin_push(
             let _commit = s.commit_order.lock().await;
             let storage_quota_bytes = s.config.storage_quota_bytes;
             let owner_storage_quota_bytes = s.config.storage_quota_bytes_per_owner;
+            let token_hash = session
+                .token_hash
+                .clone()
+                .context("authenticated session has no token hash")?;
             let stored = match db_task(s, move |db| {
-                db.add_empty_revision(&revision, storage_quota_bytes, owner_storage_quota_bytes)
+                db.add_empty_revision_for_session(
+                    &revision,
+                    &token_hash,
+                    storage_quota_bytes,
+                    owner_storage_quota_bytes,
+                )
             })
             .await
             {
@@ -1784,6 +1852,10 @@ async fn upload_chunk(
         return close(tx, 1008, "Upload size does not match metadata").await;
     }
     p.file.sync_all().await?;
+    let token_hash = session
+        .token_hash
+        .clone()
+        .context("authenticated session has no token hash")?;
     let pending = session.pending.take().unwrap();
     drop(pending.file);
     let revision = pending.revision.clone();
@@ -1794,8 +1866,9 @@ async fn upload_chunk(
     let commit_result = {
         let _commit = s.commit_order.lock().await;
         let result = db_task(s, move |db| {
-            db.add_file_revision(
+            db.add_file_revision_for_session(
                 &revision,
+                &token_hash,
                 &path,
                 storage_quota_bytes,
                 owner_storage_quota_bytes,
@@ -2080,6 +2153,10 @@ async fn restore(
         let user_id = session
             .user_id
             .context("authenticated session has no user ID")?;
+        let token_hash = session
+            .token_hash
+            .clone()
+            .context("authenticated session has no token hash")?;
         let storage_quota_bytes = s.config.storage_quota_bytes;
         let owner_storage_quota_bytes = s.config.storage_quota_bytes_per_owner;
         let reserved_global = s.storage_reservations.reserved();
@@ -2087,13 +2164,13 @@ async fn restore(
         let restore_global_quota_bytes = storage_quota_bytes.saturating_sub(reserved_global);
         let restore_owner_quota_bytes = owner_storage_quota_bytes.saturating_sub(reserved_owner);
         match db_task(s, move |db| {
-            db.restore_for_user(
+            db.restore_for_session(
                 user_id,
+                &token_hash,
                 &vault,
                 uid,
                 &device,
-                restore_global_quota_bytes,
-                restore_owner_quota_bytes,
+                (restore_global_quota_bytes, restore_owner_quota_bytes),
             )
         })
         .await
@@ -2437,6 +2514,20 @@ async fn wait_for_shutdown(shutdown: &mut watch::Receiver<bool>) {
             return;
         }
         if shutdown.changed().await.is_err() {
+            return;
+        }
+    }
+}
+async fn wait_for_cancellation(cancellation: Option<watch::Receiver<bool>>) {
+    let Some(mut cancellation) = cancellation else {
+        std::future::pending::<()>().await;
+        return;
+    };
+    loop {
+        if *cancellation.borrow_and_update() {
+            return;
+        }
+        if cancellation.changed().await.is_err() {
             return;
         }
     }
@@ -3323,7 +3414,9 @@ mod tests {
     #[test]
     fn delivered_live_revision_advances_registry_cursor_and_activity() {
         let registry = crate::admin::LiveRegistry::new(1);
-        let guard = registry.register("vault", "device", 3).unwrap();
+        let guard = registry
+            .register(1, "session", "vault", "device", 3)
+            .unwrap();
         let before = registry.snapshot()[0].last_activity_at;
         std::thread::sleep(Duration::from_millis(2));
         record_delivered_revision(Some(&guard), 41);

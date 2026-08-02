@@ -1,5 +1,5 @@
 use crate::{
-    db::{AdminActivity, AdminDatabaseSnapshot, AdminSession, AdminVault},
+    db::{AdminActivity, AdminDatabaseSnapshot, AdminSession, AdminUser, AdminVault},
     server::AppState,
 };
 use anyhow::{Result, bail};
@@ -113,10 +113,16 @@ pub(crate) struct LiveConnection {
     pub last_activity_at: i64,
     pub client_cursor: i64,
     pub state: String,
+    pub user_id: i64,
+}
+struct LiveEntry {
+    connection: LiveConnection,
+    session_hash: String,
+    cancellation: tokio::sync::watch::Sender<bool>,
 }
 #[derive(Clone, Default)]
 pub(crate) struct LiveRegistry {
-    inner: Arc<Mutex<HashMap<String, LiveConnection>>>,
+    inner: Arc<Mutex<HashMap<String, LiveEntry>>>,
     max: usize,
 }
 impl LiveRegistry {
@@ -126,35 +132,72 @@ impl LiveRegistry {
             max,
         }
     }
-    pub(crate) fn register(&self, vault: &str, device: &str, cursor: i64) -> Option<LiveGuard> {
+    pub(crate) fn register(
+        &self,
+        user_id: i64,
+        session_hash: &str,
+        vault: &str,
+        device: &str,
+        cursor: i64,
+    ) -> Option<LiveGuard> {
         let mut map = self.inner.lock().ok()?;
         if map.len() >= self.max {
             return None;
         }
         let id = Uuid::new_v4().to_string();
         let now = now_ms();
+        let (cancellation, receiver) = tokio::sync::watch::channel(false);
         map.insert(
             id.clone(),
-            LiveConnection {
-                id: id.clone(),
-                vault_id: vault.to_owned(),
-                device: sanitize_device(device),
-                connected_at: now,
-                last_activity_at: now,
-                client_cursor: cursor,
-                state: "replaying".into(),
+            LiveEntry {
+                connection: LiveConnection {
+                    id: id.clone(),
+                    vault_id: vault.to_owned(),
+                    device: sanitize_device(device),
+                    connected_at: now,
+                    last_activity_at: now,
+                    client_cursor: cursor,
+                    state: "replaying".into(),
+                    user_id,
+                },
+                session_hash: session_hash.to_owned(),
+                cancellation,
             },
         );
         Some(LiveGuard {
             id,
             registry: self.clone(),
+            cancellation: receiver,
         })
+    }
+    pub(crate) fn cancel_session(&self, session_hash: &str) {
+        if let Ok(map) = self.inner.lock() {
+            for entry in map
+                .values()
+                .filter(|entry| entry.session_hash == session_hash)
+            {
+                let _ = entry.cancellation.send(true);
+            }
+        }
+    }
+    pub(crate) fn cancel_vault(&self, vault_id: &str) {
+        if let Ok(map) = self.inner.lock() {
+            for entry in map
+                .values()
+                .filter(|entry| entry.connection.vault_id == vault_id)
+            {
+                let _ = entry.cancellation.send(true);
+            }
+        }
     }
     pub(crate) fn snapshot(&self) -> Vec<LiveConnection> {
         let Ok(map) = self.inner.lock() else {
             return vec![];
         };
-        let mut out = map.values().cloned().collect::<Vec<_>>();
+        let mut out = map
+            .values()
+            .map(|entry| entry.connection.clone())
+            .collect::<Vec<_>>();
         out.sort_by_key(|v| v.connected_at);
         out.truncate(self.max);
         out
@@ -163,12 +206,17 @@ impl LiveRegistry {
 pub(crate) struct LiveGuard {
     id: String,
     registry: LiveRegistry,
+    cancellation: tokio::sync::watch::Receiver<bool>,
 }
 impl LiveGuard {
+    pub(crate) fn cancellation(&self) -> tokio::sync::watch::Receiver<bool> {
+        self.cancellation.clone()
+    }
     pub(crate) fn activity(&self, cursor: i64, state: &str) {
         if let Ok(mut map) = self.registry.inner.lock()
             && let Some(item) = map.get_mut(&self.id)
         {
+            let item = &mut item.connection;
             item.client_cursor = cursor;
             item.last_activity_at = now_ms();
             item.state = state.chars().take(32).collect();
@@ -178,6 +226,7 @@ impl LiveGuard {
         if let Ok(mut map) = self.registry.inner.lock()
             && let Some(item) = map.get_mut(&self.id)
         {
+            let item = &mut item.connection;
             item.last_activity_at = now_ms();
             item.state = state.chars().take(32).collect();
         }
@@ -216,6 +265,7 @@ struct Snapshot {
     generated_at: i64,
     overview: Overview,
     limits: Limits,
+    users: Vec<AdminUser>,
     vaults: Vec<AdminVault>,
     live_connections: Vec<LiveConnection>,
     recent_activity: Vec<AdminActivity>,
@@ -233,6 +283,10 @@ struct Counts {
     activity_visible: usize,
     sessions_total: i64,
     sessions_visible: usize,
+    users_total: i64,
+    users_visible: usize,
+    users_active: i64,
+    users_disabled: i64,
 }
 #[derive(Serialize)]
 #[serde(rename_all = "camelCase")]
@@ -248,9 +302,12 @@ struct Overview {
 struct Limits {
     per_file_bytes: u64,
     retained_storage_bytes: i64,
+    retained_storage_bytes_per_owner: i64,
     max_sessions: i64,
     max_connections: usize,
+    max_connections_per_user: usize,
     max_uploads: usize,
+    max_uploads_per_user: usize,
 }
 #[derive(Serialize)]
 struct Sessions {
@@ -473,6 +530,10 @@ fn build_snapshot(s: &AppState, data: AdminDatabaseSnapshot) -> Snapshot {
         activity_visible: data.activity.len(),
         sessions_total: data.session_count,
         sessions_visible: data.sessions.len(),
+        users_total: data.user_count,
+        users_visible: data.users.len(),
+        users_active: data.active_users,
+        users_disabled: data.disabled_users,
     };
     Snapshot {
         generated_at: now_ms(),
@@ -486,10 +547,14 @@ fn build_snapshot(s: &AppState, data: AdminDatabaseSnapshot) -> Snapshot {
         limits: Limits {
             per_file_bytes: s.config.per_file_max,
             retained_storage_bytes: s.config.storage_quota_bytes,
+            retained_storage_bytes_per_owner: s.config.storage_quota_bytes_per_owner,
             max_sessions: data.max_sessions,
             max_connections: s.config.max_ws_connections,
+            max_connections_per_user: s.config.max_ws_connections_per_user,
             max_uploads: s.config.max_concurrent_uploads,
+            max_uploads_per_user: s.config.max_concurrent_uploads_per_user,
         },
+        users: data.users,
         vaults: data.vaults,
         live_connections: s.live_connections.snapshot(),
         recent_activity: data.activity,
@@ -556,9 +621,9 @@ fn staging_facts(path: &std::path::Path) -> StagingFacts {
     }
 }
 
-pub(crate) const ADMIN_HTML: &str = r#"<!doctype html><html lang="en"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"><title>Blackglass · Server admin</title><link rel="stylesheet" href="/admin/styles.css"><script defer src="/admin/app.js"></script></head><body><header><strong>Blackglass</strong><span>Server admin</span><span id="refreshed" aria-live="polite">Not connected</span></header><main><section id="login"><h1>Read-only server view</h1><form id="login-form"><label>Admin token <input id="token" type="password" autocomplete="off" minlength="64" maxlength="64" pattern="[0-9a-f]{64}" required></label><button id="connect" type="submit">Connect</button><p id="login-error" role="alert"></p></form></section><div id="dashboard" hidden aria-busy="false"><div class="status"><h1 id="dashboard-title" tabindex="-1">Server dashboard</h1><strong id="health" role="status" aria-live="polite">Unknown</strong><span id="version"></span><button id="refresh">Refresh</button><button id="signout">Forget token</button></div><section><h2>Overview &amp; limits</h2><dl id="overview"></dl></section><section><h2 id="vault-title">Vaults</h2><div id="vaults" class="rows"></div></section><section><h2 id="connection-title">Live connections</h2><div id="connections" class="rows"></div></section><section><h2 id="activity-title">Recent activity</h2><div id="activity" class="rows"></div></section><section><h2 id="session-title">Sessions</h2><div id="sessions" class="rows"></div></section><section><h2>Storage &amp; history</h2><dl id="storage"></dl></section><section><h2>Diagnostics</h2><dl id="diagnostics"></dl></section></div></main></body></html>"#;
+pub(crate) const ADMIN_HTML: &str = r#"<!doctype html><html lang="en"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"><title>Blackglass · Server admin</title><link rel="stylesheet" href="/admin/styles.css"><script defer src="/admin/app.js"></script></head><body><header><strong>Blackglass</strong><span>Server admin</span><span id="refreshed" aria-live="polite">Not connected</span></header><main><section id="login"><h1>Read-only server view</h1><form id="login-form"><label>Admin token <input id="token" type="password" autocomplete="off" minlength="64" maxlength="64" pattern="[0-9a-f]{64}" required></label><button id="connect" type="submit">Connect</button><p id="login-error" role="alert"></p></form></section><div id="dashboard" hidden aria-busy="false"><div class="status"><h1 id="dashboard-title" tabindex="-1">Server dashboard</h1><strong id="health" role="status" aria-live="polite">Unknown</strong><span id="version"></span><button id="refresh">Refresh</button><button id="signout">Forget token</button></div><section><h2>Overview &amp; limits</h2><dl id="overview"></dl></section><section><h2 id="user-title">Users</h2><div id="users" class="rows"></div></section><section><h2 id="vault-title">Vaults</h2><div id="vaults" class="rows"></div></section><section><h2 id="connection-title">Live connections</h2><div id="connections" class="rows"></div></section><section><h2 id="activity-title">Recent activity</h2><div id="activity" class="rows"></div></section><section><h2 id="session-title">Sessions</h2><div id="sessions" class="rows"></div></section><section><h2>Storage &amp; history</h2><dl id="storage"></dl></section><section><h2>Diagnostics</h2><dl id="diagnostics"></dl></section></div></main></body></html>"#;
 pub(crate) const ADMIN_CSS: &str = r#":root{color-scheme:light;--ink:#18201d;--muted:#66706b;--line:#d8dedb;--accent:#276b57}*{box-sizing:border-box}body{margin:0;color:var(--ink);background:#f8faf9;font:15px system-ui,sans-serif;overflow-wrap:anywhere}header{display:flex;gap:1rem;align-items:baseline;padding:1rem max(1rem,calc((100% - 70rem)/2));border-bottom:1px solid var(--line)}header #refreshed{margin-left:auto;color:var(--muted)}main{max-width:70rem;margin:auto;padding:1rem;min-width:0}section{padding:1rem 0;border-bottom:1px solid var(--line)}h1,h2{font-weight:600}h2{font-size:1rem;text-transform:uppercase;letter-spacing:.06em}button,input{min-height:44px;border:1px solid var(--line);border-radius:3px;padding:.6rem;background:white;color:inherit}button{cursor:pointer}button:disabled{cursor:wait;opacity:.55}button:focus,input:focus{outline:3px solid #8ec6b4;outline-offset:2px}.status{display:flex;gap:.75rem;align-items:center}.status button:first-of-type{margin-left:auto}.rows>article{display:grid;grid-template-columns:minmax(10rem,1fr) 2fr;gap:.5rem;padding:.7rem 0;border-top:1px solid var(--line);min-width:0}.fields{display:grid;grid-template-columns:repeat(auto-fit,minmax(10rem,1fr));gap:.35rem}.field{min-width:0}.label{display:block;color:var(--muted);font-size:.8rem}.value{display:block;font-family:ui-monospace,monospace}dl{display:grid;grid-template-columns:minmax(12rem,1fr) 2fr;gap:.5rem}dt{color:var(--muted)}dd{margin:0;font-family:ui-monospace,monospace}#login-error{color:#8a2d25}@media(max-width:600px){header{flex-wrap:wrap}.status{flex-wrap:wrap}.status button{flex:1}.rows>article,dl{grid-template-columns:1fr}header #refreshed{width:100%;margin:0}}"#;
-pub(crate) const ADMIN_JS: &str = r#"'use strict';const $=id=>document.getElementById(id);let pending=null,generation=0;const token=()=>sessionStorage.getItem('blackglass-admin-token');const label=k=>k.replace(/[A-Z]/g,m=>' '+m.toLowerCase());const bytes=v=>v==null?'Unavailable':(()=>{let n=Number(v),u=['B','KiB','MiB','GiB','TiB'],i=0;while(Math.abs(n)>=1024&&i<4){n/=1024;i++}return `${n.toFixed(i?1:0)} ${u[i]}`})();const time=v=>v==null?'Unavailable':new Date(v).toLocaleString();const duration=v=>v==null?'Unavailable':v<60?`${v} s`:v<3600?`${Math.round(v/60)} min`:v<86400?`${Math.round(v/3600)} h`:`${Math.round(v/86400)} d`;const display=(k,v)=>k.match(/bytes|size/i)?bytes(v):k.match(/at$|timestamp|created|expires|revoked/i)&&typeof v==='number'?time(v):k.match(/seconds/i)?duration(v):typeof v==='boolean'?(v?'Yes':'No'):(v??'Unavailable');function dl(id,obj){const e=$(id);e.replaceChildren();for(const[k,v]of Object.entries(obj)){const dt=document.createElement('dt'),dd=document.createElement('dd');dt.textContent=label(k);dd.textContent=display(k,v);e.append(dt,dd)}}function rows(id,items,empty){const e=$(id);e.replaceChildren();if(!items.length){const p=document.createElement('p');p.textContent=empty;e.append(p);return}for(const item of items){const a=document.createElement('article'),b=document.createElement('strong'),d=document.createElement('div');d.className='fields';b.textContent=String(item.name||item.device||item.eventType||'Session');for(const[k,v]of Object.entries(item)){if(['name','device','eventType'].includes(k))continue;const f=document.createElement('span'),l=document.createElement('span'),x=document.createElement('span');f.className='field';l.className='label';x.className='value';l.textContent=label(k);x.textContent=display(k,v);f.append(l,x);d.append(f)}a.append(b,d);e.append(a)}}function busy(on){$('connect').disabled=on;$('refresh').disabled=on;$('refresh').textContent=on?'Refreshing…':'Refresh';$('dashboard').setAttribute('aria-busy',String(on));if(on)$('refreshed').textContent='Refreshing dashboard…'}function forget(message=''){generation++;if(pending)pending.controller.abort();pending=null;busy(false);sessionStorage.removeItem('blackglass-admin-token');$('dashboard').hidden=true;$('login').hidden=false;$('token').value='';$('refreshed').textContent='Not connected';$('login-error').textContent=message;$('token').focus()}async function load(manual=false){if(pending)return pending.promise;const requestGeneration=++generation,controller=new AbortController(),wasHidden=$('dashboard').hidden;const promise=(async()=>{busy(true);$('login-error').textContent='';try{const r=await fetch('/admin/api/snapshot',{headers:{Authorization:`Bearer ${token()||''}`},cache:'no-store',signal:controller.signal});if(requestGeneration!==generation)return;if(r.status===401){forget('Invalid admin token.');return}if(!r.ok)throw Error(r.status===429?'Request rate limited; retry shortly.':'Snapshot unavailable.');const x=await r.json();if(requestGeneration!==generation||!token())return;$('login').hidden=true;$('dashboard').hidden=false;$('health').textContent=x.overview.healthy?'Healthy':'Degraded';$('version').textContent=`Version ${x.overview.version}`;$('refreshed').textContent=`Refreshed ${time(x.generatedAt)}`;dl('overview',{...x.overview,perFileLimitBytes:x.limits.perFileBytes,retainedStorageLimitBytes:x.limits.retainedStorageBytes,sessionLimit:x.limits.maxSessions,connectionLimit:x.limits.maxConnections,uploadLimit:x.limits.maxUploads});$('vault-title').textContent=`Vaults — ${x.counts.vaultsVisible} visible / ${x.counts.vaultsTotal} total`;$('connection-title').textContent=`Live connections — ${x.liveConnections.length} active`;$('activity-title').textContent=`Recent activity — ${x.counts.activityVisible} visible / ${x.counts.activityTotal} total`;$('session-title').textContent=`Sessions — ${x.sessions.active} active / ${x.sessions.total} total (${x.counts.sessionsVisible} visible)`;rows('vaults',x.vaults,'No vaults have been created.');rows('connections',x.liveConnections,'No active Sync connections.');rows('activity',x.recentActivity,'No revision activity recorded.');rows('sessions',x.sessions.items,'No sessions recorded.');dl('storage',x.storage);dl('diagnostics',x.diagnostics);if(wasHidden)$('dashboard-title').focus()}catch(e){if(e.name==='AbortError'||requestGeneration!==generation)return;const m=e instanceof Error?e.message:'Snapshot unavailable.';if($('dashboard').hidden)$('login-error').textContent=m;else $('refreshed').textContent=m;if(manual&&!$('dashboard').hidden)$('refresh').focus()}finally{if(requestGeneration===generation){busy(false);pending=null}}})();pending={promise,controller};return promise}$('login-form').addEventListener('submit',e=>{e.preventDefault();sessionStorage.setItem('blackglass-admin-token',$('token').value);load(true)});$('refresh').onclick=()=>load(true);$('signout').onclick=()=>forget();if(token())load();setInterval(()=>{if(token())load()},30000);"#;
+pub(crate) const ADMIN_JS: &str = r#"'use strict';const $=id=>document.getElementById(id);let pending=null,generation=0;const token=()=>sessionStorage.getItem('blackglass-admin-token');const label=k=>k.replace(/[A-Z]/g,m=>' '+m.toLowerCase());const bytes=v=>v==null?'Unavailable':(()=>{let n=Number(v),u=['B','KiB','MiB','GiB','TiB'],i=0;while(Math.abs(n)>=1024&&i<4){n/=1024;i++}return `${n.toFixed(i?1:0)} ${u[i]}`})();const time=v=>v==null?'Unavailable':new Date(v).toLocaleString();const duration=v=>v==null?'Unavailable':v<60?`${v} s`:v<3600?`${Math.round(v/60)} min`:v<86400?`${Math.round(v/3600)} h`:`${Math.round(v/86400)} d`;const display=(k,v)=>k.match(/bytes|size/i)?bytes(v):k.match(/at$|timestamp|created|expires|revoked/i)&&typeof v==='number'?time(v):k.match(/seconds/i)?duration(v):typeof v==='boolean'?(v?'Yes':'No'):(v??'Unavailable');function dl(id,obj){const e=$(id);e.replaceChildren();for(const[k,v]of Object.entries(obj)){const dt=document.createElement('dt'),dd=document.createElement('dd');dt.textContent=label(k);dd.textContent=display(k,v);e.append(dt,dd)}}function rows(id,items,empty){const e=$(id);e.replaceChildren();if(!items.length){const p=document.createElement('p');p.textContent=empty;e.append(p);return}for(const item of items){const a=document.createElement('article'),b=document.createElement('strong'),d=document.createElement('div');d.className='fields';b.textContent=String(item.name||item.device||item.eventType||'Session');for(const[k,v]of Object.entries(item)){if(['name','device','eventType'].includes(k))continue;const f=document.createElement('span'),l=document.createElement('span'),x=document.createElement('span');f.className='field';l.className='label';x.className='value';l.textContent=label(k);x.textContent=display(k,v);f.append(l,x);d.append(f)}a.append(b,d);e.append(a)}}function busy(on){$('connect').disabled=on;$('refresh').disabled=on;$('refresh').textContent=on?'Refreshing…':'Refresh';$('dashboard').setAttribute('aria-busy',String(on));if(on)$('refreshed').textContent='Refreshing dashboard…'}function forget(message=''){generation++;if(pending)pending.controller.abort();pending=null;busy(false);sessionStorage.removeItem('blackglass-admin-token');$('dashboard').hidden=true;$('login').hidden=false;$('token').value='';$('refreshed').textContent='Not connected';$('login-error').textContent=message;$('token').focus()}async function load(manual=false){if(pending)return pending.promise;const requestGeneration=++generation,controller=new AbortController(),wasHidden=$('dashboard').hidden;const promise=(async()=>{busy(true);$('login-error').textContent='';try{const r=await fetch('/admin/api/snapshot',{headers:{Authorization:`Bearer ${token()||''}`},cache:'no-store',signal:controller.signal});if(requestGeneration!==generation)return;if(r.status===401){forget('Invalid admin token.');return}if(!r.ok)throw Error(r.status===429?'Request rate limited; retry shortly.':'Snapshot unavailable.');const x=await r.json();if(requestGeneration!==generation||!token())return;$('login').hidden=true;$('dashboard').hidden=false;$('health').textContent=x.overview.healthy?'Healthy':'Degraded';$('version').textContent=`Version ${x.overview.version}`;$('refreshed').textContent=`Refreshed ${time(x.generatedAt)}`;dl('overview',{...x.overview,perFileLimitBytes:x.limits.perFileBytes,retainedStorageLimitBytes:x.limits.retainedStorageBytes,ownerStorageLimitBytes:x.limits.retainedStorageBytesPerOwner,sessionLimit:x.limits.maxSessions,connectionLimit:x.limits.maxConnections,connectionLimitPerUser:x.limits.maxConnectionsPerUser,uploadLimit:x.limits.maxUploads,uploadLimitPerUser:x.limits.maxUploadsPerUser});$('user-title').textContent=`Users — ${x.counts.usersActive} active / ${x.counts.usersDisabled} disabled (${x.counts.usersVisible} visible)`;$('vault-title').textContent=`Vaults — ${x.counts.vaultsVisible} visible / ${x.counts.vaultsTotal} total`;$('connection-title').textContent=`Live connections — ${x.liveConnections.length} active`;$('activity-title').textContent=`Recent activity — ${x.counts.activityVisible} visible / ${x.counts.activityTotal} total`;$('session-title').textContent=`Sessions — ${x.sessions.active} active / ${x.sessions.total} total (${x.counts.sessionsVisible} visible)`;rows('users',x.users,'No users have been provisioned.');rows('vaults',x.vaults,'No vaults have been created.');rows('connections',x.liveConnections,'No active Sync connections.');rows('activity',x.recentActivity,'No revision activity recorded.');rows('sessions',x.sessions.items,'No sessions recorded.');dl('storage',x.storage);dl('diagnostics',x.diagnostics);if(wasHidden)$('dashboard-title').focus()}catch(e){if(e.name==='AbortError'||requestGeneration!==generation)return;const m=e instanceof Error?e.message:'Snapshot unavailable.';if($('dashboard').hidden)$('login-error').textContent=m;else $('refreshed').textContent=m;if(manual&&!$('dashboard').hidden)$('refresh').focus()}finally{if(requestGeneration===generation){busy(false);pending=null}}})();pending={promise,controller};return promise}$('login-form').addEventListener('submit',e=>{e.preventDefault();sessionStorage.setItem('blackglass-admin-token',$('token').value);load(true)});$('refresh').onclick=()=>load(true);$('signout').onclick=()=>forget();if(token())load();setInterval(()=>{if(token())load()},30000);"#;
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -724,9 +789,18 @@ mod tests {
     fn live_registry_is_bounded_sanitized_and_drop_safe() {
         let r = LiveRegistry::new(1);
         {
-            let g = r.register("vault", "  Phone\nsecret  ", 7).unwrap();
+            let g = r
+                .register(1, "session-one", "vault", "  Phone\nsecret  ", 7)
+                .unwrap();
+            let cancellation = g.cancellation();
+            assert!(!*cancellation.borrow());
             assert_eq!(r.snapshot()[0].device, "Phone secret");
-            assert!(r.register("other", "Laptop", 0).is_none());
+            assert_eq!(r.snapshot()[0].user_id, 1);
+            assert!(r.register(2, "session-two", "other", "Laptop", 0).is_none());
+            r.cancel_session("unrelated");
+            assert!(!*cancellation.borrow());
+            r.cancel_session("session-one");
+            assert!(*cancellation.borrow());
             g.activity(9, "ready");
             assert_eq!(r.snapshot()[0].client_cursor, 9)
         }

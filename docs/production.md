@@ -140,9 +140,11 @@ out. The browser stores the token in `sessionStorage`, polls no faster than 30
 seconds, and can forget it with **Forget token**.
 
 The console exposes bounded, explicit projections: readiness/version/schema,
-configured limits, vault metadata and encryption mode, recent revision metadata
-without encrypted paths, session timestamps without token hashes, storage
-counts, staging diagnostics, and a bounded in-memory live-connection view.
+global and per-user limits, active/disabled users, per-owner vault and retained
+byte counts, vault metadata and encryption mode, user-attributed recent
+revision metadata without encrypted paths, user-attributed session timestamps
+without token hashes, staging diagnostics, and a bounded user-attributed
+live-connection view.
 
 ## Health, metrics, and logs
 
