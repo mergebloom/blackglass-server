@@ -9,11 +9,13 @@ ARG SOURCE_REVISION=unknown
 ARG TARGETARCH
 ARG TARGETOS
 ARG VERSION
+ARG RUN_TESTS=1
 
 RUN set -eu; \
     test "$TARGETOS" = linux; \
     case "$TARGETARCH" in amd64|arm64) ;; *) exit 1 ;; esac; \
     test -n "$VERSION"; \
+    case "$RUN_TESTS" in 0|1) ;; *) exit 1 ;; esac; \
     test "${#SOURCE_REVISION}" -eq 40; \
     case "$SOURCE_REVISION" in *[!0-9a-f]*) exit 1 ;; esac
 
@@ -58,8 +60,16 @@ ENV BLACKGLASS_SOURCE_REVISION=$SOURCE_REVISION
 
 RUN --mount=type=cache,id=blackglass-cargo-registry-$TARGETARCH,target=/usr/local/cargo/registry,sharing=locked \
     --mount=type=cache,id=blackglass-cargo-git-$TARGETARCH,target=/usr/local/cargo/git,sharing=locked \
-    cargo test --locked --release --manifest-path apps/server-rust/Cargo.toml \
-    && cargo build --locked --release --manifest-path apps/server-rust/Cargo.toml
+    --mount=type=cache,id=blackglass-cargo-target-$TARGETARCH,target=/cargo-target,sharing=locked \
+    if test "$RUN_TESTS" = 1; then \
+      CARGO_TARGET_DIR=/cargo-target CARGO_INCREMENTAL=0 \
+        cargo test --locked --release --manifest-path apps/server-rust/Cargo.toml; \
+    fi; \
+    CARGO_TARGET_DIR=/cargo-target CARGO_INCREMENTAL=0 \
+      cargo build --locked --release --manifest-path apps/server-rust/Cargo.toml \
+    && mkdir -p /target/release \
+    && cp /cargo-target/release/blackglass-server /target/release/blackglass-server \
+    && chmod 0555 /target/release/blackglass-server
 
 RUN test "$(/target/release/blackglass-server --version)" = "blackglass-server $VERSION"
 RUN /target/release/blackglass-server build-info \

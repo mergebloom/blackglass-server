@@ -9,9 +9,23 @@ project_root=$(
 . "$project_root/ops/release-version.sh"
 
 source_revision=${SOURCE_REVISION:-}
+tested_source_revision=${BLACKGLASS_TESTED_SOURCE_REVISION:-}
+force_rebuild=${BLACKGLASS_FORCE_REBUILD:-0}
+case "$force_rebuild" in
+    0|1) ;;
+    *)
+        echo "BLACKGLASS_FORCE_REBUILD must be 0 or 1" >&2
+        exit 1
+        ;;
+esac
 if test -n "$source_revision" \
     && ! blackglass_is_full_source_revision "$source_revision"; then
     echo "SOURCE_REVISION must be a full lowercase Git commit" >&2
+    exit 1
+fi
+if test -n "$tested_source_revision" \
+    && ! blackglass_is_full_source_revision "$tested_source_revision"; then
+    echo "BLACKGLASS_TESTED_SOURCE_REVISION must be a full lowercase Git commit" >&2
     exit 1
 fi
 command -v git >/dev/null 2>&1 || {
@@ -39,6 +53,11 @@ if test -n "$source_revision" && test "$source_revision" != "$git_revision"; the
     exit 1
 fi
 source_revision=$git_revision
+if test -n "$tested_source_revision" \
+    && test "$tested_source_revision" != "$source_revision"; then
+    echo "BLACKGLASS_TESTED_SOURCE_REVISION does not match the release source" >&2
+    exit 1
+fi
 
 temporary=$(mktemp -d "${TMPDIR:-/tmp}/blackglass-native-release.XXXXXX")
 publish_staging=
@@ -64,12 +83,28 @@ tar -xf "$source_archive" -C "$source_tree"
 "$source_tree/ops/verify-release-metadata.sh" "$source_tree"
 manifest="$source_tree/apps/server-rust/Cargo.toml"
 version=$(jq -er '.version' "$source_tree/package.json")
+target_directory="$project_root/apps/server-rust/target"
+destination_directory="$target_directory/release"
+binary="$destination_directory/blackglass-server"
+if test -e "$binary" && test "$force_rebuild" != 1; then
+    test ! -L "$target_directory"
+    test ! -L "$destination_directory"
+    test ! -L "$binary"
+    if binary_sha=$("$source_tree/ops/verify-native-release-binary.sh" \
+        "$binary" "$version" "$source_revision" 2>/dev/null); then
+        echo "native release already ready: $binary_sha  $binary"
+        exit 0
+    fi
+    echo "rebuilding stale native release binary: $binary" >&2
+fi
 build_target_directory="$temporary/cargo-target"
 (
     unset CDPATH
     cd -- "$source_tree"
-    CARGO_TARGET_DIR="$build_target_directory" \
-        cargo test --locked --manifest-path "$manifest"
+    if test -z "$tested_source_revision"; then
+        CARGO_TARGET_DIR="$build_target_directory" \
+            cargo test --locked --manifest-path "$manifest"
+    fi
     BLACKGLASS_SOURCE_REVISION="$source_revision" \
         CARGO_TARGET_DIR="$build_target_directory" \
         cargo build --locked --release --manifest-path "$manifest"
@@ -81,12 +116,9 @@ binary_sha=$("$source_tree/ops/verify-native-release-binary.sh" \
 # Publish only the already-attested bytes. The staging file and destination are
 # on the same filesystem, so rename is atomic even when replacing an older
 # developer build at the legacy target path.
-target_directory="$project_root/apps/server-rust/target"
-destination_directory="$target_directory/release"
 test ! -L "$target_directory"
 mkdir -p "$destination_directory"
 test ! -L "$destination_directory"
-binary="$destination_directory/blackglass-server"
 test ! -L "$binary"
 publish_staging=$(mktemp "$destination_directory/.blackglass-server.XXXXXX")
 cp "$built_binary" "$publish_staging"

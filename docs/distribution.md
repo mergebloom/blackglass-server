@@ -74,6 +74,15 @@ release builders compile an immutable `git archive` of that commit rather than
 the mutable worktree. The root package and lockfile versions and the Rust
 package and lockfile versions must all match.
 
+Repeated builds are cheap and fail closed. A complete Linux artifact set is
+verified against the exact source revision and reused; a partial or stale set
+is rejected. The native builder likewise reuses an already attested binary.
+BuildKit keeps architecture-specific Cargo registry and compiled-output caches,
+but copies the qualified binary out of the cache before packaging. CI may skip
+the duplicate release-unit-test invocation only when
+`BLACKGLASS_TESTED_SOURCE_REVISION` exactly equals the clean source commit that
+passed the preceding gate; local standalone builds run the tests normally.
+
 ## Verify a downloaded binary or archive
 
 Download an archive and its adjacent `.sha256`, then run:
