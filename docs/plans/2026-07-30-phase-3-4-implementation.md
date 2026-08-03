@@ -2,14 +2,14 @@
 
 Date: 2026-07-30
 
-Protocol authority: [`docs/protocol/phase-3-4-client-demands.md`](../protocol/phase-3-4-client-demands.md)
+Protocol authority: [`docs/protocol/phase-3-4-client-demands.md`](../protocol/phase-3-4-client-demands.md), qualified against the preserved Obsidian 1.12.7 floor and the current Obsidian 1.13.4 candidate baseline.
 
 ## Goal
 
 Build multi-account isolation first, then stock-client shared-vault collaboration, without destabilizing the deployed single-owner Sync service.
 
 - Phase 3: durable users, user-bound sessions, owned vaults, and complete tenant isolation. Sharing routes remain unsupported.
-- Phase 4: owner-managed collaborator membership and shared-vault Sync using the contract observed in Obsidian 1.12.7.
+- Phase 4: owner-managed collaborator membership and shared-vault Sync using the contract observed in Obsidian 1.12.7 and revalidated against 1.13.4.
 
 The phases are separate production releases. Phase 4 cannot begin implementation until Phase 3's authorization boundary and adversarial tests pass.
 
@@ -19,26 +19,26 @@ The phases are separate production releases. Phase 4 cannot begin implementation
 
 1. Every request starts from an authenticated user context. Client-supplied user IDs never grant authority.
 2. Every vault operation authorizes that user against the requested vault before querying or mutating vault data.
-3. Unknown, unauthorized, retired, and revoked resources have non-enumerating external failures.
+3. Unknown, unauthorized, retired, and revoked vault resources have non-enumerating external failures. The only accepted exception is the separately documented, authenticated, rate-bounded existing-account disclosure created by immediate Phase 4 invitations.
 4. Session tokens, password hashes, key hashes, salts, encrypted paths, encrypted file bodies, and raw database errors never enter logs, metrics, admin JSON, or test artifacts.
 5. Custom E2EE passwords remain client-only and are shared out of band.
 6. Production keeps the existing control/data/admin listener isolation and the read-only Phase 1 admin posture.
 7. No application-level backup timer or backup service is reintroduced. Production migrations remain offline, copy-first, verified, and pre-activation rollback-ready; after the first accepted write, recovery is roll-forward only.
 8. Existing revision ordering, replay, transfer framing, connection bounds, file limits, and SQLite resource limits remain bounded.
-9. The exact qualified client artifact and checksum are recorded for every compatibility release.
+9. The exact qualified client artifacts and checksums are recorded for every compatibility release. Phase 3 and Phase 4 must pass both the preserved 1.12.7 compatibility floor and the current 1.13.4 candidate; a later candidate may replace 1.13.4 only through the same reviewed-baseline process.
 10. A collaboration revocation stops future server access but is never described as erasing a collaborator's local copy.
 
 ## Workstream 0 — Turn client observations into executable contracts
 
 ### Task 0.1 — Extend the protocol inventory
 
-Repository: `blackglass-bridge`.
+Repository: `blackglass`.
 
 Update:
 
 - `tools/analyze-release.ts`
-- `docs/client-audit-1.12.7.md`
-- `docs/protocol/obsidian-1.12.7.md`
+- `docs/client-audit-1.12.7.md` and the corresponding 1.13.4 audit/addendum;
+- `docs/protocol/obsidian-1.12.7.md` and a versioned 1.13.4 delta or compatibility-matrix document;
 
 Record and assert:
 
@@ -49,14 +49,16 @@ Record and assert:
 - `init.userId`, revision `user`, and the `usernames` operation;
 - owned-vault versus shared-vault UI capabilities;
 - absence of a renderer `/vault/share/accept` call and role fields.
+- the 1.13.4 `/user/pow-challenge` route, its signup-only use, and its explicit unsupported Blackglass response;
+- exact success bodies, error bodies, and HTTP behavior consumed by invite, remove, list, duplicate-invite, and unavailable-account flows in both qualified clients.
 
 Do not store or redistribute renderer source. Generated evidence may contain route names, JSON field names, counts, hashes, and pass/fail results only.
 
 ### Task 0.2 — Add protocol types and synthetic fixtures
 
-Merge in this order so the observed Bridge contract is the source for the server fixture:
+Merge in this order so the observed Blackglass client contract is the source for the server fixture:
 
-1. In `blackglass-bridge`, extend `tests/client-adapter.test.ts` and `tools/analyze-release.ts` with scrubbed shape assertions.
+1. In `blackglass`, extend `tests/client-adapter.test.ts` and `tools/analyze-release.ts` with scrubbed shape assertions.
 2. In `blackglass-server`, update `packages/protocol/src/control.ts`, `packages/protocol/src/sync.ts`, and add the matching cases to `tests/client-contract.integration.test.ts`.
 
 Add typed fixtures for:
@@ -73,10 +75,10 @@ Keep pending invitations as a contract fixture, but do not implement an undelive
 
 Before changing server behavior:
 
-1. Re-run Bridge analysis against official `obsidian-1.12.7.asar.gz`.
-2. Verify the published compressed digest and record the decompressed ASAR digest.
-3. Re-run current single-owner server and bridge tests.
-4. Run the existing two-client single-owner macOS E2E from copied profiles and temporary vaults.
+1. Re-run Blackglass client analysis against the official 1.12.7 artifact and the reviewed 1.13.4 candidate artifact.
+2. Verify each published compressed-artifact digest and record each decompressed ASAR digest.
+3. Re-run current single-owner server and client tests.
+4. Run the existing two-client single-owner macOS E2E for both qualified renderer versions from copied profiles and temporary vaults.
 5. Save a scrubbed validation manifest; retain no account secrets, local-vault content, or renderer source.
 
 Gate: no Phase 3 coding while the known-good single-owner baseline is red.
@@ -91,7 +93,7 @@ Add schema version 5.
 
 Required fields:
 
-- durable numeric `id` that is safe as a JavaScript number;
+- durable numeric `id` allocated monotonically, rejected before JavaScript's maximum safe integer, and never accepted from a client as authority;
 - canonical unique email plus display email;
 - bounded display name;
 - Argon2 password hash;
@@ -99,6 +101,8 @@ Required fields:
 - created and updated timestamps.
 
 Email canonicalization is fixed for these phases: trim surrounding ASCII whitespace, require a bounded printable ASCII address with exactly one non-edge `@`, and store `to_ascii_lowercase()` as the unique canonical key while preserving a bounded display form. Sign-in, provisioning, invitation, and uniqueness checks must all call the same function. Internationalized email support requires a later explicit normalization design. Do not add public signup, email confirmation, MFA, or password-reset claims in Phase 3.
+
+Cap durable users at 256 for these phases. User creation fails before mutation at that bound. The database verifier rejects out-of-range IDs, more than one `sqlite_sequence` row for each AUTOINCREMENT table, sequence values beyond JavaScript's safe integer, and any user count above the cap. `user list`, `usernames`, admin projections, limiter maps, and migration verification use this same bound.
 
 #### Existing tables
 
@@ -133,7 +137,7 @@ Requirements:
 8. Re-running migration into an existing destination fails closed.
 9. A round-trip test proves the old database remains usable by the previous exact binary.
 
-After schema v5 cutover, the database is the sole runtime authority for users and password hashes. The legacy `SELFHOST_EMAIL`, `SELFHOST_NAME`, and `SELFHOST_PASSWORD_HASH` settings may be read by the explicit offline migration path, but Phase 3 serving must never silently fall back to them or auto-bootstrap a missing user. The plaintext test-only `SELFHOST_PASSWORD` path must remain unavailable outside its existing loopback test constraint and must not be accepted by migration. Keep the old production values only in protected rollback material until the Phase 3 rollback window closes, then retire them deliberately.
+After schema v5 cutover, the database is the sole runtime authority for users and password hashes. The legacy `SELFHOST_EMAIL`, `SELFHOST_NAME`, and `SELFHOST_PASSWORD_HASH` settings may be read by the explicit offline migration path, but Phase 3 serving must never silently fall back to them or auto-bootstrap a missing user. Runtime serving and migration must never accept a plaintext `SELFHOST_PASSWORD`; user creation reads the password from standard input while the service is offline. Keep the old production values only in protected rollback material until the Phase 3 rollback window closes, then retire them deliberately.
 
 Update `restore_database` and `rotate_recovery_epoch` for schemas v5/v6 and add a separate tenant-safe stale-backup mode; a normal schema migration must not resurrect accounts or sharing authorization from an old restore point. While every listener and edge route is detached, the current binary writes a new recovered destination that:
 
@@ -170,6 +174,8 @@ Do not implement destructive user deletion in Phase 3 or Phase 4. A user who own
 
 Every `user` command, including `list`, must acquire the same OS path ownership lock that the serving process holds for its entire lifetime (the existing `acquire_database_lock` mechanism), then open the database. If the service is running, the CLI fails without reading or mutating account state; the operator must stop the service first, which also closes every socket and discards staging. A SQLite transaction or busy lock alone is not sufficient. Do not pass passwords or password hashes in arguments. Do not add write actions to the Phase 1 browser console as part of this work.
 
+Because these lifecycle commands are deliberately offline, they do not publish in-process invalidation events. Service shutdown is their immediate connection-revocation boundary. The online `/user/signout` path revokes exactly its authenticated session and directly cancels every live connection using that session. Any future online account-disable or password-change surface requires a separate design and must reuse the same cancellation path; no such write surface is added in Phase 3.
+
 Add a process-level `P3-CLI-LOCK` test that starts the server, proves every `user` command refuses while the ownership lock is held, stops the server, performs `user set-password`, restarts, and proves the old session token fails on both control and data paths before the client can re-login with the replacement password.
 
 ### Task 3.3 — Make authentication return an `AuthContext`
@@ -191,7 +197,7 @@ Replace boolean/global-owner authentication with a single context containing at 
 
 Every authenticated handler receives this context. Sign-in verifies a database-backed user; info and signout operate only on that session. Password changes and disablement revoke all sessions for the affected user. Session expiry and periodic WebSocket revalidation remain enforced.
 
-Sign-in must preserve the existing per-source connection/request bounds and add a bounded per-source plus canonical-account attempt budget. Run Argon2 verification off the async worker threads, use one valid dummy Argon2 hash for unknown/disabled accounts, return the same stable authentication error, and test timing only as a coarse regression guard rather than claiming perfect constant-time database behavior. Successful authentication checks user status again in the same transaction that issues the session.
+Sign-in must preserve the existing bounded per-source attempt budget, trusted-proxy boundary, global Argon2 concurrency, waiter, memory, and request limits. It must not add a globally exhaustible canonical-account lockout: distributed invalid attempts against a known email cannot prevent a valid login from another admitted source. Any account-aware fairness key is a bounded, process-local `(source, keyed-canonical-account-digest)` bucket, never a global email bucket, and raw emails or stable unsalted email hashes never enter limiter state, logs, metrics, or artifacts. Run Argon2 verification off the async worker threads, use one valid dummy Argon2 hash for unknown/disabled accounts, return the same stable authentication error, and test timing only as a coarse regression guard rather than claiming perfect constant-time database behavior. Successful authentication checks user status again in the same transaction that issues the session.
 
 Disabling an owner disables only that user's account and sessions; it does not silently revoke collaborators or delete/freeze the owned vault. The durable disabled owner and ownership rows remain so an operator can re-enable the account. Vault-wide suspension or ownership transfer is a separate future policy.
 
@@ -210,7 +216,7 @@ Required behavior:
 - `/vault/list` returns only the authenticated user's owned vaults, `shared: []`, and a per-user owned-vault limit.
 - create assigns `owner_user_id` from the session.
 - access, rename, migrate, and delete require ownership.
-- count/limit checks are per owner; global deployment caps remain an independent safety ceiling.
+- count/limit checks are per owner; the current hard cap of 100 total vaults remains the independent global deployment ceiling. An owner may consume at most the configured owned-vault limit but never bypass the global cap.
 - `/subscription/list` and `/user/info` are user-scoped; every authenticated active local account receives the existing self-hosted `sync: true` entitlement and the account's own email/name fields, while disabled users cannot obtain or use a session;
 - account size is user-scoped;
 - Phase 4 sharing routes continue to return explicit unsupported errors.
@@ -259,7 +265,7 @@ Every query must be scoped by the authorized vault. Except for the explicitly do
 
 Replace the current global retired-marker pruning with two uniform bounds: at most 512 markers per owner and 8,192 globally. Prune only the same owner's oldest markers when that owner reaches its bound. If an insertion would exceed the global bound because of other owners, fail the delete/migrate/recovery operation before changing the vault instead of evicting another owner's marker. Preflight bulk recovery rotation against both bounds. Test that one owner cannot evict or alter another owner's retained markers and that invalid token shape does not expose marker existence.
 
-Password changes, user disablement, and explicit per-user session revocation must also publish a bounded internal invalidation event that immediately closes matching sockets and discards their staged transfers. Periodic session revalidation remains defense in depth, not the primary revocation mechanism.
+Online signout and every Phase 4 membership mutation publish a bounded internal invalidation event that immediately closes matching sockets and discards their staged transfers. Offline user lifecycle commands run only while the service lock is unowned and therefore rely on the required service shutdown to close sockets. Periodic session revalidation remains defense in depth, not the primary online revocation mechanism.
 
 The close signal is not the authorization boundary. Every database mutation must re-check the session user and ownership predicate inside the same SQLite transaction that commits the mutation; serialized transaction order decides a revoke-versus-write race. Give each connection an out-of-band cancellation handle owned by the live-connection registry rather than relying on the outer socket event receiver. Revocation triggers that handle directly. Replay checks it before and after every bounded database wait and page send; pull checks before every binary frame; upload checks while reading each chunk and again in the final commit transaction; every socket write races cancellation. A handler must never remain authorized merely because the outer loop is awaiting it and cannot poll a broadcast receiver. A process crash drops all sockets, so no connection survives loss of the in-memory signal.
 
@@ -289,6 +295,8 @@ Use uniform deployment configuration rather than per-user quota columns in these
 - `size.limit` is that owner's uniform `SELFHOST_STORAGE_QUOTA_BYTES_PER_OWNER` value;
 - `size.vault_size` is the selected owned or shared vault's current live logical size;
 - the global storage/resource ceilings are never exposed as the user's quota.
+
+The global ceilings for these phases are therefore 256 durable users, 100 total vaults, 1,024 retained session rows, 8,192 retired-vault markers, the existing configured WebSocket/upload ceilings, and the configured retained-storage ceiling. Reaching a per-user or global session ceiling rejects session issuance with one stable bounded retry error after expired/revoked-row pruning; it never silently revokes another live session. All in-memory per-user maps are bounded by the durable-user cap or the smaller live connection/session limit.
 
 Do not count the same shared bytes against every collaborator in Phase 4. An authorized collaborator therefore sees only the owning account's aggregate used/quota numbers needed to explain shared-vault admission; no other vault count, name, identity, or per-vault breakdown is exposed. Record this bounded shared-resource capacity disclosure explicitly in the security documentation and exact-client fixture. Keep size fields numeric and compatible with 1.12.7.
 
@@ -353,6 +361,10 @@ Using two copied Obsidian profiles and two temporary vaults:
 
 Gate: Phase 3 is releasable only after static analysis, Rust tests, Bun/integration tests, exact-client E2E, independent security review, release resource gates, and migration rehearsal all pass.
 
+## Release and schema boundaries
+
+Phase 3 is released as `v0.3.0` with schema v5. Phase 4 is released as `v0.4.0` with schema v6. Each release manifest records the exact supported source schema, destination schema, previous rollback binary/tag, client tooling revision, and qualified renderer matrix. Release automation must reject a tag/version/schema disagreement.
+
 ## Phase 3 production rollout
 
 1. Produce checksum-verified exact-source AMD64/ARM64 artifacts through CI/release workflows.
@@ -378,6 +390,8 @@ Add schema version 6 with a membership table:
 - `invited_by_user_id` foreign key;
 - accepted/created timestamps plus nullable `revoked_at`;
 - a partial unique index on `(vault_id, user_id)` where `revoked_at IS NULL`.
+
+Keep at most 64 revoked membership rows per vault and 8,192 membership rows globally. Before a re-invitation inserts a new row, prune only that vault's oldest revoked rows down to its bound without resetting `sqlite_sequence`. If the global bound is still exhausted by other vaults, fail before changing membership state rather than evicting another vault's history. Active rows are never pruned. The database verifier enforces the per-vault/global counts, sequence shape, safe-integer boundary, and active-row uniqueness. These bounds keep `usernames`, administration, migration, recovery, and invitation work finite even after repeated remove/re-invite cycles.
 
 Use foreign-key actions deliberately: deleting a vault must remove its collaborator rows in the same transaction, while a user who owns vaults must not be destructively removed by user-lifecycle tooling. Index owner and membership lookup paths used on every request.
 
@@ -470,7 +484,7 @@ Rules:
 - after removal, a later re-invitation creates a new `share_uid` not previously used in the current recovery epoch; the stale removed ID cannot leave or remove the new membership;
 - self-invite, unknown email, and disabled account all return the same stable `User unavailable for sharing` error.
 
-Canonicalization and structural validation happen first. Before any account lookup, enforce uniform rolling-hour budgets of 60 invite attempts per source, 30 per authenticated user, 20 distinct canonical target digests per authenticated user, and 300 deployment-wide. Successful, failed, duplicate, and rotating-address attempts all consume the applicable attempt budgets; metrics use only bounded outcome labels and never email or user labels. Return one stable bounded rate-limit error when any budget is exhausted. These defaults may be lowered by deployment configuration but not disabled.
+Canonicalization and structural validation happen first. Before any account lookup, enforce uniform rolling-hour budgets of 60 invite attempts per source, 30 per authenticated user, 20 distinct canonical target digests per authenticated user, and 300 deployment-wide. Target digests are process-local keyed digests using an ephemeral secret; limiter state contains no raw address or stable unsalted address hash, is capped at 300 attempt records and 256 user entries, and resets on process restart. Successful, failed, duplicate, and rotating-address attempts all consume the applicable attempt budgets; metrics use only bounded outcome labels and never email or user labels. Return one stable bounded rate-limit error when any budget is exhausted. These defaults may be lowered by deployment configuration but not disabled.
 
 Within one `BEGIN IMMEDIATE` transaction, re-check the active session, active owner, vault ownership, target active status, self-invite rule, existing active membership, active `COUNT(*) < 20`, and the final membership insert. Check an existing active membership before the count so an idempotent re-invite still succeeds at the limit. A removal sets `revoked_at`; re-invitation inserts a fresh AUTOINCREMENT row. This serialized transaction is the only collaborator-count authority.
 
@@ -593,7 +607,7 @@ Use at least three copied profiles:
 - collaborator profile B;
 - unrelated profile C.
 
-Drive the real 1.12.7 UI for invitation, share-list display, connect, collaboration, history attribution, leave, and removal. Use synthetic temporary vaults and local Blackglass accounts only. Do not alter an installed application in place or a real user vault. Capture scrubbed request/response shape manifests and screenshots containing no secrets or user content.
+Drive the real 1.12.7 and 1.13.4 UIs for invitation, share-list display, connect, collaboration, history attribution, leave, and removal. Use synthetic temporary vaults and local Blackglass accounts only. Do not alter an installed application in place or a real user vault. Capture scrubbed request/response shape manifests and screenshots containing no secrets or user content.
 
 Gate: Phase 4 is not releasable until every API, race, adversarial isolation, and exact-client scenario passes and two independent reviews approve authorization and migration behavior.
 
@@ -608,7 +622,7 @@ Create these named suites rather than extending one undifferentiated integration
 - `tests/collaboration.integration.test.ts`: `P4-SHARE`, `P4-INVENTORY`, `P4-ATTRIBUTION`, `P4-DATA`, `P4-REVOKE`, `P4-RACES`, and `P4-MIGRATE`.
 - `tests/database-migration.integration.test.ts`: `P3-MIGRATE-V5`, `P4-MIGRATE-V6`, source preservation, pre-activation rollback, and post-activation roll-forward fixtures.
 - Rust unit tests beside `auth.rs`, `db.rs`, and `server.rs`: email canonicalization, password/session lifecycle, `VaultAccess`, SQL scoping, foreign-key invariants, quota transactions, event audiences, and invalidation races.
-- Blackglass Bridge contract tests: `CLIENT-1127-SHARE-SHAPE`, `CLIENT-1127-IDENTITY`, `CLIENT-1127-OWNED-SHARED-UI`, and `CLIENT-1127-NO-ROLE`.
+- Blackglass contract tests: the `CLIENT-1127-*` fixtures plus matching `CLIENT-1134-*` fixtures, including `CLIENT-1134-POW-UNSUPPORTED`.
 - Exact-client macOS scenarios: `E2E-P3-TENANCY`, `E2E-P4-CUSTOM-E2EE`, and `E2E-P4-MANAGED-ENCRYPTION`. The two Phase 4 scenarios each use owner A, collaborator B, and outsider C; managed encryption is not allowed to pass solely through a protocol mock.
 
 Each requirement has one release-blocking owner:
@@ -636,12 +650,14 @@ bun test tests/collaboration.integration.test.ts
 git diff --check
 ```
 
-Minimum Bridge commands from `blackglass-bridge`:
+Minimum Blackglass client commands from `blackglass`:
 
 ```sh
 bun run check
 bun run analyze:release -- /path/to/verified/obsidian-1.12.7.asar
+bun run analyze:release -- /path/to/verified/obsidian-1.13.4.asar
 bun run e2e:prepare -- /path/to/run /path/to/verified/obsidian-1.12.7.asar --scenario <scenario>
+bun run e2e:prepare -- /path/to/run-1.13.4 /path/to/verified/obsidian-1.13.4.asar --scenario <scenario>
 bun run e2e:server -- /path/to/run
 bun run e2e:verify -- /path/to/run
 git diff --check
@@ -649,11 +665,11 @@ git diff --check
 
 Extend `prepare-e2e.ts`, `run-e2e-server.ts`, and `verify-e2e.ts` to support the three named scenarios, distinct generated account credentials, three copied profiles, and expected owner/collaborator/outsider identities. Credentials remain in mode-`0600` run directories and are excluded from result manifests.
 
-Each suite writes one scrubbed result under `docs/validation/`:
+Each renderer/scenario pair writes one scrubbed result under `docs/validation/`:
 
-- `phase-3-tenancy-<server-revision>.json`;
-- `phase-4-custom-e2ee-<server-revision>.json`;
-- `phase-4-managed-encryption-<server-revision>.json`.
+- `phase-3-tenancy-obsidian-<renderer-version>-<server-revision>.json`;
+- `phase-4-custom-e2ee-obsidian-<renderer-version>-<server-revision>.json`;
+- `phase-4-managed-encryption-obsidian-<renderer-version>-<server-revision>.json`.
 
 Every result records scenario ID, exact server revision/artifact digest, exact client asset digest, platform, commands, test counts, start/end timestamps, migration source/destination schema versions, and pass/fail checks. It must not contain credentials, email addresses, encryption values, raw paths, vault content, renderer source, or production identifiers. A release is blocked if any demand above lacks a named passing suite and a scrubbed result.
 
@@ -662,8 +678,8 @@ Every result records scenario ID, exact server revision/artifact digest, exact c
 1. Ship Phase 4 as a separate exact-source release after the Phase 3 soak.
 2. Confirm a successful whole-LXC/PBS backup no older than 24 hours and the same maximum 24-hour RPO/four-hour RTO, then copy-migrate schema v5 to v6 offline. Preserve the untouched v5 database and Phase 3 binary only as pre-activation rollback material.
 3. Clone the migrated candidate and exercise owner/member/outsider sharing on that disposable clone using isolated loopback test ports. Discard the clone. Verify the real candidate still has no memberships or qualification-only users and no client writes. Before activation, restoring untouched v5 plus the Phase 3 binary is an RPO-0, 15-minute-target rollback.
-4. Activate Phase 4 with no memberships, prove single-owner behavior is unchanged, and hold an owner-only one-hour gate with both monitoring backends healthy and no Blackglass alert/error increase. The first accepted client write permanently closes the v5 rollback path.
-5. Enable one real shared-vault canary only after that gate. Its owner/member accounts and stock-client flow must have already passed the disposable-clone and exact-client qualification gates. Hold the canary for 24 hours before adding another shared vault.
+4. Activate Phase 4 with no memberships and sharing disabled by default, prove single-owner behavior is unchanged, and hold an owner-only one-hour gate with both monitoring backends healthy and no Blackglass alert/error increase. The first accepted client write permanently closes the v5 rollback path.
+5. Enable one real shared-vault canary only after that gate. `SELFHOST_SHARING_ENABLED=false` plus a bounded `SELFHOST_SHARING_CANARY_OWNER_IDS` allowlist permits share management and collaborator access only for vaults owned by the listed IDs; all other owners receive the stable sharing-unavailable contract. The list accepts at most eight safe integer IDs, is validated at startup, and is empty by default. Set `SELFHOST_SHARING_ENABLED=true` only after the canary gate, at which point the allowlist is rejected as ambiguous configuration. The canary owner/member accounts and stock-client flow must have already passed the disposable-clone and exact-client qualification gates. Hold the canary for 24 hours before adding another shared vault.
 6. Verify primary and recovery Prometheus targets plus all related alerts after each step.
 7. After activation, recover forward on schema v6 with a fixed v6-compatible binary or the tenant-safe stale-backup recovery mode. Any restored memberships are cleared and accounts remain disabled until deliberate offline password replacement and re-enrollment. Never restore v5 beneath advanced clients and never run a schema-incompatible binary.
 
@@ -673,7 +689,7 @@ During the canary require `up == 1` on both monitoring backends, zero firing Bla
 
 Before each phase merges:
 
-- protocol compatibility review against the verified 1.12.7 artifact;
+- protocol compatibility review against the verified 1.12.7 floor and current 1.13.4 candidate artifacts;
 - schema and rollback review;
 - authorization/data-isolation review;
 - transfer and WebSocket race review;
@@ -703,4 +719,4 @@ A reviewer should return only PASS or concrete file-and-line findings. No phase 
 
 Phase 3 is done only when multiple accounts use the same server without any observable or actionable cross-tenant path and the legacy owner remains compatible after one documented re-login.
 
-Phase 4 is done only when the stock 1.12.7 owner and collaborator flows work end to end, revocation closes all future server paths, revision attribution is correct, encryption limitations are explicit, and an unrelated user remains unable to discover or access collaboration state.
+Phase 4 is done only when the stock 1.12.7 and 1.13.4 owner and collaborator flows work end to end, revocation closes all future server paths, revision attribution is correct, encryption limitations are explicit, and an unrelated user remains unable to discover or access collaboration state.

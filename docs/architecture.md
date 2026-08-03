@@ -4,18 +4,21 @@
 
 Provide a stable, self-hosted implementation of the Sync control and data
 planes expected by qualified Obsidian desktop clients. Client-release analysis
-and adaptation live separately in Blackglass Bridge.
+and adaptation live separately in Blackglass.
 
 ## Control plane
 
-The Rust service provides one configured user and the account and vault
-operations required to create, connect, migrate encryption, rename, and delete
-a Sync vault. Registration, password-recovery, and business-subscription routes
-return explicit administrator-managed JSON errors instead of transport errors.
-Sharing reports an empty list and invite/remove operations fail cleanly in
-single-user mode. Passwords are verified with Argon2id. Successful sign-in
-creates a random 256-bit bearer session whose digest, expiry, and revocation
-state live in SQLite.
+The Rust service provides durable SQLite-backed local users and the account and
+vault operations required to create, connect, migrate encryption, rename,
+delete, and share a Sync vault. Each vault has one durable owner and may have
+bounded active collaborators; every session is bound to one user. Serving never
+loads account credentials from environment variables. Registration,
+password-recovery, and business-subscription routes return explicit
+administrator-managed JSON errors instead of transport errors. Owners may
+invite existing active local accounts and remove collaborators; collaborators
+may leave using their own membership ID. Passwords are verified with Argon2id.
+Successful sign-in creates a random 256-bit bearer session whose digest, user,
+expiry, and revocation state live in SQLite.
 
 ## Data plane
 
@@ -34,15 +37,25 @@ replay retains at most 16 notices with at most 512 KiB of event text per client
 and releases memory admission after every notice, so slow readers cannot hold
 the pool indefinitely.
 
+Each authenticated connection has a registry-owned cancellation channel bound
+to its session and vault. Online signout, membership removal, and destructive
+vault replacement signal that channel directly. Every data mutation also
+revalidates the exact session, active user, and owner-or-collaborator access
+inside the same immediate SQLite transaction that commits the change, making
+transaction order authoritative for revoke-versus-write races.
+
 ## Persistence
 
-SQLite is the supported database for the single-node, single-owner deployment.
+SQLite is the supported database for the single-node, multi-account deployment.
 WAL commits use FULL synchronous durability. Startup, backup, restore, and
 offline session revocation fail closed on unexpected schema objects or logical
 state inconsistencies instead of silently repairing an unknown database.
 Recognized older schemas are upgraded only through an offline, copy-first
 command whose per-version validation runs inside each migration transaction.
 SQLite connections use defensive mode with trusted schemas disabled.
+Database work has a bounded worker queue, SQLite busy timeout, and dedicated
+admin-query deadline. Fixed-cardinality metrics distinguish request and admin
+snapshot pressure without database text or tenant identifiers.
 Current revisions store encrypted paths, encrypted hashes, and encrypted file
 bodies. A separate server timestamp supports history even when a deletion has
 zero file timestamps. The service is content-blind but not metadata-blind:
@@ -51,13 +64,13 @@ visible.
 
 ## Compatibility boundary
 
-Blackglass Server owns the durable protocol contract. Blackglass Bridge owns
+Blackglass Server owns the durable protocol contract. Blackglass owns
 release-specific endpoint changes and qualifies each new desktop renderer.
 That boundary allows server upgrades and client-release maintenance to proceed
 independently. Unknown client protocol changes must fail qualification rather
 than being guessed at in production.
 
-Every current Bridge qualification report is bound to the server binary's
+Every current Blackglass qualification report is bound to the server binary's
 reported semantic version, byte size, architecture, and SHA-256. Rebuilding or
 renaming a binary creates a new artifact that must earn a new client E2E record.
 

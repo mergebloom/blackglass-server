@@ -22,9 +22,15 @@ case "$target" in
 esac
 
 source_revision=${SOURCE_REVISION:-}
+tested_source_revision=${BLACKGLASS_TESTED_SOURCE_REVISION:-}
 if test -n "$source_revision" \
     && ! blackglass_is_full_source_revision "$source_revision"; then
     echo "SOURCE_REVISION must be a full lowercase Git commit" >&2
+    exit 1
+fi
+if test -n "$tested_source_revision" \
+    && ! blackglass_is_full_source_revision "$tested_source_revision"; then
+    echo "BLACKGLASS_TESTED_SOURCE_REVISION must be a full lowercase Git commit" >&2
     exit 1
 fi
 command -v git >/dev/null 2>&1 || {
@@ -52,6 +58,14 @@ if test -n "$source_revision" && test "$source_revision" != "$git_revision"; the
     exit 1
 fi
 source_revision=$git_revision
+run_tests=1
+if test -n "$tested_source_revision"; then
+    if test "$tested_source_revision" != "$source_revision"; then
+        echo "BLACKGLASS_TESTED_SOURCE_REVISION does not match the release source" >&2
+        exit 1
+    fi
+    run_tests=0
+fi
 
 # Every build input comes from this immutable commit-addressed export. A
 # concurrent worktree edit or branch move cannot change the source labeled by
@@ -61,6 +75,7 @@ source_archive="$temporary/source.tar"
 source_context="$temporary/source"
 image=
 container=
+storage_volume=
 publish_staging=
 cleanup() {
     if test -n "$container"; then
@@ -68,6 +83,9 @@ cleanup() {
     fi
     if test -n "$image"; then
         docker image rm -f "$image" >/dev/null 2>&1 || true
+    fi
+    if test -n "$storage_volume"; then
+        docker volume rm -f "$storage_volume" >/dev/null 2>&1 || true
     fi
     if test -n "$publish_staging"; then
         rm -rf "$publish_staging"
@@ -119,21 +137,43 @@ docker buildx version >/dev/null
 mkdir -p "$dist_dir"
 image="blackglass-server-smoke:${version}-${target}-$$"
 
-docker buildx build \
-    --platform "$platform" \
-    --file "$source_context/ops/Dockerfile.release" \
-    --target release \
-    --build-arg "VERSION=$version" \
-    --build-arg "SOURCE_REVISION=$source_revision" \
-    --output "type=local,dest=$temporary/out" \
-    "$source_context"
-
 archive_name="blackglass-server-v${version}-${target}.tar.gz"
 archive="$dist_dir/$archive_name"
 checksum="$archive.sha256"
 raw_binary_name="blackglass-server-v${version}-${target}"
 raw_binary="$dist_dir/$raw_binary_name"
 raw_checksum="$raw_binary.sha256"
+
+# Refuse partial/stale publication before spending minutes in a cross-build.
+# A complete artifact set from this exact immutable source is an idempotent
+# success, which makes interrupted or repeated release orchestration cheap.
+existing=0
+for destination in "$archive" "$checksum" "$raw_binary" "$raw_checksum"; do
+    if test -e "$destination" || test -L "$destination"; then
+        existing=$((existing + 1))
+    fi
+done
+if test "$existing" -ne 0; then
+    if test "$existing" -ne 4; then
+        echo "refusing a partial existing release artifact set for $target" >&2
+        exit 1
+    fi
+    "$source_context/ops/verify-linux-release.sh" \
+        "$target" "$archive" "$raw_binary" "$source_revision"
+    echo "release already ready: $archive and $raw_binary"
+    exit 0
+fi
+
+docker buildx build \
+    --platform "$platform" \
+    --file "$source_context/ops/Dockerfile.release" \
+    --target release \
+    --build-arg "VERSION=$version" \
+    --build-arg "SOURCE_REVISION=$source_revision" \
+    --build-arg "RUN_TESTS=$run_tests" \
+    --output "type=local,dest=$temporary/out" \
+    "$source_context"
+
 staged_archive="$temporary/out/$archive_name"
 staged_checksum="$staged_archive.sha256"
 staged_raw_binary="$temporary/out/$raw_binary_name"
@@ -152,6 +192,7 @@ docker buildx build \
     --target runtime \
     --build-arg "VERSION=$version" \
     --build-arg "SOURCE_REVISION=$source_revision" \
+    --build-arg "RUN_TESTS=$run_tests" \
     --load \
     --tag "$image" \
     "$source_context"
@@ -164,29 +205,32 @@ actual_version=$(docker run --rm \
     "$image" --version)
 test "$actual_version" = "blackglass-server $version"
 
-password_hash=$(printf '%s\n' release-runtime-password | docker run --rm -i \
+storage_volume="blackglass-release-smoke-${target}-$$"
+docker volume create "$storage_volume" >/dev/null
+printf '%s\n' release-runtime-password | docker run --rm -i \
     --platform "$platform" \
     --read-only \
+    --mount "type=volume,src=$storage_volume,dst=/var/lib/blackglass-server" \
     --cap-drop ALL \
     --security-opt no-new-privileges \
-    "$image" hash-password)
+    "$image" user create /var/lib/blackglass-server/server.sqlite \
+        release-runtime@example.test 'Release runtime user'
 container=$(docker run --detach --rm \
     --platform "$platform" \
     --network host \
     --stop-timeout 30 \
     --read-only \
+    --mount "type=volume,src=$storage_volume,dst=/var/lib/blackglass-server" \
     --memory 256m \
     --pids-limit 64 \
     --ulimit nofile=4096:4096 \
     --tmpfs /tmp:rw,noexec,nosuid,nodev,size=32m,mode=1777 \
     --cap-drop ALL \
     --security-opt no-new-privileges \
-    --env SELFHOST_EMAIL=release-runtime@example.test \
     --env SELFHOST_BIND_HOST=127.0.0.1 \
     --env SELFHOST_ACKNOWLEDGE_EXTERNAL_BIND= \
     --env SELFHOST_TRUSTED_PROXY=127.0.0.1 \
     --env SELFHOST_DATA_HOST=sync-data.example.test \
-    --env "SELFHOST_PASSWORD_HASH=$password_hash" \
     "$image" serve)
 control_address=127.0.0.1:3000
 data_address=127.0.0.1:3003
@@ -204,13 +248,6 @@ test "$started" -eq 1
 grep -q '"service":"blackglass-server"' "$temporary/container-health.json"
 docker stop --timeout 30 "$container" >/dev/null
 container=
-
-for destination in "$archive" "$checksum" "$raw_binary" "$raw_checksum"; do
-    if test -e "$destination" || test -L "$destination"; then
-        echo "refusing to overwrite an existing release artifact: $destination" >&2
-        exit 1
-    fi
-done
 
 # Stage on the destination filesystem, then use no-overwrite hard links so a
 # failed build can never replace a previously qualified release artifact.

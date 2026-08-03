@@ -236,6 +236,10 @@ async function createReleaseFixture(
     join(bundleDirectory, "manifest.json"),
     options.transformManifestText?.(manifestText) ?? manifestText,
   );
+  await copyFile(
+    join(root, "ops/release/release-contract.json"),
+    join(bundleDirectory, "release-contract.json"),
+  );
 
   const archive = join(directory, `${bundle}.tar.gz`);
   const entries = [
@@ -248,6 +252,7 @@ async function createReleaseFixture(
     `${bundle}/blackglass-server.service`,
     `${bundle}/blackglass-server.sysusers.conf`,
     `${bundle}/manifest.json`,
+    `${bundle}/release-contract.json`,
   ];
   const tar = Bun.spawnSync([
     "tar",

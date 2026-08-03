@@ -19,6 +19,7 @@ use axum::{
 };
 use futures_util::{SinkExt, StreamExt, stream::SplitSink};
 use serde_json::{Value, json};
+use sha2::{Digest, Sha256};
 use std::{
     collections::{HashMap, VecDeque},
     fs,
@@ -28,7 +29,7 @@ use std::{
     path::PathBuf,
     sync::{
         Arc, Mutex as StdMutex,
-        atomic::{AtomicI64, AtomicU64, Ordering},
+        atomic::{AtomicU64, Ordering},
     },
     time::{Duration, Instant, SystemTime, UNIX_EPOCH},
 };
@@ -54,8 +55,11 @@ const GRACEFUL_CONNECTION_DRAIN_DEADLINE: Duration = Duration::from_secs(15);
 const SESSION_REVALIDATE_INTERVAL: Duration = Duration::from_secs(5);
 const SOCKET_WRITE_TIMEOUT: Duration = Duration::from_secs(10);
 const SIGNIN_QUEUE_TIMEOUT: Duration = Duration::from_secs(10);
+const DB_WORKER_QUEUE_DEADLINE: Duration = Duration::from_secs(5);
 const SIGNIN_RATE_WINDOW: Duration = Duration::from_secs(60);
 const SIGNIN_ATTEMPTS_PER_SOURCE: usize = 6;
+const SHARE_INVITE_WINDOW: Duration = Duration::from_secs(60 * 60);
+const MAX_SHARE_INVITE_USER_ENTRIES: usize = 256;
 const MAX_SIGNIN_WAITERS: usize = 8;
 const MAX_UNAUTHENTICATED_WS_PER_SOURCE: usize = 4;
 const MAX_SOURCE_LIMIT_ENTRIES: usize = 4096;
@@ -91,6 +95,94 @@ pub struct Metrics {
     downloads: AtomicU64,
     errors: AtomicU64,
     control_rejections: AtomicU64,
+    authorization_denials: [AtomicU64; AuthorizationOperation::COUNT],
+    database_busy: [AtomicU64; DatabaseOperation::COUNT],
+    database_deadlines: [AtomicU64; DatabaseOperation::COUNT],
+    share_invites: [AtomicU64; ShareInviteOutcome::COUNT],
+}
+
+#[derive(Clone, Copy)]
+enum AuthorizationOperation {
+    Access,
+    Migrate,
+    Rename,
+    Delete,
+    DataInit,
+}
+
+#[derive(Clone, Copy)]
+enum ShareInviteOutcome {
+    Success,
+    Unavailable,
+    Capacity,
+    RateLimited,
+}
+
+impl ShareInviteOutcome {
+    const COUNT: usize = 4;
+    const ALL: [(Self, &'static str); Self::COUNT] = [
+        (Self::Success, "success"),
+        (Self::Unavailable, "unavailable"),
+        (Self::Capacity, "capacity"),
+        (Self::RateLimited, "rate_limited"),
+    ];
+}
+
+impl AuthorizationOperation {
+    const COUNT: usize = 5;
+    const ALL: [(Self, &'static str); Self::COUNT] = [
+        (Self::Access, "access"),
+        (Self::Migrate, "migrate"),
+        (Self::Rename, "rename"),
+        (Self::Delete, "delete"),
+        (Self::DataInit, "data_init"),
+    ];
+}
+
+#[derive(Clone, Copy)]
+pub(crate) enum DatabaseOperation {
+    Request,
+    AdminSnapshot,
+}
+
+impl DatabaseOperation {
+    const COUNT: usize = 2;
+    const ALL: [(Self, &'static str); Self::COUNT] = [
+        (Self::Request, "request"),
+        (Self::AdminSnapshot, "admin_snapshot"),
+    ];
+}
+
+impl Metrics {
+    fn deny(&self, operation: AuthorizationOperation) {
+        self.authorization_denials[operation as usize].fetch_add(1, Ordering::Relaxed);
+    }
+
+    fn share_invite(&self, outcome: ShareInviteOutcome) {
+        self.share_invites[outcome as usize].fetch_add(1, Ordering::Relaxed);
+    }
+
+    fn database_deadline(&self, operation: DatabaseOperation) {
+        self.database_deadlines[operation as usize].fetch_add(1, Ordering::Relaxed);
+    }
+
+    fn observe_database_error(&self, operation: DatabaseOperation, error: &anyhow::Error) {
+        for cause in error.chain() {
+            let Some(sqlite) = cause.downcast_ref::<rusqlite::Error>() else {
+                continue;
+            };
+            match sqlite.sqlite_error_code() {
+                Some(rusqlite::ErrorCode::DatabaseBusy | rusqlite::ErrorCode::DatabaseLocked) => {
+                    self.database_busy[operation as usize].fetch_add(1, Ordering::Relaxed);
+                }
+                Some(rusqlite::ErrorCode::OperationInterrupted) => {
+                    self.database_deadline(operation);
+                }
+                _ => {}
+            }
+            break;
+        }
+    }
 }
 
 #[derive(Clone)]
@@ -99,6 +191,7 @@ struct Event {
     vault: String,
     text: String,
     invalidated: bool,
+    invalidated_session_hash: Option<String>,
 }
 #[derive(Clone)]
 pub struct AppState {
@@ -107,11 +200,13 @@ pub struct AppState {
     events: broadcast::Sender<Event>,
     commit_order: Arc<AsyncMutex<()>>,
     storage_reservations: Arc<StorageReservations>,
+    user_concurrency: Arc<UserConcurrency>,
     uploads: Arc<Semaphore>,
     connections: Arc<Semaphore>,
     auth_checks: Arc<Semaphore>,
     auth_waiters: Arc<Semaphore>,
     source_limits: Arc<StdMutex<SourceLimits>>,
+    share_invite_limits: Arc<StdMutex<ShareInviteLimits>>,
     control_body_readers: Arc<Semaphore>,
     control_requests: Arc<Semaphore>,
     db_workers: Arc<Semaphore>,
@@ -210,6 +305,90 @@ impl SourceLimits {
     }
 }
 
+struct ShareInviteAttempt {
+    source: IpAddr,
+    user_id: i64,
+    target_digest: [u8; 32],
+    at: Instant,
+}
+
+struct ShareInviteLimits {
+    secret: [u8; 32],
+    attempts: VecDeque<ShareInviteAttempt>,
+}
+
+impl ShareInviteLimits {
+    fn new() -> Self {
+        Self {
+            secret: rand::random(),
+            attempts: VecDeque::new(),
+        }
+    }
+
+    fn admit(
+        &mut self,
+        source: IpAddr,
+        user_id: i64,
+        canonical_target: &str,
+        config: &Config,
+        now: Instant,
+    ) -> bool {
+        while self
+            .attempts
+            .front()
+            .is_some_and(|attempt| now.duration_since(attempt.at) >= SHARE_INVITE_WINDOW)
+        {
+            self.attempts.pop_front();
+        }
+
+        let mut digest = Sha256::new();
+        digest.update(self.secret);
+        digest.update(canonical_target.as_bytes());
+        let target_digest: [u8; 32] = digest.finalize().into();
+        let source_attempts = self
+            .attempts
+            .iter()
+            .filter(|attempt| attempt.source == source)
+            .count();
+        let user_attempts = self
+            .attempts
+            .iter()
+            .filter(|attempt| attempt.user_id == user_id)
+            .count();
+        let known_user = user_attempts > 0;
+        let user_entries = self
+            .attempts
+            .iter()
+            .map(|attempt| attempt.user_id)
+            .collect::<std::collections::HashSet<_>>()
+            .len();
+        let distinct_targets = self
+            .attempts
+            .iter()
+            .filter(|attempt| attempt.user_id == user_id)
+            .map(|attempt| attempt.target_digest)
+            .collect::<std::collections::HashSet<_>>();
+        let adds_distinct_target = !distinct_targets.contains(&target_digest);
+
+        if self.attempts.len() >= config.share_invites_global
+            || source_attempts >= config.share_invites_per_source
+            || user_attempts >= config.share_invites_per_user
+            || (adds_distinct_target
+                && distinct_targets.len() >= config.share_invite_targets_per_user)
+            || (!known_user && user_entries >= MAX_SHARE_INVITE_USER_ENTRIES)
+        {
+            return false;
+        }
+        self.attempts.push_back(ShareInviteAttempt {
+            source,
+            user_id,
+            target_digest,
+            at: now,
+        });
+        true
+    }
+}
+
 struct SourceConnectionPermit {
     source: IpAddr,
     limits: Arc<StdMutex<SourceLimits>>,
@@ -230,7 +409,7 @@ pub async fn run(config: Config) -> Result<()> {
     let _database_lock = acquire_database_lock(&config.database_path)?;
     let _staging_lock = acquire_path_lock(&config.staging_dir, "staging")?;
     prepare_staging(&config.staging_dir)?;
-    let db = Db::open(&config.database_path)?;
+    let db = Db::open_existing(&config.database_path)?;
     let configured_host = config.public_data_host.clone();
     let mismatched_hosts = db
         .mismatched_data_hosts(&configured_host)
@@ -252,11 +431,13 @@ pub async fn run(config: Config) -> Result<()> {
         events,
         commit_order: Arc::new(AsyncMutex::new(())),
         storage_reservations: Arc::new(StorageReservations::default()),
+        user_concurrency: Arc::new(UserConcurrency::default()),
         uploads: Arc::new(Semaphore::new(max_uploads)),
         connections: Arc::new(Semaphore::new(max_connections)),
         auth_checks: Arc::new(Semaphore::new(auth::MAX_CONCURRENT_PASSWORD_CHECKS)),
         auth_waiters: Arc::new(Semaphore::new(MAX_SIGNIN_WAITERS)),
         source_limits: Arc::new(StdMutex::new(SourceLimits::default())),
+        share_invite_limits: Arc::new(StdMutex::new(ShareInviteLimits::new())),
         control_body_readers: Arc::new(Semaphore::new(MAX_CONTROL_BODY_READERS)),
         control_requests: Arc::new(Semaphore::new(MAX_CONTROL_REQUESTS)),
         db_workers: Arc::new(Semaphore::new(MAX_DB_WORKERS)),
@@ -347,6 +528,7 @@ fn control_router(state: AppState) -> Router {
     let mut r = Router::new();
     for path in [
         "/user/signin",
+        "/user/pow-challenge",
         "/user/signout",
         "/user/info",
         "/subscription/list",
@@ -478,7 +660,7 @@ async fn ready(State(s): State<AppState>) -> Response {
 }
 async fn metrics(State(s): State<AppState>) -> Response {
     let m = &s.metrics;
-    let body = format!(
+    let mut body = format!(
         "blackglass_control_requests_total {}\nblackglass_control_rejections_total {}\nblackglass_signins_total {}\nblackglass_auth_failures_total {}\nblackglass_ws_connections_total {}\nblackglass_uploads_total {}\nblackglass_upload_bytes_total {}\nblackglass_upload_timeouts_total {}\nblackglass_storage_quota_bytes {}\nblackglass_storage_quota_rejections_total {}\nblackglass_downloads_total {}\nblackglass_errors_total {}\nobsidian_sync_control_requests_total {}\nobsidian_sync_signins_total {}\nobsidian_sync_auth_failures_total {}\nobsidian_sync_ws_connections_total {}\nobsidian_sync_uploads_total {}\nobsidian_sync_upload_bytes_total {}\nobsidian_sync_downloads_total {}\nobsidian_sync_errors_total {}\n",
         m.control.load(Ordering::Relaxed),
         m.control_rejections.load(Ordering::Relaxed),
@@ -501,6 +683,25 @@ async fn metrics(State(s): State<AppState>) -> Response {
         m.downloads.load(Ordering::Relaxed),
         m.errors.load(Ordering::Relaxed)
     );
+    for (operation, label) in AuthorizationOperation::ALL {
+        body.push_str(&format!(
+            "blackglass_authorization_denials_total{{operation=\"{label}\",reason=\"not_authorized\"}} {}\n",
+            m.authorization_denials[operation as usize].load(Ordering::Relaxed)
+        ));
+    }
+    for (operation, label) in DatabaseOperation::ALL {
+        body.push_str(&format!(
+            "blackglass_sqlite_busy_total{{operation=\"{label}\"}} {}\nblackglass_sqlite_deadlines_total{{operation=\"{label}\"}} {}\n",
+            m.database_busy[operation as usize].load(Ordering::Relaxed),
+            m.database_deadlines[operation as usize].load(Ordering::Relaxed)
+        ));
+    }
+    for (outcome, label) in ShareInviteOutcome::ALL {
+        body.push_str(&format!(
+            "blackglass_share_invites_total{{outcome=\"{label}\"}} {}\n",
+            m.share_invites[outcome as usize].load(Ordering::Relaxed)
+        ));
+    }
     (
         [
             (header::CONTENT_TYPE, "text/plain; version=0.0.4"),
@@ -561,10 +762,11 @@ async fn control(
     let source = request_source(&s.config, peer, &headers);
     let result = match uri.path() {
         "/user/signin" => signin(&s, source, value).await,
-        "/user/signup" | "/user/forgetpass" | "/user/resendconfirmation" => {
-            Err(ADMIN_MANAGED_ACCOUNT_ERROR.into())
-        }
-        _ => authorized_control(&s, uri.path(), value).await,
+        "/user/pow-challenge"
+        | "/user/signup"
+        | "/user/forgetpass"
+        | "/user/resendconfirmation" => Err(ADMIN_MANAGED_ACCOUNT_ERROR.into()),
+        _ => authorized_control(&s, uri.path(), source, value).await,
     };
     match result {
         Ok(v) => api_for_origin(&s, v, StatusCode::OK, request_origin),
@@ -619,12 +821,24 @@ async fn signin(s: &AppState, source: IpAddr, v: Value) -> std::result::Result<V
         warn!(event = "signin_memory_capacity_reached");
         return Err("Try again later".into());
     };
-    let email_ok = req
+    let canonical_email = req
         .email
         .as_deref()
-        .is_some_and(|e| e.eq_ignore_ascii_case(&s.config.email));
+        .and_then(|email| auth::canonicalize_email(email).ok())
+        .map(|email| email.canonical);
+    let candidate = if let Some(canonical_email) = canonical_email {
+        db_task(s, move |db| db.signin_candidate(&canonical_email))
+            .await
+            .map_err(internal)?
+    } else {
+        None
+    };
     let password = req.password.unwrap_or_default();
-    let encoded = s.config.password_hash.clone();
+    let encoded = candidate
+        .as_ref()
+        .filter(|user| user.active)
+        .map(|user| user.password_hash.clone())
+        .unwrap_or_else(|| auth::DUMMY_PASSWORD_HASH.to_owned());
     let password_ok = tokio::task::spawn_blocking(move || {
         let valid = auth::verify_password(&password, &encoded);
         drop((permit, bulk_memory));
@@ -632,26 +846,28 @@ async fn signin(s: &AppState, source: IpAddr, v: Value) -> std::result::Result<V
     })
     .await
     .map_err(internal)?;
-    if !email_ok || !password_ok {
+    let Some(user) = candidate.filter(|user| user.active && password_ok) else {
         s.metrics.auth_failures.fetch_add(1, Ordering::Relaxed);
         warn!(event = "signin_failed");
         return Err("Invalid email or password".into());
-    }
+    };
     if let Ok(mut limits) = s.source_limits.lock() {
         limits.refund_successful_signin(source);
     }
     let ttl = s.config.session_ttl.as_secs() as i64;
-    let token = db_task(s, move |db| db.issue_session(ttl))
+    let user_id = user.id;
+    let token = db_task(s, move |db| db.issue_session_for_user(user_id, ttl))
         .await
         .map_err(internal)?;
     s.metrics.signins.fetch_add(1, Ordering::Relaxed);
     info!(event = "signin_succeeded");
-    Ok(json!({"email":s.config.email,"name":s.config.display_name,"license":null,"token":token}))
+    Ok(json!({"email":user.email,"name":user.name,"license":null,"token":token}))
 }
 
 async fn authorized_control(
     s: &AppState,
     path: &str,
+    source: IpAddr,
     v: Value,
 ) -> std::result::Result<Value, String> {
     let token = v
@@ -660,22 +876,31 @@ async fn authorized_control(
         .ok_or("Not logged in")?
         .to_owned();
     let validation_token = token.clone();
-    if !db_task(s, move |db| Ok(db.valid_session(&validation_token)))
+    let Some(auth_context) = db_task(s, move |db| db.auth_context(&validation_token))
         .await
         .map_err(internal)?
-    {
+    else {
         s.metrics.auth_failures.fetch_add(1, Ordering::Relaxed);
         return Err("Not logged in".into());
-    }
+    };
     match path {
         "/user/signout" => {
+            let invalidated_session_hash = auth_context.token_hash.clone();
             db_task(s, move |db| db.revoke_session(&token))
                 .await
                 .map_err(internal)?;
+            s.live_connections.cancel_session(&invalidated_session_hash);
+            let _ = s.events.send(Event {
+                uid: 0,
+                vault: String::new(),
+                text: String::new(),
+                invalidated: false,
+                invalidated_session_hash: Some(invalidated_session_hash),
+            });
             Ok(json!({}))
         }
         "/user/info" => {
-            Ok(json!({"email":s.config.email,"name":s.config.display_name,"license":null}))
+            Ok(json!({"email":auth_context.email,"name":auth_context.name,"license":null}))
         }
         "/subscription/list" => Ok(json!({"sync":true,"publish":false})),
         "/subscription/business" => {
@@ -696,24 +921,156 @@ async fn authorized_control(
             Ok(json!({"regions":[{"value":"selfhost","name":"Blackglass Server"}]}))
         }
         "/vault/list" => Ok(json!({
-            "vaults":db_task(s, |db| db.list_vaults()).await.map_err(internal)?,
-            "shared":[],
+            "vaults":db_task(s, move |db| db.list_vaults_for_user(auth_context.user_id)).await.map_err(internal)?,
+            "shared":shared_inventory(s, auth_context.user_id).await?,
             "limit":100
         })),
-        "/vault/create" => create_vault(s, v).await,
-        "/vault/access" => access_vault(s, v).await,
-        "/vault/migrate" => migrate_vault(s, v).await,
-        "/vault/rename" => rename_vault(s, v).await,
-        "/vault/delete" => delete_vault(s, v).await,
-        "/vault/share/list" => Ok(json!({"shares":[]})),
-        "/vault/share/invite" | "/vault/share/remove" => {
-            Err("Sharing is unavailable in single-user mode".into())
+        "/vault/create" => create_vault(s, auth_context.user_id, auth_context.token_hash, v).await,
+        "/vault/access" => access_vault(s, auth_context.user_id, auth_context.token_hash, v).await,
+        "/vault/migrate" => {
+            migrate_vault(s, auth_context.user_id, auth_context.token_hash, v).await
+        }
+        "/vault/rename" => rename_vault(s, auth_context.user_id, auth_context.token_hash, v).await,
+        "/vault/delete" => delete_vault(s, auth_context.user_id, auth_context.token_hash, v).await,
+        "/vault/share/list" => share_list(s, auth_context.user_id, v).await,
+        "/vault/share/invite" => {
+            share_invite(s, source, auth_context.user_id, auth_context.token_hash, v).await
+        }
+        "/vault/share/remove" => {
+            share_remove(s, auth_context.user_id, auth_context.token_hash, v).await
         }
         _ => Err("Not found".into()),
     }
 }
 
-async fn create_vault(s: &AppState, v: Value) -> std::result::Result<Value, String> {
+async fn shared_inventory(
+    s: &AppState,
+    user_id: i64,
+) -> std::result::Result<Vec<SharedVault>, String> {
+    let mut shared = db_task(s, move |db| db.list_shared_vaults_for_user(user_id))
+        .await
+        .map_err(internal)?;
+    shared.retain(|vault| s.config.sharing_allowed_for_owner(vault.owner_user_id));
+    Ok(shared)
+}
+
+async fn share_list(s: &AppState, user_id: i64, v: Value) -> std::result::Result<Value, String> {
+    if !s.config.sharing_allowed_for_owner(user_id) {
+        return Err("Sharing is unavailable".into());
+    }
+    let request: VaultShareListRequest =
+        serde_json::from_value(v).map_err(|_| "Unable to list collaborators".to_string())?;
+    let vault_id = request.vault_uid.ok_or("Unable to list collaborators")?;
+    let shares = db_task(s, move |db| db.list_shares_for_owner(user_id, &vault_id))
+        .await
+        .map_err(internal)?
+        .ok_or("Unable to list collaborators")?;
+    Ok(json!({"shares": shares}))
+}
+
+async fn share_invite(
+    s: &AppState,
+    source: IpAddr,
+    user_id: i64,
+    token_hash: String,
+    v: Value,
+) -> std::result::Result<Value, String> {
+    if !s.config.sharing_allowed_for_owner(user_id) {
+        return Err("Sharing is unavailable".into());
+    }
+    let request: VaultShareInviteRequest =
+        serde_json::from_value(v).map_err(|_| "Unable to invite collaborator".to_string())?;
+    let vault_id = request.vault_uid.ok_or("Unable to invite collaborator")?;
+    let email = request.email.ok_or("User unavailable for sharing")?;
+    let canonical =
+        auth::canonicalize_email(&email).map_err(|_| "User unavailable for sharing".to_string())?;
+    let admitted = s
+        .share_invite_limits
+        .lock()
+        .map_err(|_| "Share invitation rate limit reached".to_string())?
+        .admit(
+            source,
+            user_id,
+            &canonical.canonical,
+            &s.config,
+            Instant::now(),
+        );
+    if !admitted {
+        s.metrics.share_invite(ShareInviteOutcome::RateLimited);
+        return Err("Share invitation rate limit reached".into());
+    }
+    let result = db_task(s, move |db| {
+        db.invite_collaborator_for_session(user_id, &token_hash, &vault_id, &email)
+    })
+    .await;
+    match result {
+        Ok(item) => {
+            s.metrics.share_invite(ShareInviteOutcome::Success);
+            serde_json::to_value(item).map_err(internal)
+        }
+        Err(error) => {
+            let message = error.to_string();
+            if message.contains("sharing user unavailable") {
+                s.metrics.share_invite(ShareInviteOutcome::Unavailable);
+                Err("User unavailable for sharing".to_string())
+            } else if message.contains("collaborator limit reached") {
+                s.metrics.share_invite(ShareInviteOutcome::Capacity);
+                Err("Collaborator limit reached".to_string())
+            } else if message.contains("membership capacity reached")
+                || message.contains("membership sequence exhausted")
+            {
+                s.metrics.share_invite(ShareInviteOutcome::Capacity);
+                Err("Sharing capacity reached".to_string())
+            } else if message.contains("sharing vault unavailable") {
+                Err("Unable to invite collaborator".to_string())
+            } else {
+                Err(internal(error))
+            }
+        }
+    }
+}
+
+async fn share_remove(
+    s: &AppState,
+    user_id: i64,
+    token_hash: String,
+    v: Value,
+) -> std::result::Result<Value, String> {
+    let request: VaultShareRemoveRequest =
+        serde_json::from_value(v).map_err(|_| "Unable to remove collaborator".to_string())?;
+    let vault_id = request.vault_uid.ok_or("Unable to remove collaborator")?;
+    let owner_lookup = vault_id.clone();
+    let owner_user_id = db_task(s, move |db| db.vault_owner_user_id(&owner_lookup))
+        .await
+        .map_err(internal)?
+        .ok_or("Unable to remove collaborator")?;
+    if !s.config.sharing_allowed_for_owner(owner_user_id) {
+        return Err("Sharing is unavailable".into());
+    }
+    let share_uid = request
+        .share_uid
+        .filter(|uid| (1..=MAX_JS_SAFE_INTEGER).contains(uid))
+        .ok_or("Unable to remove collaborator")?;
+    let removed_vault_id = vault_id.clone();
+    let removed = db_task(s, move |db| {
+        db.remove_collaborator_for_session(user_id, &token_hash, &vault_id, share_uid)
+    })
+    .await
+    .map_err(internal)?;
+    if removed.is_none() {
+        return Err("Unable to remove collaborator".into());
+    }
+    s.live_connections
+        .cancel_user_vault(removed.expect("checked above"), &removed_vault_id);
+    Ok(json!({}))
+}
+
+async fn create_vault(
+    s: &AppState,
+    user_id: i64,
+    token_hash: String,
+    v: Value,
+) -> std::result::Result<Value, String> {
     let r: VaultCreate =
         serde_json::from_value(v).map_err(|_| "Invalid vault request".to_string())?;
     let name = r
@@ -745,7 +1102,11 @@ async fn create_vault(s: &AppState, v: Value) -> std::result::Result<Value, Stri
         password,
     };
     let stored = vault.clone();
-    if let Err(error) = db_task(s, move |db| db.create_vault(&stored)).await {
+    if let Err(error) = db_task(s, move |db| {
+        db.create_vault_for_session(user_id, &token_hash, &stored)
+    })
+    .await
+    {
         if error.to_string().contains("vault limit reached") {
             return Err("Vault limit reached".into());
         }
@@ -753,15 +1114,34 @@ async fn create_vault(s: &AppState, v: Value) -> std::result::Result<Value, Stri
     }
     serde_json::to_value(vault).map_err(internal)
 }
-async fn access_vault(s: &AppState, v: Value) -> std::result::Result<Value, String> {
-    let r: VaultAccess =
+async fn access_vault(
+    s: &AppState,
+    user_id: i64,
+    token_hash: String,
+    v: Value,
+) -> std::result::Result<Value, String> {
+    let r: VaultAccessRequest =
         serde_json::from_value(v).map_err(|_| "Unable to access vault".to_string())?;
     let id = r.vault_uid.ok_or("Unable to access vault")?;
     let lookup_id = id.clone();
-    let mut vault = db_task(s, move |db| db.find_vault(&lookup_id))
-        .await
-        .map_err(internal)?
-        .ok_or("Unable to access vault")?;
+    let Some((mut vault, access)) =
+        db_task(s, move |db| db.find_authorized_vault(user_id, &lookup_id))
+            .await
+            .map_err(internal)?
+    else {
+        s.metrics.deny(AuthorizationOperation::Access);
+        return Err("Unable to access vault".into());
+    };
+    if matches!(access, crate::model::VaultAccess::Collaborator { .. }) {
+        let owner_lookup = id.clone();
+        let owner_user_id = db_task(s, move |db| db.vault_owner_user_id(&owner_lookup))
+            .await
+            .map_err(internal)?
+            .ok_or("Unable to access vault")?;
+        if !s.config.sharing_allowed_for_owner(owner_user_id) {
+            return Err("Sharing is unavailable".into());
+        }
+    }
     if r.host.as_deref() != Some(&vault.host)
         || r.encryption_version != Some(vault.encryption_version)
     {
@@ -775,16 +1155,23 @@ async fn access_vault(s: &AppState, v: Value) -> std::result::Result<Value, Stri
             .ok_or("Unable to access vault")?;
         let bind_id = vault.id.clone();
         let requested = requested.to_owned();
-        vault.keyhash = db_task(s, move |db| db.bind_managed_keyhash(&bind_id, &requested))
-            .await
-            .map_err(internal)?;
+        vault.keyhash = db_task(s, move |db| {
+            db.bind_managed_keyhash_for_session(user_id, &token_hash, &bind_id, &requested)
+        })
+        .await
+        .map_err(internal)?;
     }
     if r.keyhash != vault.keyhash {
         return Err("Unable to access vault".into());
     }
     Ok(json!({}))
 }
-async fn migrate_vault(s: &AppState, v: Value) -> std::result::Result<Value, String> {
+async fn migrate_vault(
+    s: &AppState,
+    user_id: i64,
+    token_hash: String,
+    v: Value,
+) -> std::result::Result<Value, String> {
     let r: VaultMigrate =
         serde_json::from_value(v).map_err(|_| "Unable to migrate vault".to_string())?;
     let source_id = r.vault_uid.ok_or("Unable to migrate vault")?;
@@ -798,10 +1185,13 @@ async fn migrate_vault(s: &AppState, v: Value) -> std::result::Result<Value, Str
     } = vault_credentials(r.keyhash, r.salt)?;
     let _commit = s.commit_order.lock().await;
     let lookup_id = source_id.clone();
-    let source = db_task(s, move |db| db.find_vault(&lookup_id))
+    let Some(source) = db_task(s, move |db| db.find_owned_vault(user_id, &lookup_id))
         .await
         .map_err(internal)?
-        .ok_or("Unable to migrate vault")?;
+    else {
+        s.metrics.deny(AuthorizationOperation::Migrate);
+        return Err("Unable to migrate vault".into());
+    };
     if source.encryption_version >= 3 {
         return Err("Vault already uses encryption version 3".into());
     }
@@ -819,16 +1209,24 @@ async fn migrate_vault(s: &AppState, v: Value) -> std::result::Result<Value, Str
     };
     let stored = replacement.clone();
     let migrate_source_id = source_id.clone();
-    if !db_task(s, move |db| db.migrate_vault(&migrate_source_id, &stored))
-        .await
-        .map_err(internal)?
+    if !db_task(s, move |db| {
+        db.migrate_vault_for_session(user_id, &token_hash, &migrate_source_id, &stored)
+    })
+    .await
+    .map_err(internal)?
     {
+        s.metrics.deny(AuthorizationOperation::Migrate);
         return Err("Unable to migrate vault".into());
     }
     invalidate_vault(s, source_id);
     serde_json::to_value(replacement).map_err(internal)
 }
-async fn rename_vault(s: &AppState, v: Value) -> std::result::Result<Value, String> {
+async fn rename_vault(
+    s: &AppState,
+    user_id: i64,
+    token_hash: String,
+    v: Value,
+) -> std::result::Result<Value, String> {
     let r: VaultRename =
         serde_json::from_value(v).map_err(|_| "Unable to rename vault".to_string())?;
     let id = r.vault_uid.ok_or("Unable to rename vault")?;
@@ -840,24 +1238,35 @@ async fn rename_vault(s: &AppState, v: Value) -> std::result::Result<Value, Stri
         .ok_or("Unable to rename vault")?
         .to_owned();
     let _commit = s.commit_order.lock().await;
-    if !db_task(s, move |db| db.rename_vault(&id, &name))
-        .await
-        .map_err(internal)?
+    if !db_task(s, move |db| {
+        db.rename_vault_for_session(user_id, &token_hash, &id, &name)
+    })
+    .await
+    .map_err(internal)?
     {
+        s.metrics.deny(AuthorizationOperation::Rename);
         return Err("Unable to rename vault".into());
     }
     Ok(json!({}))
 }
-async fn delete_vault(s: &AppState, v: Value) -> std::result::Result<Value, String> {
+async fn delete_vault(
+    s: &AppState,
+    user_id: i64,
+    token_hash: String,
+    v: Value,
+) -> std::result::Result<Value, String> {
     let r: VaultDelete =
         serde_json::from_value(v).map_err(|_| "Unable to delete vault".to_string())?;
     let id = r.vault_uid.unwrap_or_default();
     let _commit = s.commit_order.lock().await;
     let delete_id = id.clone();
-    if !db_task(s, move |db| db.delete_vault(&delete_id))
-        .await
-        .map_err(internal)?
+    if !db_task(s, move |db| {
+        db.delete_vault_for_session(user_id, &token_hash, &delete_id)
+    })
+    .await
+    .map_err(internal)?
     {
+        s.metrics.deny(AuthorizationOperation::Delete);
         return Err("Unable to delete vault".into());
     }
     invalidate_vault(s, id);
@@ -900,11 +1309,13 @@ fn vault_credentials(
 }
 
 fn invalidate_vault(s: &AppState, vault: String) {
+    s.live_connections.cancel_vault(&vault);
     let _ = s.events.send(Event {
         uid: 0,
         vault,
         text: String::new(),
         invalidated: true,
+        invalidated_session_hash: None,
     });
 }
 
@@ -944,70 +1355,163 @@ async fn upgrade(
 struct Session {
     authenticated: bool,
     token_hash: Option<String>,
+    user_id: Option<i64>,
+    expires_at: Option<i64>,
     vault: Option<String>,
+    vault_owner_user_id: Option<i64>,
     device: String,
     pending: Option<Pending>,
     live: Option<crate::admin::LiveGuard>,
+    cancellation: Option<watch::Receiver<bool>>,
+    _user_connection_permit: Option<UserConcurrencyPermit>,
 }
 
 #[derive(Default)]
 struct StorageReservations {
-    bytes: AtomicI64,
+    state: StdMutex<StorageReservationState>,
+}
+
+#[derive(Default)]
+struct StorageReservationState {
+    global_bytes: i64,
+    owner_bytes: HashMap<i64, i64>,
 }
 
 impl StorageReservations {
     fn reserved(&self) -> i64 {
-        self.bytes.load(Ordering::Acquire)
+        self.state.lock().map_or(0, |state| state.global_bytes)
+    }
+
+    fn reserved_for_owner(&self, user_id: i64) -> i64 {
+        self.state
+            .lock()
+            .ok()
+            .and_then(|state| state.owner_bytes.get(&user_id).copied())
+            .unwrap_or(0)
     }
 
     fn try_reserve(
         self: &Arc<Self>,
-        committed: i64,
+        committed_global: i64,
+        committed_owner: i64,
+        owner_user_id: i64,
         additional: i64,
-        limit: i64,
+        global_limit: i64,
+        owner_limit: i64,
     ) -> Option<StorageReservation> {
-        if committed < 0 || additional <= 0 || limit <= 0 {
+        if committed_global < 0
+            || committed_owner < 0
+            || additional <= 0
+            || global_limit <= 0
+            || owner_limit <= 0
+        {
             return None;
         }
-        let mut reserved = self.bytes.load(Ordering::Acquire);
-        loop {
-            if committed > limit || reserved > limit - committed {
-                return None;
-            }
-            let available = limit - committed - reserved;
-            if additional > available {
-                return None;
-            }
-            match self.bytes.compare_exchange_weak(
-                reserved,
-                reserved + additional,
-                Ordering::AcqRel,
-                Ordering::Acquire,
-            ) {
-                Ok(_) => {
-                    return Some(StorageReservation {
-                        bytes: additional,
-                        reservations: self.clone(),
-                    });
-                }
-                Err(actual) => reserved = actual,
-            }
+        let mut state = self.state.lock().ok()?;
+        let owner_reserved = state.owner_bytes.get(&owner_user_id).copied().unwrap_or(0);
+        if committed_global > global_limit
+            || state.global_bytes > global_limit - committed_global
+            || additional > global_limit - committed_global - state.global_bytes
+            || committed_owner > owner_limit
+            || owner_reserved > owner_limit - committed_owner
+            || additional > owner_limit - committed_owner - owner_reserved
+        {
+            return None;
         }
+        state.global_bytes += additional;
+        *state.owner_bytes.entry(owner_user_id).or_default() += additional;
+        Some(StorageReservation {
+            owner_user_id,
+            bytes: additional,
+            reservations: self.clone(),
+        })
     }
 }
 
 struct StorageReservation {
+    owner_user_id: i64,
     bytes: i64,
     reservations: Arc<StorageReservations>,
 }
 
 impl Drop for StorageReservation {
     fn drop(&mut self) {
-        let previous = self
-            .reservations
-            .bytes
-            .fetch_sub(self.bytes, Ordering::AcqRel);
-        debug_assert!(previous >= self.bytes);
+        if let Ok(mut state) = self.reservations.state.lock() {
+            debug_assert!(state.global_bytes >= self.bytes);
+            state.global_bytes = state.global_bytes.saturating_sub(self.bytes);
+            if let Some(owner_bytes) = state.owner_bytes.get_mut(&self.owner_user_id) {
+                debug_assert!(*owner_bytes >= self.bytes);
+                *owner_bytes = owner_bytes.saturating_sub(self.bytes);
+                if *owner_bytes == 0 {
+                    state.owner_bytes.remove(&self.owner_user_id);
+                }
+            }
+        }
+    }
+}
+
+#[derive(Default)]
+struct UserConcurrency {
+    entries: StdMutex<HashMap<i64, UserConcurrencyEntry>>,
+}
+
+#[derive(Default)]
+struct UserConcurrencyEntry {
+    connections: usize,
+    uploads: usize,
+}
+
+#[derive(Clone, Copy)]
+enum UserConcurrencyKind {
+    Connection,
+    Upload,
+}
+
+impl UserConcurrency {
+    fn try_acquire(
+        self: &Arc<Self>,
+        user_id: i64,
+        kind: UserConcurrencyKind,
+        limit: usize,
+    ) -> Option<UserConcurrencyPermit> {
+        let mut entries = self.entries.lock().ok()?;
+        let entry = entries.entry(user_id).or_default();
+        let count = match kind {
+            UserConcurrencyKind::Connection => &mut entry.connections,
+            UserConcurrencyKind::Upload => &mut entry.uploads,
+        };
+        if *count >= limit {
+            return None;
+        }
+        *count += 1;
+        Some(UserConcurrencyPermit {
+            user_id,
+            kind,
+            limits: self.clone(),
+        })
+    }
+}
+
+struct UserConcurrencyPermit {
+    user_id: i64,
+    kind: UserConcurrencyKind,
+    limits: Arc<UserConcurrency>,
+}
+
+impl Drop for UserConcurrencyPermit {
+    fn drop(&mut self) {
+        if let Ok(mut entries) = self.limits.entries.lock()
+            && let Some(entry) = entries.get_mut(&self.user_id)
+        {
+            let count = match self.kind {
+                UserConcurrencyKind::Connection => &mut entry.connections,
+                UserConcurrencyKind::Upload => &mut entry.uploads,
+            };
+            *count = count.saturating_sub(1);
+            if entry.connections == 0 && entry.uploads == 0 {
+                entries.remove(&self.user_id);
+            }
+        }
     }
 }
 
@@ -1020,6 +1524,7 @@ struct Pending {
     idle_deadline: TokioInstant,
     _storage_reservation: StorageReservation,
     _permit: tokio::sync::OwnedSemaphorePermit,
+    _user_upload_permit: UserConcurrencyPermit,
 }
 
 async fn socket_loop(
@@ -1035,10 +1540,15 @@ async fn socket_loop(
     let mut session = Session {
         authenticated: false,
         token_hash: None,
+        user_id: None,
+        expires_at: None,
         vault: None,
+        vault_owner_user_id: None,
         device: "Unknown device".into(),
         pending: None,
         live: None,
+        cancellation: None,
+        _user_connection_permit: None,
     };
     let mut source_permit = Some(source_permit);
     let authentication_deadline = tokio::time::sleep(AUTHENTICATION_DEADLINE);
@@ -1046,6 +1556,7 @@ async fn socket_loop(
     let mut session_revalidation = interval(SESSION_REVALIDATE_INTERVAL);
     session_revalidation.set_missed_tick_behavior(MissedTickBehavior::Skip);
     loop {
+        let cancellation = session.cancellation.clone();
         let pending_upload_deadline = session
             .pending
             .as_ref()
@@ -1066,6 +1577,13 @@ async fn socket_loop(
                 let _ = socket_send(&mut tx, Message::Close(Some(CloseFrame {
                     code: 1008,
                     reason: "Authentication deadline exceeded".into(),
+                }))).await;
+                break
+            },
+            _ = wait_for_cancellation(cancellation), if session.cancellation.is_some() => {
+                let _ = socket_send(&mut tx, Message::Close(Some(CloseFrame {
+                    code: 1008,
+                    reason: "Authorization revoked".into(),
                 }))).await;
                 break
             },
@@ -1114,6 +1632,13 @@ async fn socket_loop(
                 _ => break,
             },
             event = events.recv() => match event {
+                Ok(event) if event.invalidated_session_hash.as_deref() == session.token_hash.as_deref() => {
+                    let _ = socket_send(&mut tx, Message::Close(Some(CloseFrame {
+                        code: 1008,
+                        reason: "Session revoked".into(),
+                    }))).await;
+                    break
+                },
                 Ok(event) if session.vault.as_deref() == Some(&event.vault) && event.invalidated => {
                     let _ = socket_send(&mut tx, Message::Close(Some(CloseFrame {
                         code: 1008,
@@ -1218,12 +1743,26 @@ async fn handle_message(
                 "size" => {
                     let vault = session.vault.clone().unwrap();
                     let (size, vault_size) = db_task(s, move |db| {
-                        Ok((db.stored_ciphertext_size()?, db.vault_size(&vault)?))
+                        Ok((
+                            db.stored_ciphertext_size_for_vault_owner(&vault)?
+                                .context("authorized vault has no owner")?,
+                            db.vault_size(&vault)?,
+                        ))
                     })
                     .await?;
-                    send(tx,json!({"res":"ok","size":size,"limit":s.config.storage_quota_bytes,"vault_size":vault_size})).await?
+                    if !session_active(s, session).await {
+                        return close(tx, 1008, "Authorization revoked").await;
+                    }
+                    send(tx,json!({"res":"ok","size":size,"limit":s.config.storage_quota_bytes_per_owner,"vault_size":vault_size})).await?
                 }
-                "usernames" => send(tx, json!({"1":s.config.display_name})).await?,
+                "usernames" => {
+                    let vault = session.vault.clone().unwrap();
+                    let usernames = db_task(s, move |db| db.usernames_for_vault(&vault)).await?;
+                    if !session_active(s, session).await {
+                        return close(tx, 1008, "Authorization revoked").await;
+                    }
+                    send(tx, serde_json::to_value(usernames)?).await?
+                }
                 "push" => begin_push(s, session, events, tx, v).await?,
                 "pull" => pull(s, session, tx, v).await?,
                 "deleted" => deleted(s, session, tx, v).await?,
@@ -1231,8 +1770,18 @@ async fn handle_message(
                 "restore" => restore(s, session, events, tx, v).await?,
                 "purge" => {
                     let vault = session.vault.clone().unwrap();
+                    let user_id = session
+                        .user_id
+                        .context("authenticated session has no user ID")?;
+                    let token_hash = session
+                        .token_hash
+                        .clone()
+                        .context("authenticated session has no token hash")?;
                     let _commit = s.commit_order.lock().await;
-                    db_task(s, move |db| db.purge(&vault)).await?;
+                    db_task(s, move |db| {
+                        db.purge_for_session(user_id, &token_hash, &vault)
+                    })
+                    .await?;
                     drop(_commit);
                     send(tx, json!({"res":"ok"})).await?
                 }
@@ -1305,22 +1854,42 @@ async fn init(
             .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte));
     let keyhash = v.get("keyhash").and_then(Value::as_str).map(str::to_owned);
     let enc = v.get("encryption_version").and_then(Value::as_i64);
-    let (vault, valid_session, retired_vault) = db_task(s, move |db| {
-        Ok((
-            db.find_vault(&lookup_id)?,
-            token_has_session_shape && db.valid_session_hash(&validation_hash),
-            db.is_retired_vault(&lookup_id)?,
-        ))
+    let (auth_context, vault, access, owner_user_id, retired_vault) = db_task(s, move |db| {
+        let auth_context = token_has_session_shape
+            .then(|| db.auth_context_hash(&validation_hash))
+            .transpose()?
+            .flatten();
+        let Some(auth_context) = auth_context else {
+            return Ok((None, None, None, None, false));
+        };
+        let authorized = db.find_authorized_vault(auth_context.user_id, &lookup_id)?;
+        let (vault, access) = match authorized {
+            Some((vault, access)) => (Some(vault), Some(access)),
+            None => (None, None),
+        };
+        let owner_user_id = db.vault_owner_user_id(&lookup_id)?;
+        let retired = db.is_retired_vault_for_user(auth_context.user_id, &lookup_id)?;
+        Ok((Some(auth_context), vault, access, owner_user_id, retired))
     })
     .await?;
+    let valid_session = auth_context.is_some();
     let Some(vault) = vault else {
         if valid_session || (token_has_session_shape && retired_vault) {
+            if valid_session {
+                s.metrics.deny(AuthorizationOperation::DataInit);
+            }
             send(tx, json!({"res":"err","msg":"Vault not found"})).await?;
             return close(tx, 1008, "Vault not found").await;
         }
         send(tx, json!({"res":"err","msg":"Unable to authenticate"})).await?;
         return Ok(());
     };
+    if matches!(access, Some(crate::model::VaultAccess::Collaborator { .. }))
+        && !owner_user_id.is_some_and(|owner| s.config.sharing_allowed_for_owner(owner))
+    {
+        send(tx, json!({"res":"err","msg":"Vault not found"})).await?;
+        return close(tx, 1008, "Vault not found").await;
+    }
     if !valid_session
         || keyhash.as_deref() != vault.keyhash.as_deref()
         || enc != Some(vault.encryption_version)
@@ -1339,9 +1908,26 @@ async fn init(
             }
         },
     };
+    let auth_context = auth_context.unwrap();
+    let Some(user_connection_permit) = s.user_concurrency.try_acquire(
+        auth_context.user_id,
+        UserConcurrencyKind::Connection,
+        s.config.max_ws_connections_per_user,
+    ) else {
+        send(
+            tx,
+            json!({"res":"err","msg":"Account connection capacity reached; retry shortly"}),
+        )
+        .await?;
+        return close(tx, 1013, "Account connection capacity reached").await;
+    };
     session.authenticated = true;
-    session.token_hash = Some(token_hash);
+    session.token_hash = Some(auth_context.token_hash.clone());
+    session.user_id = Some(auth_context.user_id);
+    session.expires_at = Some(auth_context.expires_at);
+    session._user_connection_permit = Some(user_connection_permit);
     session.vault = Some(vault.id.clone());
+    session.vault_owner_user_id = owner_user_id;
     session.device = bounded(
         v.get("device")
             .and_then(Value::as_str)
@@ -1350,9 +1936,14 @@ async fn init(
     )
     .unwrap_or("Unknown device")
     .into();
-    session.live = s
-        .live_connections
-        .register(&vault.id, &session.device, version);
+    session.live = s.live_connections.register(
+        auth_context.user_id,
+        &auth_context.token_hash,
+        &vault.id,
+        &session.device,
+        version,
+    );
+    session.cancellation = session.live.as_ref().map(|live| live.cancellation());
     let initial = v.get("initial").and_then(Value::as_bool).unwrap_or(false);
     let ready_version = {
         // Establish the replay/live boundary while commits are serialized. Replacing
@@ -1374,7 +1965,7 @@ async fn init(
     }
     send(
         tx,
-        json!({"res":"ok","userId":1,"perFileMax":s.config.per_file_max}),
+        json!({"res":"ok","userId":auth_context.user_id,"perFileMax":s.config.per_file_max}),
     )
     .await?;
     let mut cursor = if initial { 0 } else { version };
@@ -1402,6 +1993,9 @@ async fn init(
             if shutting_down(s) {
                 return Ok(());
             }
+            if !session_active(s, session).await {
+                return close(tx, 1008, "Authorization revoked").await;
+            }
             cursor = revision.uid;
             // Retain at most a small, explicitly bounded DB page per client,
             // then admit each wire item separately. A trickle reader releases
@@ -1416,6 +2010,9 @@ async fn init(
         if page_len < REPLAY_PAGE_SIZE as usize {
             break;
         }
+    }
+    if !session_active(s, session).await {
+        return close(tx, 1008, "Authorization revoked").await;
     }
     send(tx, json!({"op":"ready","version":ready_version})).await?;
     if let Some(live) = &session.live {
@@ -1481,7 +2078,9 @@ async fn begin_push(
         size,
         pieces,
         device: session.device.clone(),
-        user_id: 1,
+        user_id: session
+            .user_id
+            .context("authenticated session has no user ID")?,
     };
     if serialized_notice_size(&revision)? > MAX_EVENT_BYTES {
         send(tx, json!({"err":"Push metadata is too large"})).await?;
@@ -1491,8 +2090,18 @@ async fn begin_push(
         let notice = {
             let _commit = s.commit_order.lock().await;
             let storage_quota_bytes = s.config.storage_quota_bytes;
+            let owner_storage_quota_bytes = s.config.storage_quota_bytes_per_owner;
+            let token_hash = session
+                .token_hash
+                .clone()
+                .context("authenticated session has no token hash")?;
             let stored = match db_task(s, move |db| {
-                db.add_empty_revision(&revision, storage_quota_bytes)
+                db.add_empty_revision_for_session(
+                    &revision,
+                    &token_hash,
+                    storage_quota_bytes,
+                    owner_storage_quota_bytes,
+                )
             })
             .await
             {
@@ -1520,14 +2129,44 @@ async fn begin_push(
             return Ok(());
         }
     };
+    let user_id = revision.user_id;
+    let owner_user_id = session
+        .vault_owner_user_id
+        .context("authorized vault has no owner")?;
+    let Some(user_upload_permit) = s.user_concurrency.try_acquire(
+        user_id,
+        UserConcurrencyKind::Upload,
+        s.config.max_concurrent_uploads_per_user,
+    ) else {
+        drop(permit);
+        send(
+            tx,
+            json!({"err":"Account upload capacity reached; retry shortly"}),
+        )
+        .await?;
+        return Ok(());
+    };
     let storage_reservation = {
         let _commit = s.commit_order.lock().await;
-        let committed = db_task(s, |db| db.stored_ciphertext_size()).await?;
-        s.storage_reservations
-            .try_reserve(committed, revision.size, s.config.storage_quota_bytes)
+        let (committed_global, committed_owner) = db_task(s, move |db| {
+            Ok((
+                db.stored_ciphertext_size()?,
+                db.stored_ciphertext_size_for_owner(owner_user_id)?,
+            ))
+        })
+        .await?;
+        s.storage_reservations.try_reserve(
+            committed_global,
+            committed_owner,
+            owner_user_id,
+            revision.size,
+            s.config.storage_quota_bytes,
+            s.config.storage_quota_bytes_per_owner,
+        )
     };
     let Some(storage_reservation) = storage_reservation else {
         drop(permit);
+        drop(user_upload_permit);
         reject_storage_quota(s, tx).await?;
         return Ok(());
     };
@@ -1545,6 +2184,7 @@ async fn begin_push(
         idle_deadline: TokioInstant::now() + s.config.upload_idle_timeout,
         _storage_reservation: storage_reservation,
         _permit: permit,
+        _user_upload_permit: user_upload_permit,
     });
     send(tx, json!({"res":"next"})).await?;
     Ok(())
@@ -1585,16 +2225,27 @@ async fn upload_chunk(
         return close(tx, 1008, "Upload size does not match metadata").await;
     }
     p.file.sync_all().await?;
+    let token_hash = session
+        .token_hash
+        .clone()
+        .context("authenticated session has no token hash")?;
     let pending = session.pending.take().unwrap();
     drop(pending.file);
     let revision = pending.revision.clone();
     let path = pending.path.clone();
     let storage_reservation = pending._storage_reservation;
     let storage_quota_bytes = s.config.storage_quota_bytes;
+    let owner_storage_quota_bytes = s.config.storage_quota_bytes_per_owner;
     let commit_result = {
         let _commit = s.commit_order.lock().await;
         let result = db_task(s, move |db| {
-            db.add_file_revision(&revision, &path, storage_quota_bytes)
+            db.add_file_revision_for_session(
+                &revision,
+                &token_hash,
+                &path,
+                storage_quota_bytes,
+                owner_storage_quota_bytes,
+            )
         })
         .await
         .and_then(|stored| {
@@ -1656,6 +2307,9 @@ async fn pull(
         send(tx, json!({"err":"Revision not found"})).await?;
         return Ok(());
     }
+    if !session_active(s, session).await {
+        return close(tx, 1008, "Authorization revoked").await;
+    }
     if info.deleted || info.folder || !info.has_content {
         send(
             tx,
@@ -1694,6 +2348,9 @@ async fn pull(
         }
         let len = (info.size - offset).min(PIECE_SIZE);
         let chunk = db_task(s, move |db| db.content_chunk(uid, offset, len)).await?;
+        if !session_active(s, session).await {
+            return close(tx, 1008, "Authorization revoked").await;
+        }
         socket_send(tx, Message::Binary(chunk.into())).await?;
         offset += len
     }
@@ -1777,6 +2434,9 @@ async fn history(
         .take(100)
         .map(notice_item)
         .collect::<Vec<_>>();
+    if !session_active(s, session).await {
+        return close(tx, 1008, "Authorization revoked").await;
+    }
     if !send_with_limit(
         tx,
         json!({"items":items,"more":more}),
@@ -1853,6 +2513,9 @@ async fn deleted(
     }
     response.extend_from_slice(b"]}");
     drop(_commit);
+    if !session_active(s, session).await {
+        return close(tx, 1008, "Authorization revoked").await;
+    }
     let response = String::from_utf8(response).context("serialize deleted response")?;
     socket_send(tx, Message::Text(response.into())).await?;
     Ok(())
@@ -1872,11 +2535,31 @@ async fn restore(
         let _commit = s.commit_order.lock().await;
         let vault = session.vault.clone().unwrap();
         let device = session.device.clone();
+        let user_id = session
+            .user_id
+            .context("authenticated session has no user ID")?;
+        let token_hash = session
+            .token_hash
+            .clone()
+            .context("authenticated session has no token hash")?;
         let storage_quota_bytes = s.config.storage_quota_bytes;
-        let reserved = s.storage_reservations.reserved();
-        let restore_quota_bytes = storage_quota_bytes.saturating_sub(reserved);
+        let owner_storage_quota_bytes = s.config.storage_quota_bytes_per_owner;
+        let reserved_global = s.storage_reservations.reserved();
+        let owner_user_id = session
+            .vault_owner_user_id
+            .context("authorized vault has no owner")?;
+        let reserved_owner = s.storage_reservations.reserved_for_owner(owner_user_id);
+        let restore_global_quota_bytes = storage_quota_bytes.saturating_sub(reserved_global);
+        let restore_owner_quota_bytes = owner_storage_quota_bytes.saturating_sub(reserved_owner);
         match db_task(s, move |db| {
-            db.restore(&vault, uid, &device, restore_quota_bytes)
+            db.restore_for_session(
+                user_id,
+                &token_hash,
+                &vault,
+                uid,
+                &device,
+                (restore_global_quota_bytes, restore_owner_quota_bytes),
+            )
         })
         .await
         {
@@ -1919,6 +2602,7 @@ fn publish_committed(s: &AppState, r: Revision) -> Result<Event> {
         vault,
         text,
         invalidated: false,
+        invalidated_session_hash: None,
     };
     let _ = s.events.send(event.clone());
     Ok(event)
@@ -2150,12 +2834,19 @@ where
     T: Send + 'static,
     F: FnOnce(Db) -> Result<T> + Send + 'static,
 {
-    let permit = state
-        .db_workers
-        .clone()
-        .acquire_owned()
-        .await
-        .context("database worker pool stopped")?;
+    let permit = match timeout(
+        DB_WORKER_QUEUE_DEADLINE,
+        state.db_workers.clone().acquire_owned(),
+    )
+    .await
+    {
+        Ok(Ok(permit)) => permit,
+        Ok(Err(_)) => return Err(anyhow::anyhow!("database worker pool stopped")),
+        Err(_) => {
+            state.metrics.database_deadline(DatabaseOperation::Request);
+            return Err(anyhow::anyhow!("database worker deadline exceeded"));
+        }
+    };
     spawn_db_task(state, permit, operation).await
 }
 
@@ -2182,15 +2873,35 @@ where
     F: FnOnce(Db) -> Result<T> + Send + 'static,
 {
     let database = state.db.clone();
-    tokio::task::spawn_blocking(move || {
+    let result = tokio::task::spawn_blocking(move || {
         let _permit = permit;
         operation(database)
     })
     .await
-    .context("database worker stopped")?
+    .context("database worker stopped")?;
+    if let Err(error) = &result {
+        state
+            .metrics
+            .observe_database_error(DatabaseOperation::Request, error);
+    }
+    result
+}
+
+pub(crate) fn observe_database_error(
+    state: &AppState,
+    operation: DatabaseOperation,
+    error: &anyhow::Error,
+) {
+    state.metrics.observe_database_error(operation, error);
 }
 
 async fn session_active(s: &AppState, session: &Session) -> bool {
+    if session
+        .expires_at
+        .is_none_or(|expires_at| expires_at <= now_ms())
+    {
+        return false;
+    }
     let Some(token_hash) = session.token_hash.clone() else {
         return false;
     };
@@ -2212,6 +2923,20 @@ async fn wait_for_shutdown(shutdown: &mut watch::Receiver<bool>) {
             return;
         }
         if shutdown.changed().await.is_err() {
+            return;
+        }
+    }
+}
+async fn wait_for_cancellation(cancellation: Option<watch::Receiver<bool>>) {
+    let Some(mut cancellation) = cancellation else {
+        std::future::pending::<()>().await;
+        return;
+    };
+    loop {
+        if *cancellation.borrow_and_update() {
+            return;
+        }
+        if cancellation.changed().await.is_err() {
             return;
         }
     }
@@ -2507,6 +3232,42 @@ mod tests {
     use sha2::{Digest, Sha256};
     use tower::ServiceExt;
 
+    #[test]
+    fn share_invite_limits_are_bounded_keyed_and_uniform() {
+        let directory = tempfile::tempdir().unwrap();
+        let mut config = Config::test(directory.path(), 3000, 3003).unwrap();
+        config.share_invites_per_source = 3;
+        config.share_invites_per_user = 3;
+        config.share_invite_targets_per_user = 1;
+        config.share_invites_global = 3;
+        let source: IpAddr = "192.0.2.1".parse().unwrap();
+        let now = Instant::now();
+        let mut limits = ShareInviteLimits::new();
+
+        assert!(limits.admit(source, 1, "first@example.test", &config, now));
+        assert!(limits.admit(source, 1, "first@example.test", &config, now));
+        assert!(!limits.admit(source, 1, "second@example.test", &config, now));
+        assert_eq!(limits.attempts.len(), 2);
+        let unkeyed: [u8; 32] = Sha256::digest(b"first@example.test").into();
+        assert!(
+            limits
+                .attempts
+                .iter()
+                .all(|attempt| attempt.target_digest != unkeyed)
+        );
+
+        config.share_invite_targets_per_user = 3;
+        assert!(limits.admit(source, 1, "second@example.test", &config, now));
+        assert!(!limits.admit(
+            "192.0.2.2".parse().unwrap(),
+            2,
+            "third@example.test",
+            &config,
+            now
+        ));
+        assert_eq!(limits.attempts.len(), config.share_invites_global);
+    }
+
     fn admin_test_state(
         directory: &std::path::Path,
         admin_port: u16,
@@ -2531,11 +3292,13 @@ mod tests {
                 events: broadcast::channel(EVENT_CAPACITY).0,
                 commit_order: Arc::new(AsyncMutex::new(())),
                 storage_reservations: Arc::new(StorageReservations::default()),
+                user_concurrency: Arc::new(UserConcurrency::default()),
                 uploads: Arc::new(Semaphore::new(max_uploads)),
                 connections: Arc::new(Semaphore::new(max_connections)),
                 auth_checks: Arc::new(Semaphore::new(auth::MAX_CONCURRENT_PASSWORD_CHECKS)),
                 auth_waiters: Arc::new(Semaphore::new(MAX_SIGNIN_WAITERS)),
                 source_limits: Arc::new(StdMutex::new(SourceLimits::default())),
+                share_invite_limits: Arc::new(StdMutex::new(ShareInviteLimits::new())),
                 control_body_readers: Arc::new(Semaphore::new(MAX_CONTROL_BODY_READERS)),
                 control_requests: Arc::new(Semaphore::new(MAX_CONTROL_REQUESTS)),
                 db_workers: Arc::new(Semaphore::new(MAX_DB_WORKERS)),
@@ -2571,19 +3334,82 @@ mod tests {
     #[test]
     fn storage_reservations_are_bounded_and_release_on_drop() {
         let reservations = Arc::new(StorageReservations::default());
-        let first = reservations.try_reserve(16, 32, 64).unwrap();
+        let first = reservations.try_reserve(16, 16, 1, 32, 64, 64).unwrap();
         assert_eq!(reservations.reserved(), 32);
-        assert!(reservations.try_reserve(16, 17, 64).is_none());
-        let second = reservations.try_reserve(16, 16, 64).unwrap();
+        assert_eq!(reservations.reserved_for_owner(1), 32);
+        assert!(reservations.try_reserve(16, 16, 1, 17, 64, 64).is_none());
+        let second = reservations.try_reserve(16, 16, 2, 16, 64, 64).unwrap();
         assert_eq!(reservations.reserved(), 48);
-        assert!(reservations.try_reserve(16, 1, 64).is_none());
+        assert!(reservations.try_reserve(16, 16, 2, 1, 64, 32).is_none());
         drop(first);
         assert_eq!(reservations.reserved(), 16);
-        let third = reservations.try_reserve(16, 32, 64).unwrap();
+        let third = reservations.try_reserve(16, 16, 1, 32, 64, 64).unwrap();
         assert_eq!(reservations.reserved(), 48);
         drop(second);
         drop(third);
         assert_eq!(reservations.reserved(), 0);
+    }
+
+    #[test]
+    fn database_metrics_classify_only_fixed_busy_and_deadline_reasons() {
+        let metrics = Metrics::default();
+        let busy = anyhow::Error::new(rusqlite::Error::SqliteFailure(
+            rusqlite::ffi::Error::new(rusqlite::ffi::SQLITE_BUSY),
+            Some("untrusted detail".into()),
+        ));
+        let interrupted = anyhow::Error::new(rusqlite::Error::SqliteFailure(
+            rusqlite::ffi::Error::new(rusqlite::ffi::SQLITE_INTERRUPT),
+            None,
+        ));
+        let unrelated = anyhow::anyhow!("untrusted detail");
+
+        metrics.observe_database_error(DatabaseOperation::Request, &busy);
+        metrics.observe_database_error(DatabaseOperation::AdminSnapshot, &interrupted);
+        metrics.observe_database_error(DatabaseOperation::Request, &unrelated);
+
+        assert_eq!(
+            metrics.database_busy[DatabaseOperation::Request as usize].load(Ordering::Relaxed),
+            1
+        );
+        assert_eq!(
+            metrics.database_deadlines[DatabaseOperation::AdminSnapshot as usize]
+                .load(Ordering::Relaxed),
+            1
+        );
+        assert_eq!(
+            metrics.database_deadlines[DatabaseOperation::Request as usize].load(Ordering::Relaxed),
+            0
+        );
+    }
+
+    #[test]
+    fn per_user_concurrency_is_isolated_and_releases_on_drop() {
+        let limits = Arc::new(UserConcurrency::default());
+        let first = limits
+            .try_acquire(1, UserConcurrencyKind::Connection, 1)
+            .unwrap();
+        assert!(
+            limits
+                .try_acquire(1, UserConcurrencyKind::Connection, 1)
+                .is_none()
+        );
+        let other = limits
+            .try_acquire(2, UserConcurrencyKind::Connection, 1)
+            .unwrap();
+        let upload = limits
+            .try_acquire(1, UserConcurrencyKind::Upload, 1)
+            .unwrap();
+        assert!(
+            limits
+                .try_acquire(1, UserConcurrencyKind::Upload, 1)
+                .is_none()
+        );
+        drop(first);
+        let replacement = limits
+            .try_acquire(1, UserConcurrencyKind::Connection, 1)
+            .unwrap();
+        drop((replacement, other, upload));
+        assert!(limits.entries.lock().unwrap().is_empty());
     }
 
     #[test]
@@ -3066,7 +3892,9 @@ mod tests {
     #[test]
     fn delivered_live_revision_advances_registry_cursor_and_activity() {
         let registry = crate::admin::LiveRegistry::new(1);
-        let guard = registry.register("vault", "device", 3).unwrap();
+        let guard = registry
+            .register(1, "session", "vault", "device", 3)
+            .unwrap();
         let before = registry.snapshot()[0].last_activity_at;
         std::thread::sleep(Duration::from_millis(2));
         record_delivered_revision(Some(&guard), 41);

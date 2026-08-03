@@ -34,7 +34,7 @@ jobs:
           --manifest-path apps/server-rust/Cargo.toml
           check advisories licenses sources
       - run: bun run check
-      - run: ./ops/build-release.sh
+      - run: BLACKGLASS_TESTED_SOURCE_REVISION="$GITHUB_SHA" ./ops/build-release.sh
       - run: bun run server:measure
       - run: shellcheck ops/*.sh
       - name: Verify systemd hardening unit
@@ -82,7 +82,7 @@ jobs:
           version: v0.33.0
           driver-opts: image=moby/buildkit:v0.30.0@sha256:0168606be2315b7c807a03b3d8aa79beefdb31c98740cebdffdfeebf31190c9f
       - run: npm ci
-      - run: ./ops/build-linux-release.sh "${{ matrix.target }}"
+      - run: BLACKGLASS_TESTED_SOURCE_REVISION="$GITHUB_SHA" ./ops/build-linux-release.sh "${{ matrix.target }}"
       - name: Qualify the exact exported binary
         shell: bash
         run: |

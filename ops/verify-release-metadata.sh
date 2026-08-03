@@ -122,4 +122,48 @@ for candidate in \
     fi
 done
 
+schema_version=$(awk '
+    /^const CURRENT_SCHEMA_VERSION: i64 = [0-9]+;$/ {
+        matches++
+        value = $0
+        sub(/^const CURRENT_SCHEMA_VERSION: i64 = /, "", value)
+        sub(/;$/, "", value)
+    }
+    END { if (matches != 1) exit 2; print value }
+' "$project_root/apps/server-rust/src/db.rs") || {
+    echo "could not determine the database schema version" >&2
+    exit 1
+}
+
+release_contract="$project_root/ops/release/release-contract.json"
+jq -e \
+    --arg version "$package_json_version" \
+    --argjson schema "$schema_version" '
+      type == "object" and
+      (keys | sort) == ([
+        "clientToolingRevision",
+        "database",
+        "monitoring",
+        "previousRollbackTag",
+        "qualifiedRenderers",
+        "schemaVersion",
+        "serverVersion",
+        "sharingEnabled"
+      ] | sort) and
+      .schemaVersion == 1 and
+      .serverVersion == $version and
+      .database.destinationSchema == $schema and
+      .database.supportedSourceSchemas == [5] and
+      .previousRollbackTag == "v0.3.0" and
+      (.clientToolingRevision | test("^[a-f0-9]{40}$")) and
+      (.qualifiedRenderers | map(.version)) == ["1.12.7", "1.13.4"] and
+      all(.qualifiedRenderers[]; .baselineSha256 | test("^[a-f0-9]{64}$")) and
+      .monitoring.prometheusJobSelector == "job=\"blackglass-server\"" and
+      .monitoring.requiredBackends == ["primary", "recovery"] and
+      .sharingEnabled == true
+    ' "$release_contract" >/dev/null || {
+    echo "release contract does not match the package and schema boundary" >&2
+    exit 1
+}
+
 echo "release metadata verified: blackglass-server $package_json_version"

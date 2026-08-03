@@ -4,8 +4,9 @@ This archive contains a statically linked Linux binary. It does not require
 glibc, SQLite, OpenSSL, or another shared userspace library.
 
 Choose either the archive or the separately published raw binary. Verify its
-adjacent checksum. Archives also carry `INSTALL.md`, `LICENSE`, and an embedded
-manifest; both forms contain byte-identical executables. Install as root while
+adjacent checksum. Archives also carry `INSTALL.md`, `LICENSE`, an embedded
+manifest, and `release-contract.json`; both forms contain byte-identical
+executables. Install as root while
 keeping the service process unprivileged:
 
 ```sh
@@ -49,3 +50,5 @@ Native service configuration and OCI images default to loopback. The supported
 Linux Docker deployment uses host networking so host Caddy reaches loopback
 without published plaintext ports. Never expose the control or data listeners
 directly; follow the exact topology in `docs/distribution.md`.
+Scrape `/ready` and `/metrics` only over loopback or a private administration
+network; the example public Caddy policy deliberately hides them.

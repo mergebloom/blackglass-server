@@ -1,5 +1,23 @@
 use serde::{Deserialize, Serialize};
 
+#[derive(Clone, Debug)]
+pub struct UserCredential {
+    pub id: i64,
+    pub email: String,
+    pub name: String,
+    pub password_hash: String,
+    pub active: bool,
+}
+
+#[derive(Clone, Debug)]
+pub struct AuthContext {
+    pub user_id: i64,
+    pub email: String,
+    pub name: String,
+    pub token_hash: String,
+    pub expires_at: i64,
+}
+
 #[derive(Clone, Debug, Serialize)]
 pub struct Vault {
     pub id: String,
@@ -13,6 +31,24 @@ pub struct Vault {
     pub created: i64,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub password: Option<String>,
+}
+
+#[derive(Clone, Debug, Serialize)]
+pub struct SharedVault {
+    #[serde(flatten)]
+    pub vault: Vault,
+    pub share_uid: i64,
+    #[serde(skip)]
+    pub owner_user_id: i64,
+}
+
+#[derive(Clone, Debug, Serialize)]
+pub struct VaultShareItem {
+    pub uid: i64,
+    pub email: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub name: Option<String>,
+    pub accepted: bool,
 }
 
 #[derive(Clone, Debug)]
@@ -68,13 +104,26 @@ pub struct VaultCreate {
 }
 
 #[derive(Debug, Deserialize)]
-pub struct VaultAccess {
+pub struct VaultAccessRequest {
     #[serde(rename = "token")]
     pub _token: Option<String>,
     pub vault_uid: Option<String>,
     pub keyhash: Option<String>,
     pub host: Option<String>,
     pub encryption_version: Option<i64>,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum VaultAccess {
+    Owner {
+        user_id: i64,
+        vault_id: String,
+    },
+    Collaborator {
+        user_id: i64,
+        vault_id: String,
+        share_uid: i64,
+    },
 }
 
 #[derive(Debug, Deserialize)]
@@ -90,6 +139,29 @@ pub struct VaultDelete {
     #[serde(rename = "token")]
     pub _token: Option<String>,
     pub vault_uid: Option<String>,
+}
+
+#[derive(Debug, Deserialize)]
+pub struct VaultShareListRequest {
+    #[serde(rename = "token")]
+    pub _token: Option<String>,
+    pub vault_uid: Option<String>,
+}
+
+#[derive(Debug, Deserialize)]
+pub struct VaultShareInviteRequest {
+    #[serde(rename = "token")]
+    pub _token: Option<String>,
+    pub vault_uid: Option<String>,
+    pub email: Option<String>,
+}
+
+#[derive(Debug, Deserialize)]
+pub struct VaultShareRemoveRequest {
+    #[serde(rename = "token")]
+    pub _token: Option<String>,
+    pub vault_uid: Option<String>,
+    pub share_uid: Option<i64>,
 }
 
 #[derive(Debug, Deserialize)]

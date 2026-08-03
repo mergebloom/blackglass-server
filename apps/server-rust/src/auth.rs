@@ -1,5 +1,5 @@
-use anyhow::Result;
-use argon2::{Argon2, PasswordHash, PasswordHasher, PasswordVerifier};
+use anyhow::{Result, bail};
+use argon2::{Algorithm, Argon2, Params, PasswordHash, PasswordHasher, PasswordVerifier, Version};
 use password_hash::SaltString;
 use rand::{RngCore, rngs::OsRng};
 use sha2::{Digest, Sha256};
@@ -11,6 +11,9 @@ const MAX_ARGON2_TIME_COST: u32 = 5;
 const MIN_ARGON2_PARALLELISM: u32 = 1;
 const MAX_ARGON2_PARALLELISM: u32 = 4;
 const MAX_PASSWORD_HASH_LENGTH: usize = 512;
+pub(crate) const DUMMY_PASSWORD_HASH: &str = "$argon2id$v=19$m=65536,t=5,p=4$YmxhY2tnbGFzcy1yZXNvdXJjZS1lbnZlbG9wZS12MQ$qF1GQ0hLTNgx8hhl7Qo3R7r1pSYB+eYXdX4KtmWP5VI";
+pub(crate) const MAX_EMAIL_BYTES: usize = 254;
+pub(crate) const MAX_DISPLAY_NAME_BYTES: usize = 128;
 pub(crate) const MAX_CONCURRENT_PASSWORD_CHECKS: usize = 1;
 const SERVICE_MEMORY_LIMIT_KIB: usize = 384 * 1024;
 const MAX_WS_FRAME_MEMORY_KIB: usize = crate::config::MAX_WS_CONNECTIONS_LIMIT * 2 * 1024;
@@ -38,7 +41,14 @@ const _: () = assert!(
 
 pub fn hash_password(password: &str) -> Result<String> {
     let salt = SaltString::generate(&mut password_hash::rand_core::OsRng);
-    Ok(Argon2::default()
+    let params = Params::new(
+        MAX_ARGON2_MEMORY_KIB,
+        MAX_ARGON2_TIME_COST,
+        MAX_ARGON2_PARALLELISM,
+        Some(32),
+    )
+    .map_err(|e| anyhow::anyhow!("unable to configure password hashing: {e}"))?;
+    Ok(Argon2::new(Algorithm::Argon2id, Version::V0x13, params)
         .hash_password(password.as_bytes(), &salt)
         .map_err(|e| anyhow::anyhow!("unable to hash password: {e}"))?
         .to_string())
@@ -54,6 +64,44 @@ pub fn verify_password(password: &str, encoded: &str) -> bool {
 
 pub fn password_hash_is_production_grade(encoded: &str) -> bool {
     accepted_password_hash(encoded).is_some()
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(crate) struct CanonicalEmail {
+    pub display: String,
+    pub canonical: String,
+}
+
+pub(crate) fn canonicalize_email(value: &str) -> Result<CanonicalEmail> {
+    let display = value.trim_matches(|character: char| character.is_ascii_whitespace());
+    if display.is_empty() || display.len() > MAX_EMAIL_BYTES {
+        bail!("email must be between 1 and {MAX_EMAIL_BYTES} ASCII bytes")
+    }
+    if !display.bytes().all(|byte| (b'!'..=b'~').contains(&byte)) {
+        bail!("email must contain printable ASCII without whitespace")
+    }
+    let mut separators = display.match_indices('@');
+    let Some((separator, _)) = separators.next() else {
+        bail!("email must contain exactly one non-edge @")
+    };
+    if separator == 0 || separator + 1 == display.len() || separators.next().is_some() {
+        bail!("email must contain exactly one non-edge @")
+    }
+    Ok(CanonicalEmail {
+        display: display.to_owned(),
+        canonical: display.to_ascii_lowercase(),
+    })
+}
+
+pub(crate) fn normalize_display_name(value: &str) -> Result<String> {
+    let name = value.trim_matches(|character: char| character.is_ascii_whitespace());
+    if name.is_empty() || name.len() > MAX_DISPLAY_NAME_BYTES {
+        bail!("name must be between 1 and {MAX_DISPLAY_NAME_BYTES} bytes")
+    }
+    if name.chars().any(char::is_control) {
+        bail!("name must not contain control characters")
+    }
+    Ok(name.to_owned())
 }
 
 fn accepted_password_hash(encoded: &str) -> Option<PasswordHash<'_>> {
@@ -126,7 +174,7 @@ mod tests {
             with_argon2_params(&encoded, 19_456, 2, 0),
             with_argon2_params(&encoded, 19_456, 2, 5),
             with_argon2_params(&encoded, u32::MAX, u32::MAX, u32::MAX),
-            encoded.replacen("p=1", "p=1,x=1", 1),
+            encoded.replacen("p=4", "p=4,x=1", 1),
             encoded.replace("$v=19$", "$v=16$"),
             format!("{encoded}{}", "x".repeat(MAX_PASSWORD_HASH_LENGTH)),
         ] {
@@ -140,6 +188,43 @@ mod tests {
             MAX_ARGON2_PARALLELISM,
         );
         assert!(password_hash_is_production_grade(&bounded));
+    }
+
+    #[test]
+    fn email_canonicalization_is_shared_bounded_and_ascii_only() {
+        assert_eq!(
+            canonicalize_email("\tOwner+Sync@Example.TEST\r\n").unwrap(),
+            CanonicalEmail {
+                display: "Owner+Sync@Example.TEST".into(),
+                canonical: "owner+sync@example.test".into(),
+            }
+        );
+        for rejected in [
+            "",
+            "owner",
+            "@example.test",
+            "owner@",
+            "owner@@example.test",
+            "owner @example.test",
+            "ownér@example.test",
+        ] {
+            assert!(
+                canonicalize_email(rejected).is_err(),
+                "accepted {rejected:?}"
+            );
+        }
+        assert!(canonicalize_email(&format!("{}@x.test", "a".repeat(248))).is_err());
+    }
+
+    #[test]
+    fn display_names_are_trimmed_and_bounded_without_controls() {
+        assert_eq!(
+            normalize_display_name("  Alice Example \n").unwrap(),
+            "Alice Example"
+        );
+        assert!(normalize_display_name("").is_err());
+        assert!(normalize_display_name("Alice\u{0000}Example").is_err());
+        assert!(normalize_display_name(&"a".repeat(MAX_DISPLAY_NAME_BYTES + 1)).is_err());
     }
 
     #[test]

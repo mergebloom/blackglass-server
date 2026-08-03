@@ -16,7 +16,7 @@ privacy without dependence on Obsidian's hosted Sync infrastructure. End-to-end
 encryption protects vault contents; as noted in the security model below, the
 server can still observe some metadata.
 
-The stable server/client boundary and Blackglass Bridge's small, fail-closed
+The stable server/client boundary and Blackglass's small, fail-closed
 endpoint adaptation are designed to make qualification of future Obsidian
 releases repeatable and low-maintenance rather than a continuing fork of the
 application.
@@ -30,14 +30,14 @@ same tests, artifact hashes, and release gates as any other contribution.
 
 | Area | Current support |
 | --- | --- |
-| Deployment | One owner, one server node, local SQLite storage |
-| Sync | Account, vault, history, upload, download, and recovery |
+| Deployment | Multiple administrator-provisioned accounts, one server node, local SQLite storage |
+| Sync | Vault collaboration, history, upload, download, and recovery |
 | Encryption | Client-managed and server-managed encrypted vaults |
 | Client target | macOS desktop on Apple Silicon; Obsidian renderer 1.12.7 first |
 | Server hosts | 64-bit Linux on amd64 or arm64; native binary or OCI image |
 
-Publish, public registration, sharing, high availability,
-mobile clients, Windows servers, and 32-bit hosts are not supported yet.
+Publish, public registration, high availability, mobile clients, Windows
+servers, and 32-bit hosts are not supported yet.
 
 ## Architecture
 
@@ -46,7 +46,7 @@ listeners. Native installs and the OCI image default to loopback. The supported
 Linux Docker deployment uses host networking so host Caddy can reach those
 listeners without publishing plaintext ports. Caddy is the only public
 listener. SQLite stores opaque ciphertext and protocol state behind an atomic
-retained-history quota. Blackglass Bridge owns the small,
+retained-history quota. Blackglass owns the small,
 release-specific client endpoint adapter.
 
 See [architecture](docs/architecture.md) for the component and trust boundaries.
@@ -62,15 +62,18 @@ cargo test --locked --manifest-path apps/server-rust/Cargo.toml
 Start a loopback-only development server:
 
 ```sh
-SELFHOST_EMAIL=admin@example.test \
-SELFHOST_PASSWORD='replace-this' \
-SELFHOST_ALLOW_PLAINTEXT_PASSWORD=1 \
+printf '%s\n' 'replace-this' | cargo run --release --locked \
+  --manifest-path apps/server-rust/Cargo.toml -- \
+  user create ./selfhost-sync.sqlite admin@example.test 'Local admin'
 cargo run --release --locked \
   --manifest-path apps/server-rust/Cargo.toml -- serve
 ```
 
 The default listeners are `127.0.0.1:3000` and `127.0.0.1:3003`.
-Plaintext credentials and transport are for loopback development only.
+Account passwords are read from standard input by offline user-management
+commands and stored only as bounded Argon2id hashes in SQLite. Serving does not
+read account credentials from environment variables. Plaintext transport is
+for loopback development only.
 
 An optional dependency-free, read-only admin console can run on a third,
 independently configured listener. It is disabled unless all three admin

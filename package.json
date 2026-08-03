@@ -1,6 +1,6 @@
 {
   "name": "blackglass-server",
-  "version": "0.2.5",
+  "version": "0.4.5",
   "private": true,
   "license": "MIT",
   "engines": {
@@ -25,7 +25,10 @@
     "server:measure": "bun run tools/measure-rust-server.ts",
     "test:integration": "bun test tests/server.integration.test.ts",
     "verify:release-metadata": "./ops/verify-release-metadata.sh",
-    "check": "bun run verify:release-metadata && bun run licenses:check && bun run typecheck && cargo fmt --manifest-path apps/server-rust/Cargo.toml -- --check && cargo clippy --locked --manifest-path apps/server-rust/Cargo.toml --all-targets -- -D warnings && bun run server:test && bun test",
+    "check:fast": "bun run verify:release-metadata && bun run licenses:check && bun run typecheck && cargo fmt --manifest-path apps/server-rust/Cargo.toml -- --check && cargo check --locked --manifest-path apps/server-rust/Cargo.toml --all-targets && bun test tests/release-metadata.test.ts tests/client-contract.integration.test.ts tests/collaboration.integration.test.ts tests/tenant-isolation.integration.test.ts",
+    "check:full": "bun run verify:release-metadata && bun run licenses:check && bun run typecheck && cargo fmt --manifest-path apps/server-rust/Cargo.toml -- --check && cargo clippy --locked --manifest-path apps/server-rust/Cargo.toml --all-targets -- -D warnings && bun run server:test && bun test",
+    "check:release": "bun run check:full && shellcheck ops/*.sh",
+    "check": "bun run check:full",
     "test": "bun test",
     "typecheck": "tsc --noEmit"
   },

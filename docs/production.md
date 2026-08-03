@@ -2,13 +2,13 @@
 
 ## Supported production shape
 
-The production target is deliberately narrow: one owner, end-to-end-encrypted
-vaults, one Rust process, one SQLite database, and one static node. Publish,
-public registration, sharing, high availability, and mobile clients are not
-supported in this phase. Both custom-password and managed-encryption vaults are
-compatible. Prefer a custom vault password when the server operator must not be
-able to derive the vault key; managed mode stores its generated recovery
-password in SQLite and backups.
+The production target is deliberately narrow: administrator-provisioned local
+accounts with isolated or explicitly shared end-to-end-encrypted vaults, one
+Rust process, one SQLite database, and one static node. Publish, public
+registration, high availability, and mobile clients are not supported. Both
+custom-password and managed-encryption vaults are compatible. Prefer a custom
+vault password when the server operator must not be able to derive the vault
+key; managed mode stores its generated recovery password in SQLite and backups.
 
 Native installs have two loopback listeners. A TLS reverse proxy is the only
 public listener:
@@ -52,24 +52,32 @@ sudo install -m 0755 \
   /opt/blackglass-server/
 ```
 
-Generate the password hash without putting the password in a process argument:
+Initialize the database and first account offline without putting the password
+in a process argument:
 
 ```sh
+sudo systemd-sysusers ./ops/blackglass-server.sysusers.conf
+sudo install -d -o blackglass-server -g blackglass-server -m 0700 \
+  /var/lib/blackglass-server
 read -r -s account_password
-printf '%s' "$account_password" | \
-  /opt/blackglass-server/blackglass-server hash-password
+printf '%s' "$account_password" | sudo -u blackglass-server \
+  /opt/blackglass-server/blackglass-server user create \
+  /var/lib/blackglass-server/server.sqlite owner@example.com 'Vault owner'
 unset account_password
 ```
 
 Copy `ops/blackglass-server.env.example` to
 `/etc/blackglass-server/server.env`, replace
-the sample values, and set its owner to root and mode to 0600. The service will
-not accept a plaintext production password. Sessions are random 256-bit bearer
-tokens; only SHA-256 token digests, expiry, and revocation state are stored.
+the sample values, and set its owner to root and mode to 0600. Account
+credentials live only in SQLite and are changed through offline `user`
+commands. Sessions are random 256-bit bearer tokens; only SHA-256 token
+digests, user IDs, expiry, and revocation state are stored.
 Imported password hashes must use Argon2id v=19 with bounded work parameters:
 `m=19456..65536`, `t=2..5`, and `p=1..4`. Hashes outside those limits are
 rejected before password verification to prevent an unsafe operator value from
 causing unbounded CPU or memory use.
+New and replaced account passwords are generated at the qualified policy
+maximum (`m=65536,t=5,p=4`).
 
 Install `ops/blackglass-server.service`, run `systemd-analyze security` against it,
 then enable it. The supplied sysusers file and unit use a static unprivileged
@@ -97,12 +105,34 @@ the same time as the plural variable. Never use wildcard CORS.
 One Argon2 password check runs at a time, with at most eight fair queued
 waiters. The server also admits six sign-in attempts per real source in a
 60-second window and at most four unauthenticated WebSockets per source;
-successful owner sign-in refunds its attempt. `SELFHOST_TRUSTED_PROXY` accepts
+successful sign-in refunds its attempt. `SELFHOST_TRUSTED_PROXY` accepts
 one exact private or loopback IP, never a CIDR. Only set it when that peer is the
 exclusive ingress and overwrites `X-Forwarded-For`; the supplied Caddy example
 does both with `127.0.0.1`. Otherwise leave it unset and add equivalent
 per-source limits at ingress. `SELFHOST_MAX_WS_CONNECTIONS` defaults to 16 and
-is constrained to 1..16 by the qualified memory envelope.
+is constrained to 1..16 by the qualified memory envelope. The independent
+per-user defaults are four WebSockets and two active uploads; neither per-user
+value may exceed its corresponding global limit. Retained ciphertext is
+admitted against both `SELFHOST_STORAGE_QUOTA_BYTES` and the uniform
+`SELFHOST_STORAGE_QUOTA_BYTES_PER_OWNER` ceiling.
+
+Shared-vault collaboration is disabled by default. For a controlled canary,
+leave `SELFHOST_SHARING_ENABLED=false` and set
+`SELFHOST_SHARING_CANARY_OWNER_IDS` to at most eight numeric owner IDs. Set
+`SELFHOST_SHARING_ENABLED=true` only for global enablement; startup rejects an
+ambiguous global-plus-canary configuration. Invitation attempts use bounded
+rolling-hour source, owner, distinct-target, and deployment budgets. The four
+`SELFHOST_SHARE_INVITE*` values may be lowered but cannot be disabled or raised
+above the qualified defaults. Target addresses are represented in limiter
+memory only by process-local keyed digests and reset on restart.
+
+The first sharing release immediately accepts existing active local accounts;
+it does not send email or implement pending invitations. Owners invite and
+remove collaborators. Collaborators can sync, inspect history, restore, purge,
+and leave with their own share ID, but cannot rename, delete, migrate, list, or
+manage other collaborators. Revocation closes matching live sockets and
+discards staged uploads. It cannot erase an already-downloaded local copy or
+make a previously disclosed custom encryption password secret again.
 
 ## Read-only admin console
 
@@ -130,9 +160,11 @@ out. The browser stores the token in `sessionStorage`, polls no faster than 30
 seconds, and can forget it with **Forget token**.
 
 The console exposes bounded, explicit projections: readiness/version/schema,
-configured limits, vault metadata and encryption mode, recent revision metadata
-without encrypted paths, session timestamps without token hashes, storage
-counts, staging diagnostics, and a bounded in-memory live-connection view.
+global and per-user limits, active/disabled users, per-owner vault and retained
+byte counts, vault metadata and encryption mode, user-attributed recent
+revision metadata without encrypted paths, user-attributed session timestamps
+without token hashes, staging diagnostics, and a bounded user-attributed
+live-connection view.
 
 ## Health, metrics, and logs
 
@@ -148,9 +180,9 @@ endpoints. Scrape them over loopback or a private administration network. If you
 publish them, add an explicit authentication and network policy first.
 
 Metrics use the `blackglass_` prefix. The equivalent legacy
-`obsidian_sync_` names are emitted during the 0.2 compatibility window so
-existing dashboards keep working; migrate alerts before those aliases are
-removed in a future major release.
+`obsidian_sync_` names remain aliases in 0.3 so existing dashboards keep
+working; migrate alerts before those aliases are removed in a future major
+release.
 
 Keep all three endpoints behind the control hostname's normal network policy.
 Alert on readiness failures, restarts, sign-in failures/rate limits, WebSocket
@@ -161,6 +193,20 @@ that stopped making progress during an upload.
 Alert on `blackglass_storage_quota_rejections_total` and record
 `blackglass_storage_quota_bytes` alongside host disk capacity. A quota
 rejection is an expected bounded client error, not a server fault.
+Alert on unexpected increases in `blackglass_authorization_denials_total`;
+its fixed `operation` and `reason` labels identify the denied protocol surface
+without tenant, vault, session, or payload data. Alert on any sustained increase
+in `blackglass_sqlite_busy_total` or `blackglass_sqlite_deadlines_total`.
+Those counters use only the fixed `request` and `admin_snapshot` operation
+labels. A single busy event can be transient; a continuing increase indicates
+storage contention, an undersized host, or an unexpectedly expensive query.
+Alert on `blackglass_share_invites_total{outcome="rate_limited"}`. The fixed
+outcome labels contain no email address, user ID, vault ID, or target digest.
+
+The `v0.4.5` archive includes `release-contract.json`. Release automation
+checks that it binds server 0.4.5 to schema 6 and schema-5 migration input,
+the previous rollback tag, the exact client tooling revision, both qualified
+renderer baselines, and the required primary/recovery monitoring selectors.
 
 ## Backup and recovery
 
@@ -191,19 +237,28 @@ current-schema file into another new path:
 
 ```sh
 blackglass-server migrate old-backup.sqlite migrated-backup.sqlite
-blackglass-server restore migrated-backup.sqlite recovered.sqlite
+blackglass-server recover-stale-backup migrated-backup.sqlite recovered.sqlite
 ```
 
-Restore always establishes a new recovery epoch: every remote vault ID rotates
-and every session is cleared. Point `SELFHOST_DATABASE` at the recovered file,
-start the service, and require `/ready`. Every desktop must then sign in again,
+Both recovery commands establish a new recovery epoch: every remote vault ID
+rotates and every session is cleared. Use `recover-stale-backup` for disaster
+recovery from an older point in time; it additionally disables every account so
+the backup cannot resurrect access that was removed after it was created.
+Review `user list`, replace passwords as appropriate, and explicitly run
+`user set-status <database> <user-id> active` for each intended account while
+the service remains stopped. The narrower `restore` command preserves account
+status and is reserved for a verified current-state copy when no authorization
+rollback is possible.
+
+Point `SELFHOST_DATABASE` at the recovered file, start the service, and require
+`/ready`. Every desktop must then sign in again,
 reselect the replacement remote vault, and recover into a fresh empty local
 vault. Do not let a pre-restore local profile resume against its retired remote
 identity. Complete a fresh-client recovery test before discarding old files.
-The recovery response is deliberately narrow: a recorded retired vault ID plus
-any 64-character lowercase-hex token receives `Vault not found`, even when a
-post-backup token is absent from the restored session table. Other token shapes
-and arbitrary missing vault IDs retain the generic authentication error.
+The recovery response is deliberately tenant-scoped: only a valid session for
+the retired vault's owner receives `Vault not found`. Invalid, expired,
+token-shaped, cross-tenant, and arbitrary identifiers retain the generic
+authentication error.
 
 If a signed-in device or bearer token may be compromised, stop the service and
 revoke every session before restarting it:
@@ -213,8 +268,9 @@ revoke every session before restarting it:
   revoke-all-sessions /var/lib/blackglass-server/server.sqlite
 ```
 
-All clients must sign in again. Changing the account password hash should be
-paired with this command.
+All clients must sign in again. Prefer the scoped offline command
+`blackglass-server user revoke-sessions <database> <user-id>`; password and
+email replacement revoke that user's sessions transactionally.
 
 ## Upgrade and rollback
 
@@ -230,10 +286,12 @@ blackglass-server migrate server-vOLD.sqlite server-vNEW.sqlite
 
 Only after `verify server-vNEW.sqlite` succeeds should configuration point at
 the new file. The source stays unchanged. Each migration step validates its
-input/output inside the transaction and rolls back on failure. Migration from
-the shipped schema v3 to v4 preserves vault IDs and sessions; migrations from
-schemas older than v3 establish a new recovery epoch and require the same
-fresh-client procedure as restore.
+input/output inside the transaction and rolls back on failure. The Phase 4
+migration accepts a schema-v5 source, creates a new schema-v6 file, starts with
+no memberships, and invalidates existing sessions for one required re-login.
+Keep the exact v0.3.0 binary and untouched v5 source until activation. After
+the first accepted v6 write, recovery is roll-forward only; never run the
+v0.3.0 binary against schema v6.
 
 A pre-v4/pre-0.2.2 rollback is safe only before activation, while the untouched
 old database has received no client writes. After the new database has served

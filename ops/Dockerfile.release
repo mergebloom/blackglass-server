@@ -9,11 +9,13 @@ ARG SOURCE_REVISION=unknown
 ARG TARGETARCH
 ARG TARGETOS
 ARG VERSION
+ARG RUN_TESTS=1
 
 RUN set -eu; \
     test "$TARGETOS" = linux; \
     case "$TARGETARCH" in amd64|arm64) ;; *) exit 1 ;; esac; \
     test -n "$VERSION"; \
+    case "$RUN_TESTS" in 0|1) ;; *) exit 1 ;; esac; \
     test "${#SOURCE_REVISION}" -eq 40; \
     case "$SOURCE_REVISION" in *[!0-9a-f]*) exit 1 ;; esac
 
@@ -48,6 +50,7 @@ COPY ops/blackglass-server.service ./ops/blackglass-server.service
 COPY LICENSE /metadata/LICENSE
 COPY THIRD_PARTY_NOTICES.md /metadata/THIRD_PARTY_NOTICES.md
 COPY ops/release/INSTALL.md /metadata/INSTALL.md
+COPY ops/release/release-contract.json /metadata/release-contract.json
 COPY ops/blackglass-server.env.example /metadata/blackglass-server.env.example
 COPY ops/blackglass-server.service /metadata/blackglass-server.service
 COPY ops/blackglass-server.sysusers.conf /metadata/blackglass-server.sysusers.conf
@@ -57,8 +60,16 @@ ENV BLACKGLASS_SOURCE_REVISION=$SOURCE_REVISION
 
 RUN --mount=type=cache,id=blackglass-cargo-registry-$TARGETARCH,target=/usr/local/cargo/registry,sharing=locked \
     --mount=type=cache,id=blackglass-cargo-git-$TARGETARCH,target=/usr/local/cargo/git,sharing=locked \
-    cargo test --locked --release --manifest-path apps/server-rust/Cargo.toml \
-    && cargo build --locked --release --manifest-path apps/server-rust/Cargo.toml
+    --mount=type=cache,id=blackglass-cargo-target-$TARGETARCH,target=/cargo-target,sharing=locked \
+    if test "$RUN_TESTS" = 1; then \
+      CARGO_TARGET_DIR=/cargo-target CARGO_INCREMENTAL=0 \
+        cargo test --locked --release --manifest-path apps/server-rust/Cargo.toml; \
+    fi; \
+    CARGO_TARGET_DIR=/cargo-target CARGO_INCREMENTAL=0 \
+      cargo build --locked --release --manifest-path apps/server-rust/Cargo.toml \
+    && mkdir -p /target/release \
+    && cp /cargo-target/release/blackglass-server /target/release/blackglass-server \
+    && chmod 0555 /target/release/blackglass-server
 
 RUN test "$(/target/release/blackglass-server --version)" = "blackglass-server $VERSION"
 RUN /target/release/blackglass-server build-info \
@@ -68,15 +79,15 @@ RUN /target/release/blackglass-server build-info \
 # both listeners, and readiness. The password is fixed test data in a disposable
 # build layer, not a production credential.
 RUN set -eu; \
-    password_hash=$(printf '%s\n' release-smoke-password | /target/release/blackglass-server hash-password); \
+    printf '%s\n' release-smoke-password \
+        | /target/release/blackglass-server user create \
+            /tmp/blackglass-smoke.sqlite release-smoke@example.test 'Release smoke user'; \
     SELFHOST_BIND_HOST=127.0.0.1 \
     SELFHOST_CONTROL_PORT=3100 \
     SELFHOST_DATA_PORT=3103 \
     SELFHOST_DATA_HOST=127.0.0.1:3103 \
     SELFHOST_DATABASE=/tmp/blackglass-smoke.sqlite \
     SELFHOST_STAGING_DIR=/tmp/blackglass-smoke-uploads \
-    SELFHOST_EMAIL=release-smoke@example.test \
-    SELFHOST_PASSWORD_HASH="$password_hash" \
     SELFHOST_LOG_FORMAT=pretty \
     /target/release/blackglass-server serve >/tmp/blackglass-smoke.log 2>&1 & \
     server_pid=$!; \
@@ -103,6 +114,7 @@ RUN set -eu; \
     cp /target/release/blackglass-server "/package/$bundle/blackglass-server"; \
     chmod 0755 "/package/$bundle/blackglass-server"; \
     cp /metadata/INSTALL.md "/package/$bundle/INSTALL.md"; \
+    cp /metadata/release-contract.json "/package/$bundle/release-contract.json"; \
     cp /metadata/LICENSE "/package/$bundle/LICENSE"; \
     cp /metadata/THIRD_PARTY_NOTICES.md "/package/$bundle/THIRD_PARTY_NOTICES.md"; \
     cp /metadata/blackglass-server.env.example "/package/$bundle/blackglass-server.env.example"; \

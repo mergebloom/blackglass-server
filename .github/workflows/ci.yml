@@ -27,7 +27,7 @@ jobs:
           --manifest-path apps/server-rust/Cargo.toml
           check advisories licenses sources
       - run: bun run check
-      - run: ./ops/build-release.sh
+      - run: BLACKGLASS_TESTED_SOURCE_REVISION="$GITHUB_SHA" ./ops/build-release.sh
       - run: bun run server:measure
       - run: shellcheck ops/*.sh
       - name: Verify systemd hardening unit

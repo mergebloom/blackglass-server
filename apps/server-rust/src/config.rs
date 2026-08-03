@@ -8,6 +8,10 @@ use std::{
 };
 
 pub(crate) const MAX_WS_CONNECTIONS_LIMIT: usize = 16;
+pub(crate) const MAX_SHARE_INVITES_PER_SOURCE: usize = 60;
+pub(crate) const MAX_SHARE_INVITES_PER_USER: usize = 30;
+pub(crate) const MAX_SHARE_INVITE_TARGETS_PER_USER: usize = 20;
+pub(crate) const MAX_SHARE_INVITES_GLOBAL: usize = 300;
 pub(crate) const DEFAULT_MAX_WS_CONNECTIONS: usize = 16;
 pub(crate) const MAX_CONCURRENT_UPLOADS_LIMIT: usize = 4;
 pub(crate) const MAX_PER_FILE_BYTES: u64 = 900 * 1024 * 1024;
@@ -29,19 +33,25 @@ pub struct Config {
     pub public_data_host: String,
     pub database_path: PathBuf,
     pub staging_dir: PathBuf,
-    pub email: String,
-    pub password_hash: String,
-    pub display_name: String,
     pub per_file_max: u64,
     pub storage_quota_bytes: i64,
+    pub storage_quota_bytes_per_owner: i64,
     pub session_ttl: Duration,
     pub upload_idle_timeout: Duration,
     pub allowed_origins: Vec<String>,
     pub max_concurrent_uploads: usize,
+    pub max_concurrent_uploads_per_user: usize,
     pub max_ws_connections: usize,
+    pub max_ws_connections_per_user: usize,
     pub trusted_proxy: Option<IpAddr>,
     pub admin: Option<crate::admin::AdminConfig>,
     pub json_logs: bool,
+    pub sharing_enabled: bool,
+    pub sharing_canary_owner_ids: Vec<i64>,
+    pub share_invites_per_source: usize,
+    pub share_invites_per_user: usize,
+    pub share_invite_targets_per_user: usize,
+    pub share_invites_global: usize,
 }
 
 impl Config {
@@ -56,10 +66,6 @@ impl Config {
             Some(_) => bail!("SELFHOST_ACKNOWLEDGE_EXTERNAL_BIND must be exactly 1 when set"),
         };
         validate_bind_host(bind_host, external_bind_acknowledged)?;
-        let allow_plaintext_password = plaintext_password_allowed(
-            bind_host,
-            value("SELFHOST_ALLOW_PLAINTEXT_PASSWORD").as_deref(),
-        )?;
         let control_port = number("SELFHOST_CONTROL_PORT", 3000u16)?;
         let data_port = number("SELFHOST_DATA_PORT", 3003u16)?;
         let database_path = PathBuf::from(
@@ -72,21 +78,6 @@ impl Config {
                 path.set_extension("uploads");
                 path
             });
-        let password_hash = match value("SELFHOST_PASSWORD_HASH") {
-            Some(hash) => hash,
-            None if allow_plaintext_password => {
-                let password = required("SELFHOST_PASSWORD")?;
-                crate::auth::hash_password(&password)?
-            }
-            None => bail!(
-                "SELFHOST_PASSWORD_HASH is required (use `hash-password`; the plaintext override is loopback-only test convenience)"
-            ),
-        };
-        if !crate::auth::password_hash_is_production_grade(&password_hash) {
-            bail!(
-                "SELFHOST_PASSWORD_HASH must be an Argon2id v=19 PHC string with m=19456..65536,t=2..5,p=1..4"
-            );
-        }
         if control_port == 0 || data_port == 0 || control_port == data_port {
             bail!("control and data ports must be distinct and non-zero");
         }
@@ -95,6 +86,15 @@ impl Config {
         let storage_quota_bytes =
             number("SELFHOST_STORAGE_QUOTA_BYTES", DEFAULT_STORAGE_QUOTA_BYTES)?;
         validate_storage_quota(storage_quota_bytes, per_file_max)?;
+        let storage_quota_bytes_per_owner = number(
+            "SELFHOST_STORAGE_QUOTA_BYTES_PER_OWNER",
+            storage_quota_bytes,
+        )?;
+        validate_owner_storage_quota(
+            storage_quota_bytes_per_owner,
+            storage_quota_bytes,
+            per_file_max,
+        )?;
         let session_ttl_seconds = number("SELFHOST_SESSION_TTL_SECONDS", 30 * 24 * 60 * 60u64)?;
         if !(300..=365 * 24 * 60 * 60).contains(&session_ttl_seconds) {
             bail!("SELFHOST_SESSION_TTL_SECONDS must be between 300 seconds and 365 days");
@@ -106,10 +106,28 @@ impl Config {
         validate_upload_idle_timeout(upload_idle_timeout_seconds)?;
         let max_concurrent_uploads = number("SELFHOST_MAX_CONCURRENT_UPLOADS", 4usize)?;
         validate_concurrent_uploads(max_concurrent_uploads)?;
+        let max_concurrent_uploads_per_user = number(
+            "SELFHOST_MAX_CONCURRENT_UPLOADS_PER_USER",
+            max_concurrent_uploads.min(2),
+        )?;
+        validate_per_user_limit(
+            "SELFHOST_MAX_CONCURRENT_UPLOADS_PER_USER",
+            max_concurrent_uploads_per_user,
+            max_concurrent_uploads,
+        )?;
         let max_ws_connections = number("SELFHOST_MAX_WS_CONNECTIONS", DEFAULT_MAX_WS_CONNECTIONS)?;
         if !(1..=MAX_WS_CONNECTIONS_LIMIT).contains(&max_ws_connections) {
             bail!("SELFHOST_MAX_WS_CONNECTIONS must be between 1 and {MAX_WS_CONNECTIONS_LIMIT}");
         }
+        let max_ws_connections_per_user = number(
+            "SELFHOST_MAX_WS_CONNECTIONS_PER_USER",
+            max_ws_connections.min(4),
+        )?;
+        validate_per_user_limit(
+            "SELFHOST_MAX_WS_CONNECTIONS_PER_USER",
+            max_ws_connections_per_user,
+            max_ws_connections,
+        )?;
         let allowed_origins = match (
             value("SELFHOST_ALLOWED_ORIGINS"),
             value("SELFHOST_ALLOWED_ORIGIN"),
@@ -141,6 +159,33 @@ impl Config {
             control_port,
             data_port,
         )?;
+        let sharing_enabled = boolean("SELFHOST_SHARING_ENABLED", false)?;
+        let sharing_canary_owner_ids = parse_owner_ids(
+            value("SELFHOST_SHARING_CANARY_OWNER_IDS")
+                .as_deref()
+                .unwrap_or(""),
+        )?;
+        if sharing_enabled && !sharing_canary_owner_ids.is_empty() {
+            bail!(
+                "SELFHOST_SHARING_CANARY_OWNER_IDS must be empty when sharing is globally enabled"
+            )
+        }
+        let share_invites_per_source = bounded_budget(
+            "SELFHOST_SHARE_INVITES_PER_SOURCE_HOUR",
+            MAX_SHARE_INVITES_PER_SOURCE,
+        )?;
+        let share_invites_per_user = bounded_budget(
+            "SELFHOST_SHARE_INVITES_PER_USER_HOUR",
+            MAX_SHARE_INVITES_PER_USER,
+        )?;
+        let share_invite_targets_per_user = bounded_budget(
+            "SELFHOST_SHARE_INVITE_TARGETS_PER_USER_HOUR",
+            MAX_SHARE_INVITE_TARGETS_PER_USER,
+        )?;
+        let share_invites_global = bounded_budget(
+            "SELFHOST_SHARE_INVITES_GLOBAL_HOUR",
+            MAX_SHARE_INVITES_GLOBAL,
+        )?;
         Ok(Self {
             bind_host,
             control_port,
@@ -148,19 +193,25 @@ impl Config {
             public_data_host,
             database_path,
             staging_dir,
-            email: required("SELFHOST_EMAIL")?,
-            password_hash,
-            display_name: value("SELFHOST_NAME").unwrap_or_else(|| "Blackglass user".into()),
             per_file_max,
             storage_quota_bytes,
+            storage_quota_bytes_per_owner,
             session_ttl: Duration::from_secs(session_ttl_seconds),
             upload_idle_timeout: Duration::from_secs(upload_idle_timeout_seconds),
             allowed_origins,
             max_concurrent_uploads,
+            max_concurrent_uploads_per_user,
             max_ws_connections,
+            max_ws_connections_per_user,
             trusted_proxy,
             admin,
             json_logs: value("SELFHOST_LOG_FORMAT").as_deref() != Some("pretty"),
+            sharing_enabled,
+            sharing_canary_owner_ids,
+            share_invites_per_source,
+            share_invites_per_user,
+            share_invite_targets_per_user,
+            share_invites_global,
         })
     }
 
@@ -173,20 +224,30 @@ impl Config {
             public_data_host: format!("127.0.0.1:{data_port}"),
             database_path: root.join("server.sqlite"),
             staging_dir: root.join("uploads"),
-            email: "owner@example.test".into(),
-            password_hash: crate::auth::hash_password("test-password")?,
-            display_name: "Test owner".into(),
             per_file_max: 8 * 1024 * 1024,
             storage_quota_bytes: DEFAULT_STORAGE_QUOTA_BYTES,
+            storage_quota_bytes_per_owner: DEFAULT_STORAGE_QUOTA_BYTES,
             session_ttl: Duration::from_secs(3600),
             upload_idle_timeout: Duration::from_secs(DEFAULT_UPLOAD_IDLE_TIMEOUT_SECONDS),
             allowed_origins: vec!["app://obsidian.md".into()],
             max_concurrent_uploads: 2,
+            max_concurrent_uploads_per_user: 2,
             max_ws_connections: DEFAULT_MAX_WS_CONNECTIONS,
+            max_ws_connections_per_user: 4,
             trusted_proxy: None,
             admin: None,
             json_logs: false,
+            sharing_enabled: true,
+            sharing_canary_owner_ids: Vec::new(),
+            share_invites_per_source: MAX_SHARE_INVITES_PER_SOURCE,
+            share_invites_per_user: MAX_SHARE_INVITES_PER_USER,
+            share_invite_targets_per_user: MAX_SHARE_INVITE_TARGETS_PER_USER,
+            share_invites_global: MAX_SHARE_INVITES_GLOBAL,
         })
+    }
+
+    pub fn sharing_allowed_for_owner(&self, owner_user_id: i64) -> bool {
+        self.sharing_enabled || self.sharing_canary_owner_ids.contains(&owner_user_id)
     }
 }
 
@@ -199,6 +260,43 @@ fn private_or_loopback(address: IpAddr) -> bool {
 
 fn value(name: &str) -> Option<String> {
     env::var(name).ok().filter(|v| !v.is_empty())
+}
+
+fn boolean(name: &str, default: bool) -> Result<bool> {
+    match value(name).as_deref() {
+        None => Ok(default),
+        Some("true") => Ok(true),
+        Some("false") => Ok(false),
+        Some(_) => bail!("{name} must be exactly true or false"),
+    }
+}
+
+fn bounded_budget(name: &str, maximum: usize) -> Result<usize> {
+    let value = number(name, maximum)?;
+    if !(1..=maximum).contains(&value) {
+        bail!("{name} must be between 1 and {maximum}")
+    }
+    Ok(value)
+}
+
+fn parse_owner_ids(value: &str) -> Result<Vec<i64>> {
+    if value.is_empty() {
+        return Ok(Vec::new());
+    }
+    let mut ids = Vec::new();
+    for raw in value.split(',') {
+        let id = raw
+            .parse::<i64>()
+            .with_context(|| "SELFHOST_SHARING_CANARY_OWNER_IDS must contain decimal user IDs")?;
+        if !(1..=MAX_JS_SAFE_INTEGER).contains(&id) || ids.contains(&id) {
+            bail!("SELFHOST_SHARING_CANARY_OWNER_IDS contains an invalid or duplicate user ID")
+        }
+        ids.push(id);
+    }
+    if ids.len() > 8 {
+        bail!("SELFHOST_SHARING_CANARY_OWNER_IDS accepts at most 8 user IDs")
+    }
+    Ok(ids)
 }
 
 fn validate_bind_host(bind_host: IpAddr, external_bind_acknowledged: bool) -> Result<()> {
@@ -214,17 +312,6 @@ fn validate_bind_host(bind_host: IpAddr, external_bind_acknowledged: bool) -> Re
         )
     }
     Ok(())
-}
-
-fn plaintext_password_allowed(bind_host: IpAddr, configured: Option<&str>) -> Result<bool> {
-    match configured {
-        None => Ok(false),
-        Some("1") if bind_host.is_loopback() => Ok(true),
-        Some("1") => bail!(
-            "SELFHOST_ALLOW_PLAINTEXT_PASSWORD=1 is permitted only with a loopback SELFHOST_BIND_HOST"
-        ),
-        Some(_) => bail!("SELFHOST_ALLOW_PLAINTEXT_PASSWORD must be exactly 1 when set"),
-    }
 }
 
 fn validate_concurrent_uploads(value: usize) -> Result<()> {
@@ -261,6 +348,25 @@ fn validate_storage_quota(value: i64, per_file_max: u64) -> Result<()> {
         bail!(
             "SELFHOST_STORAGE_QUOTA_BYTES must be between {minimum} bytes (one maximum-size encrypted file) and {MAX_JS_SAFE_INTEGER} bytes"
         )
+    }
+    Ok(())
+}
+
+fn validate_owner_storage_quota(value: i64, global: i64, per_file_max: u64) -> Result<()> {
+    validate_storage_quota(value, per_file_max).map_err(|_| {
+        anyhow::anyhow!(
+            "SELFHOST_STORAGE_QUOTA_BYTES_PER_OWNER must hold one maximum-size encrypted file and remain JavaScript-safe"
+        )
+    })?;
+    if value > global {
+        bail!("SELFHOST_STORAGE_QUOTA_BYTES_PER_OWNER must not exceed SELFHOST_STORAGE_QUOTA_BYTES")
+    }
+    Ok(())
+}
+
+fn validate_per_user_limit(name: &str, value: usize, global: usize) -> Result<()> {
+    if value == 0 || value > global {
+        bail!("{name} must be between 1 and its corresponding global limit ({global})")
     }
     Ok(())
 }
@@ -335,9 +441,6 @@ fn parse_allowed_origins(raw: &str) -> Result<Vec<String>> {
         }
     }
     Ok(origins)
-}
-fn required(name: &str) -> Result<String> {
-    value(name).with_context(|| format!("{name} is required"))
 }
 fn number<T>(name: &str, default: T) -> Result<T>
 where
@@ -483,24 +586,6 @@ mod tests {
     }
 
     #[test]
-    fn plaintext_password_override_is_loopback_only() {
-        for bind in ["127.0.0.1", "::1"] {
-            assert!(
-                plaintext_password_allowed(bind.parse().unwrap(), Some("1")).unwrap(),
-                "loopback override rejected for {bind}"
-            );
-        }
-        for bind in ["0.0.0.0", "::", "192.0.2.10"] {
-            assert!(
-                plaintext_password_allowed(bind.parse().unwrap(), Some("1")).is_err(),
-                "external plaintext override passed for {bind}"
-            );
-        }
-        assert!(!plaintext_password_allowed("127.0.0.1".parse().unwrap(), None).unwrap());
-        assert!(plaintext_password_allowed("127.0.0.1".parse().unwrap(), Some("true")).is_err());
-    }
-
-    #[test]
     fn upload_concurrency_cannot_exceed_the_qualified_envelope() {
         for value in 1..=MAX_CONCURRENT_UPLOADS_LIMIT {
             validate_concurrent_uploads(value).unwrap();
@@ -562,6 +647,19 @@ mod tests {
             DEFAULT_STORAGE_QUOTA_BYTES, 1_099_511_627_776,
             "the compatibility default must preserve the previously advertised 1 TiB limit"
         );
+    }
+
+    #[test]
+    fn per_user_resource_limits_never_exceed_global_limits() {
+        validate_per_user_limit("connections", 1, 1).unwrap();
+        validate_per_user_limit("connections", 4, 16).unwrap();
+        assert!(validate_per_user_limit("connections", 0, 16).is_err());
+        assert!(validate_per_user_limit("connections", 5, 4).is_err());
+
+        let per_file_max = 200 * 1024 * 1024u64;
+        let minimum = (per_file_max + AES_GCM_WIRE_OVERHEAD_BYTES) as i64;
+        validate_owner_storage_quota(minimum, minimum, per_file_max).unwrap();
+        assert!(validate_owner_storage_quota(minimum + 1, minimum, per_file_max).is_err());
     }
 
     #[test]
