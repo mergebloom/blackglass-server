@@ -11,7 +11,7 @@
     "directRollbackTag": null,
     "directRollbackSupported": false
   },
-  "clientToolingRevision": "97d93106b4a62fdd243fa12df80070c26b09df39",
+  "clientToolingRevision": "ed30b6067f26669f8bf9effc80d3b8b336cae3db",
   "qualifiedRenderers": [
     {
       "version": "1.12.7",
