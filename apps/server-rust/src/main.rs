@@ -329,6 +329,7 @@ fn stream_verified_backup(source: &std::path::Path) -> Result<()> {
     let parent = source
         .parent()
         .context("backup source has no parent directory")?;
+    cleanup_stale_streamed_backups(parent)?;
     let mut temporary = None;
     for nonce in 0..16_u8 {
         let candidate = parent.join(format!(
@@ -355,6 +356,44 @@ fn stream_verified_backup(source: &std::path::Path) -> Result<()> {
     cleanup.context("remove streamed backup staging file")?;
     Ok(())
 }
+
+fn cleanup_stale_streamed_backups(parent: &std::path::Path) -> Result<()> {
+    use std::os::unix::fs::MetadataExt;
+    let current_uid = unsafe { libc::geteuid() };
+    for entry in std::fs::read_dir(parent).context("read backup source directory")? {
+        let entry = entry?;
+        let name = entry.file_name();
+        let Some(name) = name.to_str() else { continue };
+        let Some(owner_pid) = streamed_backup_owner_pid(name) else {
+            continue;
+        };
+        let metadata = std::fs::symlink_metadata(entry.path())?;
+        if !metadata.file_type().is_file()
+            || metadata.file_type().is_symlink()
+            || metadata.uid() != current_uid
+        {
+            continue;
+        }
+        let alive = unsafe { libc::kill(owner_pid, 0) } == 0
+            || std::io::Error::last_os_error().raw_os_error() == Some(libc::EPERM);
+        if !alive {
+            std::fs::remove_file(entry.path()).context("remove stale streamed backup")?;
+        }
+    }
+    Ok(())
+}
+
+fn streamed_backup_owner_pid(name: &str) -> Option<i32> {
+    let suffix = name
+        .strip_prefix(".blackglass-backup-stream-")?
+        .strip_suffix(".sqlite")?;
+    let (pid, nonce) = suffix.split_once('-')?;
+    if nonce.is_empty() || !nonce.bytes().all(|byte| byte.is_ascii_digit()) {
+        return None;
+    }
+    let pid = pid.parse::<i32>().ok()?;
+    (pid > 0).then_some(pid)
+}
 fn init_tracing(json: bool) {
     let filter = EnvFilter::try_from_default_env()
         .unwrap_or_else(|_| EnvFilter::new("info,tower_http=warn"));
@@ -365,5 +404,67 @@ fn init_tracing(json: bool) {
         builder.json().init()
     } else {
         builder.compact().init()
+    }
+}
+
+#[cfg(test)]
+mod streamed_backup_tests {
+    use super::{cleanup_stale_streamed_backups, streamed_backup_owner_pid};
+
+    #[test]
+    fn parses_only_exact_streamed_backup_names() {
+        assert_eq!(
+            streamed_backup_owner_pid(".blackglass-backup-stream-42-3.sqlite"),
+            Some(42)
+        );
+        assert_eq!(
+            streamed_backup_owner_pid(".blackglass-backup-stream-42-x.sqlite"),
+            None
+        );
+        assert_eq!(streamed_backup_owner_pid("backup-stream-42-3.sqlite"), None);
+    }
+
+    #[test]
+    fn removes_dead_owner_regular_files_and_preserves_foreign_entries() {
+        use std::os::unix::fs::symlink;
+        let directory = tempfile::tempdir().unwrap();
+        let stale = directory
+            .path()
+            .join(".blackglass-backup-stream-2147483647-0.sqlite");
+        let foreign = directory
+            .path()
+            .join(".blackglass-backup-stream-not-owned.sqlite");
+        let link = directory
+            .path()
+            .join(".blackglass-backup-stream-2147483647-1.sqlite");
+        std::fs::write(&stale, b"stale").unwrap();
+        std::fs::write(&foreign, b"foreign").unwrap();
+        symlink(&foreign, &link).unwrap();
+        cleanup_stale_streamed_backups(directory.path()).unwrap();
+        assert!(!stale.exists());
+        assert!(foreign.exists());
+        assert!(
+            std::fs::symlink_metadata(link)
+                .unwrap()
+                .file_type()
+                .is_symlink()
+        );
+    }
+
+    #[test]
+    fn preserves_live_owner_files_and_matching_directories() {
+        let directory = tempfile::tempdir().unwrap();
+        let live = directory.path().join(format!(
+            ".blackglass-backup-stream-{}-0.sqlite",
+            std::process::id()
+        ));
+        let foreign_directory = directory
+            .path()
+            .join(".blackglass-backup-stream-2147483647-2.sqlite");
+        std::fs::write(&live, b"live").unwrap();
+        std::fs::create_dir(&foreign_directory).unwrap();
+        cleanup_stale_streamed_backups(directory.path()).unwrap();
+        assert_eq!(std::fs::read(live).unwrap(), b"live");
+        assert!(foreign_directory.is_dir());
     }
 }

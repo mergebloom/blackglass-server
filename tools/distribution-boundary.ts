@@ -13,11 +13,13 @@ const patterns = [
   /\bgithub_pat_[A-Za-z0-9_]{30,}\b/u,
 ];
 const artifactPath = /(?:^|\/)\S+\.(?:asar|dmg|pkg)(?:$|\/)|(?:^|\/)\S+\.app(?:$|\/)/iu;
+const sensitivePath = /(?:^|\/)\.env$|\.(?:sqlite|sqlite3|db|pem|key)$|(?:^|\/)(?:credentials|secrets?|tokens?)(?:\.[^/]*)?$/iu;
 const failures: string[] = [];
 const files = git(["ls-files", "-z", "--cached", "--others", "--exclude-standard"])
   .split("\0").filter(Boolean).sort();
 for (const path of files) {
   if (artifactPath.test(path)) failures.push(`${path}: proprietary client artifact path`);
+  if (sensitivePath.test(path)) failures.push(`${path}: sensitive deployment or runtime data path`);
   const bytes = await readFile(resolve(root, path));
   if (!bytes.includes(0)) inspect(path, bytes.toString("utf8"));
 }

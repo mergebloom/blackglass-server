@@ -13,6 +13,16 @@ owner/collaborator/outsider isolation, revocation, reinvitation, self-leave,
 and clean-device recovery are implemented and exercised by the companion
 conformance suite.
 
+## Supported scope
+
+The initial platform is Linux server deployment on amd64 or arm64 with the
+companion Apple Silicon macOS Bridge. Sync, custom client-managed E2EE, managed
+encryption, sharing, membership lifecycle, and clean-device recovery are the
+product flow. Exact renderer/Bridge/Server combinations are listed only in the
+Bridge's generated [compatibility matrix](https://github.com/mergebloom/blackglass-bridge/blob/main/compatibility/MATRIX.md).
+Windows, Linux desktop, Intel Mac, mobile clients, and unrelated Obsidian
+services are future work and are not claimed here.
+
 ## Deploy with Docker Compose
 
 Requirements: a 64-bit Linux Docker host, Docker Compose, two DNS names pointed

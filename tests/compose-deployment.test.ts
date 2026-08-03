@@ -21,6 +21,12 @@ describe("one-command production deployment", () => {
     expect(compose).toContain("SELFHOST_ALLOWED_ORIGINS: app://obsidian.md");
     expect(compose).toContain("SELFHOST_TRUSTED_PROXY: 127.0.0.1");
     expect(compose).not.toMatch(/^\s+ports:/mu);
+    expect(compose).toContain("service_completed_successfully");
+    expect(compose).toContain("exec chown -R 65532:65532 /var/lib/blackglass-server /data /config");
+    expect(compose).not.toMatch(/^\s+command:/mu);
+    expect(compose).toContain("network_mode: none");
+    expect(compose).toContain("pids_limit: 16");
+    expect(compose).toContain("mem_limit: 32m");
   });
 
   test("keeps operational endpoints private and overwrites forwarded identity", () => {
@@ -32,11 +38,21 @@ describe("one-command production deployment", () => {
   test("provides password-safe init plus verified backup and restore commands", () => {
     expect(operations).toContain("pipe the new account password on standard input");
     expect(operations).not.toContain("--password");
+    expect(operations).toContain("compose run --rm -T permissions");
     expect(operations).toContain("backup-stdout");
     expect(operations).toContain("refusing to overwrite backup output");
+    expect(operations).toContain("backup checksum is required and must be a regular file");
+    expect(operations).toContain("its checksum was rolled back");
     expect(operations).toContain("restore /backup.sqlite /tmp/restored.sqlite");
     const syntax = Bun.spawnSync(["sh", "-n", resolve(root, "ops/compose-ops.sh")]);
     expect(syntax.exitCode, syntax.stderr.toString()).toBe(0);
+  });
+
+  test("keeps private deployment configuration out of Git", () => {
+    const ignored = Bun.spawnSync(["git", "check-ignore", "-q", ".env"], { cwd: root });
+    expect(ignored.exitCode).toBe(0);
+    const example = Bun.spawnSync(["git", "check-ignore", "-q", ".env.example"], { cwd: root });
+    expect(example.exitCode).not.toBe(0);
   });
 
   test("renders a complete Compose model when Docker Compose is available", () => {

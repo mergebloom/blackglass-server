@@ -1,6 +1,33 @@
 name: blackglass
 
 services:
+  permissions:
+    image: ${BLACKGLASS_CADDY_IMAGE:-caddy:2.10.2-alpine@sha256:4c6e91c6ed0e2fa03efd5b44747b625fec79bc9cd06ac5235a779726618e530d}
+    user: "0:0"
+    read_only: true
+    restart: "no"
+    network_mode: none
+    pids_limit: 16
+    mem_limit: 32m
+    memswap_limit: 32m
+    entrypoint:
+      - /bin/sh
+      - -eu
+      - -c
+      - exec chown -R 65532:65532 /var/lib/blackglass-server /data /config
+    volumes:
+      - blackglass-data:/var/lib/blackglass-server
+      - blackglass-caddy-data:/data
+      - blackglass-caddy-config:/config
+    cap_drop:
+      - ALL
+    cap_add:
+      - CHOWN
+      - FOWNER
+      - DAC_OVERRIDE
+    security_opt:
+      - no-new-privileges:true
+
   server:
     image: ${BLACKGLASS_SERVER_IMAGE:?set BLACKGLASS_SERVER_IMAGE in .env}
     network_mode: host
@@ -41,6 +68,9 @@ services:
       timeout: 5s
       start_period: 10s
       retries: 3
+    depends_on:
+      permissions:
+        condition: service_completed_successfully
 
   caddy:
     image: ${BLACKGLASS_CADDY_IMAGE:-caddy:2.10.2-alpine@sha256:4c6e91c6ed0e2fa03efd5b44747b625fec79bc9cd06ac5235a779726618e530d}
@@ -49,6 +79,8 @@ services:
     restart: unless-stopped
     read_only: true
     depends_on:
+      permissions:
+        condition: service_completed_successfully
       server:
         condition: service_healthy
     environment:

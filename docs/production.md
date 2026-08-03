@@ -244,8 +244,8 @@ Alert on `blackglass_share_invites_total{outcome="rate_limited"}`. The fixed
 outcome labels contain no email address, user ID, vault ID, or target digest.
 
 The `v0.5.0` archive includes `release-contract.json`. Release automation
-checks that it binds server 0.5.0 to schema 6 and schema-5 migration input,
-the previous rollback tag, the exact client tooling revision, both qualified
+checks that it binds server 0.5.0 to schema 6 and schema-4/schema-5 migration input,
+the exact published-predecessor and direct-rollback boundary, the exact client tooling revision, both qualified
 renderer baselines, and the required primary/recovery monitoring selectors.
 
 ## Backup and recovery
@@ -278,6 +278,22 @@ current-schema file into another new path:
 ```sh
 blackglass-server migrate old-backup.sqlite migrated-backup.sqlite
 blackglass-server recover-stale-backup migrated-backup.sqlite recovered.sqlite
+```
+
+Schema-4 databases from the previous published `v0.2.5` release require the
+initial owner while the copy-first migration creates the multi-user schema.
+Generate the password hash from standard input, keep it out of shell history,
+and run the exact new binary while the old service is stopped:
+
+```sh
+read -r -s BLACKGLASS_MIGRATION_PASSWORD
+export SELFHOST_PASSWORD_HASH=$(printf '%s\n' "$BLACKGLASS_MIGRATION_PASSWORD" | \
+  blackglass-server hash-password)
+unset BLACKGLASS_MIGRATION_PASSWORD
+export SELFHOST_EMAIL=owner@example.com SELFHOST_NAME='Vault owner'
+blackglass-server migrate server-v4.sqlite server-v6.sqlite
+unset SELFHOST_PASSWORD_HASH SELFHOST_EMAIL SELFHOST_NAME
+blackglass-server verify server-v6.sqlite
 ```
 
 Both recovery commands establish a new recovery epoch: every remote vault ID
@@ -330,10 +346,11 @@ input/output inside the transaction and rolls back on failure. The Phase 4
 migration accepts a schema-v5 source, creates a new schema-v6 file, starts with
 no memberships, and invalidates existing sessions for one required re-login.
 Keep the exact v0.3.0 binary and untouched v5 source until a v5-to-v6 migration
-is activated; never run it against schema v6. The v0.5.0 release does not
-change schema v6, so its direct rollback boundary is v0.4.5 after stopping the
-service and verifying the database. Once a future release accepts writes on a
-newer schema, recovery becomes roll-forward only.
+is activated; never run it against schema v6. There is no published schema-v6
+predecessor for v0.5.0: the previous published tag, v0.2.5, supports schema v4
+and is not a direct binary rollback target. Preserve the exact pre-migration
+binary and untouched database privately when upgrading. Once a release accepts
+writes on a newer schema, recovery becomes roll-forward only.
 
 A pre-v4/pre-0.2.2 rollback is safe only before activation, while the untouched
 old database has received no client writes. After the new database has served

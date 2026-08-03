@@ -144,17 +144,22 @@ jq -e \
         "clientToolingRevision",
         "database",
         "monitoring",
-        "previousRollbackTag",
+        "rollback",
         "qualifiedRenderers",
         "schemaVersion",
         "serverVersion",
         "sharingEnabled"
       ] | sort) and
-      .schemaVersion == 1 and
+      .schemaVersion == 2 and
       .serverVersion == $version and
       .database.destinationSchema == $schema and
-      .database.supportedSourceSchemas == [5] and
-      .previousRollbackTag == "v0.4.5" and
+      .database.supportedSourceSchemas == [4, 5] and
+      .rollback == {
+        "previousPublishedTag": "v0.2.5",
+        "previousPublishedSchema": 4,
+        "directRollbackTag": null,
+        "directRollbackSupported": false
+      } and
       (.clientToolingRevision | test("^[a-f0-9]{40}$")) and
       (.qualifiedRenderers | map(.version)) == ["1.12.7", "1.13.4"] and
       all(.qualifiedRenderers[]; .baselineSha256 | test("^[a-f0-9]{64}$")) and

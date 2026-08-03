@@ -49,6 +49,7 @@ case "$command" in
             echo "pipe the new account password on standard input; it is never accepted as an argument" >&2
             exit 2
         }
+        compose run --rm -T permissions
         compose run --rm --no-deps -T server \
             user create /var/lib/blackglass-server/server.sqlite "$2" "$3"
         ;;
@@ -71,6 +72,7 @@ case "$command" in
         output="$output_parent/$(basename -- "$output")"
         temporary="$output.partial.$$"
         checksum="$output.sha256"
+        checksum_temporary="$checksum.partial.$$"
         [ ! -e "$temporary" ] && [ ! -L "$temporary" ] || {
             echo "backup staging path already exists: $temporary" >&2
             exit 1
@@ -79,32 +81,56 @@ case "$command" in
             echo "refusing to overwrite backup checksum: $checksum" >&2
             exit 1
         }
+        [ ! -e "$checksum_temporary" ] && [ ! -L "$checksum_temporary" ] || {
+            echo "backup checksum staging path already exists: $checksum_temporary" >&2
+            exit 1
+        }
         umask 077
-        trap 'rm -f -- "$temporary"' EXIT HUP INT TERM
+        trap 'rm -f -- "$temporary" "$checksum_temporary"' EXIT HUP INT TERM
         compose exec -T server backup-stdout \
             /var/lib/blackglass-server/server.sqlite > "$temporary"
         [ -s "$temporary" ] || {
             echo "backup stream was empty" >&2
             exit 1
         }
-        mv -- "$temporary" "$output"
-        trap - EXIT HUP INT TERM
         if command -v sha256sum >/dev/null 2>&1; then
-            (cd -- "$output_parent" && sha256sum "$(basename -- "$output")" > "$(basename -- "$checksum")")
+            digest_line=$(sha256sum "$temporary")
         else
-            (cd -- "$output_parent" && shasum -a 256 "$(basename -- "$output")" > "$(basename -- "$checksum")")
+            digest_line=$(shasum -a 256 "$temporary")
         fi
+        digest=$(printf '%s\n' "$digest_line" | awk '{print $1}')
+        case "$digest" in
+            [0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f]*) ;;
+            *) echo "backup checksum generation returned malformed output" >&2; exit 1 ;;
+        esac
+        [ "${#digest}" -eq 64 ] || {
+            echo "backup checksum generation returned malformed output" >&2
+            exit 1
+        }
+        printf '%s  %s\n' "$digest" "$(basename -- "$output")" > "$checksum_temporary"
+        mv -- "$checksum_temporary" "$checksum"
+        if ! mv -- "$temporary" "$output"; then
+            if ! mv -- "$checksum" "$checksum_temporary"; then
+                echo "backup publication and checksum rollback both failed" >&2
+                exit 1
+            fi
+            echo "backup publication failed; its checksum was rolled back" >&2
+            exit 1
+        fi
+        trap - EXIT HUP INT TERM
         printf '%s\n%s\n' "$output" "$checksum"
         ;;
     verify-backup|restore-drill)
         [ "$#" -eq 2 ] || usage
         require_regular_backup "$2"
-        if [ -f "$backup.sha256" ]; then
-            if command -v sha256sum >/dev/null 2>&1; then
-                (cd -- "$(dirname -- "$backup")" && sha256sum -c "$(basename -- "$backup.sha256")")
-            else
-                (cd -- "$(dirname -- "$backup")" && shasum -a 256 -c "$(basename -- "$backup.sha256")")
-            fi
+        [ -f "$backup.sha256" ] && [ ! -L "$backup.sha256" ] || {
+            echo "backup checksum is required and must be a regular file: $backup.sha256" >&2
+            exit 1
+        }
+        if command -v sha256sum >/dev/null 2>&1; then
+            (cd -- "$(dirname -- "$backup")" && sha256sum -c "$(basename -- "$backup.sha256")")
+        else
+            (cd -- "$(dirname -- "$backup")" && shasum -a 256 -c "$(basename -- "$backup.sha256")")
         fi
         if [ "$command" = verify-backup ]; then
             compose run --rm --no-deps -T --user 0:0 \

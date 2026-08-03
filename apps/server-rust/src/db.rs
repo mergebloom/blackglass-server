@@ -5011,6 +5011,46 @@ mod tests {
     }
 
     #[test]
+    fn previous_published_v4_schema_migrates_copy_first_to_v6() {
+        let dir = tempfile::tempdir().unwrap();
+        let source = dir.path().join("published-v4.sqlite");
+        let destination = dir.path().join("current-v6.sqlite");
+        create_v1_database(&source);
+        let connection = Connection::open(&source).unwrap();
+        connection
+            .pragma_update(None, "foreign_keys", "ON")
+            .unwrap();
+        apply_migration(&connection, 2, MIGRATION_2_SQL).unwrap();
+        apply_migration(&connection, 3, MIGRATION_3_SQL).unwrap();
+        apply_migration(&connection, 4, MIGRATION_4_SQL).unwrap();
+        assert_eq!(verify_recorded_schema(&connection).unwrap(), 4);
+        drop(connection);
+        let source_before = std::fs::read(&source).unwrap();
+
+        migrate_versioned_database(&source, &destination).unwrap();
+
+        assert_eq!(std::fs::read(&source).unwrap(), source_before);
+        verify_database(&destination).unwrap();
+        let migrated = Db::open(&destination).unwrap();
+        migrated
+            .with(|connection| {
+                assert_eq!(migration_versions(connection)?, vec![1, 2, 3, 4, 5, 6]);
+                assert_eq!(
+                    connection
+                        .query_row("SELECT COUNT(*) FROM users", [], |row| row.get::<_, i64>(0))?,
+                    1
+                );
+                assert_eq!(
+                    connection.query_row("SELECT COUNT(*) FROM sessions", [], |row| row
+                        .get::<_, i64>(0))?,
+                    0
+                );
+                Ok(())
+            })
+            .unwrap();
+    }
+
+    #[test]
     fn current_schema_migration_is_rejected_without_creating_a_copy() {
         let dir = tempfile::tempdir().unwrap();
         let source = dir.path().join("current.sqlite");
