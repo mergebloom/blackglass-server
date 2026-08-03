@@ -49,7 +49,9 @@ case "$command" in
             echo "pipe the new account password on standard input; it is never accepted as an argument" >&2
             exit 2
         }
-        compose run --rm -T permissions
+        # The permissions helper must never inherit the account-password
+        # stream. Docker Compose may otherwise drain stdin before user create.
+        compose run --rm -T permissions </dev/null
         compose run --rm --no-deps -T server \
             user create /var/lib/blackglass-server/server.sqlite "$2" "$3"
         ;;
@@ -59,7 +61,7 @@ case "$command" in
         ;;
     health)
         [ "$#" -eq 1 ] || usage
-        compose exec -T server healthcheck
+        compose exec -T server /usr/local/bin/blackglass-server healthcheck
         ;;
     backup)
         [ "$#" -eq 2 ] || usage
@@ -87,7 +89,7 @@ case "$command" in
         }
         umask 077
         trap 'rm -f -- "$temporary" "$checksum_temporary"' EXIT HUP INT TERM
-        compose exec -T server backup-stdout \
+        compose exec -T server /usr/local/bin/blackglass-server backup-stdout \
             /var/lib/blackglass-server/server.sqlite > "$temporary"
         [ -s "$temporary" ] || {
             echo "backup stream was empty" >&2

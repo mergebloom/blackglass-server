@@ -26,7 +26,11 @@ test("runs the permission bootstrap before first-account initialization", async 
   const log = join(fixture.root, "docker.log");
   await executable(join(fixture.bin, "docker"), `#!/bin/sh
 printf '%s\n' "$*" >> "$FAKE_DOCKER_LOG"
-case "$*" in *permissions*) exit 0 ;; *'user create'*) read password; [ -n "$password" ] ;; *) exit 0 ;; esac
+case "$*" in
+  *permissions*) read ignored || true; exit 0 ;;
+  *'user create'*) read password; [ "$password" = safe-test-password ] ;;
+  *) exit 0 ;;
+esac
 `);
   const result = Bun.spawnSync(["/bin/sh", script, "init", "owner@example.test", "Owner"], {
     cwd: root,
@@ -42,6 +46,15 @@ case "$*" in *permissions*) exit 0 ;; *'user create'*) read password; [ -n "$pas
   const invocations = (await readFile(log, "utf8")).trim().split("\n");
   expect(invocations[0]).toContain("run --rm -T permissions");
   expect(invocations[1]).toContain("run --rm --no-deps -T server user create");
+});
+
+test("runs the health probe through the server executable", async () => {
+  const fixture = await fixtureDirectory();
+  await executable(join(fixture.bin, "docker"), `#!/bin/sh
+[ "$*" = "compose --env-file .env.example -f compose.yaml exec -T server /usr/local/bin/blackglass-server healthcheck" ]
+`);
+  const result = run(fixture.bin, ["health"]);
+  expect(result.exitCode, result.stderr.toString()).toBe(0);
 });
 
 test("rejects checksum mismatch before invoking the restore container", async () => {
@@ -86,7 +99,8 @@ async function fixtureDirectory(): Promise<{ root: string; bin: string }> {
   await mkdir(bin);
   await executable(join(bin, "docker"), `#!/bin/sh
 case "$*" in
-  *backup-stdout*) printf %s sqlite-backup-bytes ;;
+  *'/usr/local/bin/blackglass-server backup-stdout'*) printf %s sqlite-backup-bytes ;;
+  *backup-stdout*) exit 11 ;;
   *) exit 0 ;;
 esac
 `);
