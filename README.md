@@ -1,137 +1,125 @@
 # Blackglass Server
 
-Blackglass Server is a lean, self-hosted Sync backend for qualified Obsidian
-desktop clients. It preserves the client's built-in Sync and end-to-end
-encryption flows while replacing Obsidian's remote control and data services.
+Blackglass Server is a lean Rust/SQLite replacement for the hosted Sync service
+used by a [Blackglass Bridge](https://github.com/mergebloom/blackglass-bridge)-adapted
+Obsidian desktop application. The intended outcome is native desktop Sync with
+a server, domains, TLS, database, attachments, backups, and retention entirely
+under the operator’s control.
 
-Blackglass is independent and is not affiliated with or endorsed by Obsidian.
+It requires no Blackglass-operated service, sends no telemetry, and has no
+required outbound application dependency. SQLite and staged/blob data live in
+one portable data root. Custom client-managed E2EE and managed encryption,
+owner/collaborator/outsider isolation, revocation, reinvitation, self-leave,
+and clean-device recovery are implemented and exercised by the companion
+conformance suite.
 
-## Project goal
+## Deploy with Docker Compose
 
-The intended outcome is to let people host their own Obsidian-compatible Sync
-service and keep using the Obsidian desktop app's built-in Sync experience,
-without losing Sync functionality. The operator controls the service, encrypted
-vault data, backups, retention, and deployment, providing data sovereignty and
-privacy without dependence on Obsidian's hosted Sync infrastructure. End-to-end
-encryption protects vault contents; as noted in the security model below, the
-server can still observe some metadata.
-
-The stable server/client boundary and Blackglass's small, fail-closed
-endpoint adaptation are designed to make qualification of future Obsidian
-releases repeatable and low-maintenance rather than a continuing fork of the
-application.
-
-Blackglass began as a research project exploring how frontier language models
-can support protocol analysis, clean-room compatible implementation, release
-adaptation, and end-to-end validation. Generated findings remain subject to the
-same tests, artifact hashes, and release gates as any other contribution.
-
-## Supported scope
-
-| Area | Current support |
-| --- | --- |
-| Deployment | Multiple administrator-provisioned accounts, one server node, local SQLite storage |
-| Sync | Vault collaboration, history, upload, download, and recovery |
-| Encryption | Client-managed and server-managed encrypted vaults |
-| Client target | macOS desktop on Apple Silicon; Obsidian renderer 1.12.7 first |
-| Server hosts | 64-bit Linux on amd64 or arm64; native binary or OCI image |
-
-Publish, public registration, high availability, mobile clients, Windows
-servers, and 32-bit hosts are not supported yet.
-
-## Architecture
-
-The server runs one Rust process with separate HTTP control and WebSocket Sync
-listeners. Native installs and the OCI image default to loopback. The supported
-Linux Docker deployment uses host networking so host Caddy can reach those
-listeners without publishing plaintext ports. Caddy is the only public
-listener. SQLite stores opaque ciphertext and protocol state behind an atomic
-retained-history quota. Blackglass owns the small,
-release-specific client endpoint adapter.
-
-See [architecture](docs/architecture.md) for the component and trust boundaries.
-
-## Quick start
-
-Requirement: Rust 1.92 or newer.
+Requirements: a 64-bit Linux Docker host, Docker Compose, two DNS names pointed
+at the host, and inbound ports 80/443. Copy the example and pin a published
+version or image digest:
 
 ```sh
-cargo test --locked --manifest-path apps/server-rust/Cargo.toml
+cp .env.example .env
+chmod 0600 .env
+${EDITOR:-vi} .env
+./ops/compose-ops.sh config
 ```
 
-Start a loopback-only development server:
+Create the initial account before exposing the service. The password is read
+only from standard input:
 
 ```sh
-printf '%s\n' 'replace-this' | cargo run --release --locked \
-  --manifest-path apps/server-rust/Cargo.toml -- \
-  user create ./selfhost-sync.sqlite admin@example.test 'Local admin'
-cargo run --release --locked \
-  --manifest-path apps/server-rust/Cargo.toml -- serve
+read -r -s BLACKGLASS_INITIAL_PASSWORD
+printf '%s\n' "$BLACKGLASS_INITIAL_PASSWORD" | \
+  ./ops/compose-ops.sh init owner@example.com 'Vault owner'
+unset BLACKGLASS_INITIAL_PASSWORD
+./ops/compose-ops.sh up
+./ops/compose-ops.sh health
 ```
 
-The default listeners are `127.0.0.1:3000` and `127.0.0.1:3003`.
-Account passwords are read from standard input by offline user-management
-commands and stored only as bounded Argon2id hashes in SQLite. Serving does not
-read account credentials from environment variables. Plaintext transport is
-for loopback development only.
+Caddy obtains TLS certificates for the exact control and data domains. The
+Server runs as uid/gid 65532 with a read-only root filesystem, dropped
+capabilities, bounded memory/PIDs/file descriptors, a native readiness probe,
+graceful shutdown, and one explicit persistent data volume. Plaintext service
+ports remain loopback-only on the Linux host.
 
-An optional dependency-free, read-only admin console can run on a third,
-independently configured listener. It is disabled unless all three admin
-variables are set, is never mounted on either Sync listener, and accepts a
-separate 64-character lowercase-hex bearer token whose configuration contains
-only a SHA-256 hash. See the production guide; never publish this listener to
-the Internet.
-
-## Deploy
-
-Tagged releases produce checksummed static-musl archives and separately
-downloadable raw binaries for `linux-amd64` and `linux-arm64`, plus a minimal
-non-root multi-architecture OCI image. Archives, raw-binary release assets, and
-the image include the applicable project and third-party license notices. Start
-with [distribution](docs/distribution.md) to select and verify an artifact, then use
-[production operations](docs/production.md) for TLS, systemd, backups,
-monitoring, upgrades, and recovery.
-
-The production executable is `blackglass-server`:
+Export and test a verified online backup:
 
 ```sh
-blackglass-server --version
-blackglass-server --help
+./ops/compose-ops.sh backup /safe/off-host/blackglass.sqlite
+./ops/compose-ops.sh verify-backup /safe/off-host/blackglass.sqlite
+./ops/compose-ops.sh restore-drill /safe/off-host/blackglass.sqlite
 ```
 
-## Security model
+The [production guide](docs/production.md) covers monitoring, account changes,
+scheduled off-host backups, real recovery, upgrades, schema migration, and
+rollback. Back up and run a restore drill before changing an image digest.
 
-Clients encrypt content, paths, and hashes before transmission. With a custom
-vault password, the server never receives that password and cannot decrypt the
-vault; it can still observe metadata and is trusted for availability and
-revision ordering. In the built-in managed-encryption mode, the server securely
-generates and stores the recovery password, so the operator is additionally in
-the confidentiality trust boundary. Account passwords use Argon2id; sessions
-are expiring, revocable bearer tokens whose digests are stored. Production
-defaults to loopback behind HTTPS/WSS, and memory use is bounded by frame and
-concurrency limits. The qualified container topology keeps loopback binding and
-uses Linux host networking behind host Caddy.
+## Standalone Linux artifacts
 
-Read the full [security model](docs/security.md). Report vulnerabilities using
-[SECURITY.md](SECURITY.md), not a public issue.
+Releases provide separate static-musl executables and compressed archives for
+`linux-amd64` and `linux-arm64`, adjacent checksums, resource reports, license
+notices, `SHA256SUMS`, and multi-architecture OCI metadata. Every executable
+reports its semantic version and embedded source revision:
 
-## Validation
+```sh
+shasum -a 256 -c blackglass-server-vVERSION-linux-amd64.sha256
+chmod 0755 blackglass-server-vVERSION-linux-amd64
+./blackglass-server-vVERSION-linux-amd64 --version
+./blackglass-server-vVERSION-linux-amd64 build-info
+```
 
-Artifact-bound resource reports ship with each tagged release;
-[docs/validation](docs/validation/README.md) documents the evidence model.
-Rebuilding a binary changes its hash and requires the artifact-level
-qualification gates to run again.
+See [distribution](docs/distribution.md) for archive verification, provenance,
+container digests, local builds, supported Linux hosts, and systemd installation.
+
+## Develop and validate
+
+```sh
+npm ci
+bun run check
+```
+
+The production service is Rust; Bun is development/test orchestration only.
+Release builders use immutable Git source, locked Rust dependencies,
+digest-pinned build inputs, reusable architecture-specific caches, and exact
+artifact verification. The test suite covers protocol behavior, authentication,
+authorization, quotas, database durability and corruption handling, migration,
+backup/recovery, resource gates, Linux packaging, OCI publication metadata,
+and dependency/license notices.
+
+## Project boundary
+
+This repository owns the Rust service, SQLite schema and migrations,
+Linux/container release artifacts, deployment, backup, restore, and operations.
+The Bridge repository owns official-client inspection, local adaptation, macOS
+packaging, client artifacts, E2E orchestration, and the exact compatibility
+matrix. Server protocol evidence is linked into those client release claims;
+client implementation details are not duplicated here.
+
+The public repository contains no Obsidian application, ASAR, extracted source,
+proprietary assets, credentials, private domains, vault data, or private
+deployment details. Repository and release gates scan that boundary.
+
+Obsidian is a third-party product. Blackglass is independent and is not
+affiliated with or endorsed by Obsidian. Users must supply their own legitimate
+Obsidian installation to the companion Bridge. This is a distribution note,
+not a legal conclusion.
+
+Blackglass began as a research project exploring frontier LLM capabilities in
+software analysis, compatibility engineering, implementation, and end-to-end
+validation. Support claims remain tied to deterministic conformance evidence.
 
 ## Documentation
 
 | Guide | Purpose |
 | --- | --- |
-| [Architecture](docs/architecture.md) | Components, persistence, and compatibility boundary |
-| [Production](docs/production.md) | Hardened deployment, operations, backup, and rollback |
-| [Distribution](docs/distribution.md) | Linux artifacts, containers, checksums, and provenance |
-| [Protocol](docs/protocol/obsidian-1.12.7.md) | Observed Sync contract for the qualified renderer |
-| [E2E](docs/e2e.md) | Cross-project validation procedure |
+| [Production](docs/production.md) | Secure configuration, operations, backup, upgrade, rollback |
+| [Distribution](docs/distribution.md) | Linux binaries, archives, OCI image, verification |
+| [Security](docs/security.md) | Threat model and controls |
+| [Architecture](docs/architecture.md) | Rust/SQLite service design |
+| [Protocol](docs/protocol/obsidian-1.12.7.md) | Observed Sync contract |
+| [Validation](docs/validation/README.md) | Preserved protocol and scenario evidence |
 
-Development requirements are in [CONTRIBUTING.md](CONTRIBUTING.md). The
-independently written server is licensed under the [MIT License](LICENSE); that
-license does not cover Obsidian or any proprietary client artifact.
+See [CONTRIBUTING.md](CONTRIBUTING.md), [SECURITY.md](SECURITY.md), and the
+[MIT License](LICENSE).

@@ -177,5 +177,7 @@ EXPOSE 3000 3003
 VOLUME ["/var/lib/blackglass-server"]
 USER 65532:65532
 WORKDIR /var/lib/blackglass-server
+HEALTHCHECK --interval=30s --timeout=5s --start-period=10s --retries=3 \
+  CMD ["/usr/local/bin/blackglass-server", "healthcheck"]
 ENTRYPOINT ["/usr/local/bin/blackglass-server"]
 CMD ["serve"]

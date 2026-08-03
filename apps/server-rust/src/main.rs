@@ -8,8 +8,11 @@ mod server;
 use anyhow::{Context, Result, bail};
 use std::{
     io::{self, Read},
+    net::{IpAddr, Ipv4Addr, Ipv6Addr},
     path::PathBuf,
+    time::Duration,
 };
+use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tracing_subscriber::EnvFilter;
 
 const NAME: &str = "blackglass-server";
@@ -52,6 +55,7 @@ async fn main() -> Result<()> {
             );
             Ok(())
         }
+        [command] if command == "healthcheck" => healthcheck().await,
         [command] if command == "hash-password" => {
             let password = read_password()?;
             println!("{}", auth::hash_password(&password)?);
@@ -142,6 +146,9 @@ async fn main() -> Result<()> {
             db::backup_database(&source, &output)?;
             println!("backup verified: {}", output.display());
             Ok(())
+        }
+        [command, source] if command == "backup-stdout" => {
+            stream_verified_backup(&PathBuf::from(source))
         }
         [command, path] if command == "verify" => {
             let path = PathBuf::from(path);
@@ -257,7 +264,7 @@ fn parse_user_id(value: &str) -> Result<i64> {
 fn print_help() {
     println!(
         "{NAME} {VERSION}\n\n\
-Usage:\n  {NAME} serve\n  {NAME} hash-password\n  {NAME} backup <database> <output>\n  \
+Usage:\n  {NAME} serve\n  {NAME} hash-password\n  {NAME} backup <database> <output>\n  {NAME} backup-stdout <database>\n  \
 {NAME} user list <database>\n  {NAME} user create <database> <email> <name>\n  \
 {NAME} user set-password <database> <user-id>\n  \
 {NAME} user set-email <database> <user-id> <email>\n  \
@@ -269,8 +276,84 @@ Usage:\n  {NAME} serve\n  {NAME} hash-password\n  {NAME} backup <database> <outp
 {NAME} migrate-legacy <legacy-database> <new-database>\n  \
 {NAME} rebind-data-host <database> <new-host> <backup>\n  \
 {NAME} purge-deleted <database> <vault-id> <backup>\n  \
-{NAME} revoke-all-sessions <database>\n  {NAME} build-info\n  {NAME} --version\n  {NAME} --help"
+{NAME} revoke-all-sessions <database>\n  {NAME} healthcheck\n  {NAME} build-info\n  {NAME} --version\n  {NAME} --help"
     );
+}
+
+async fn healthcheck() -> Result<()> {
+    let configured = std::env::var("SELFHOST_BIND_HOST").unwrap_or_else(|_| "127.0.0.1".into());
+    let address = configured
+        .parse::<IpAddr>()
+        .map_err(|_| anyhow::anyhow!("SELFHOST_BIND_HOST must be an IP address"))?;
+    let probe_address = match address {
+        IpAddr::V4(value) if value.is_unspecified() => IpAddr::V4(Ipv4Addr::LOCALHOST),
+        IpAddr::V6(value) if value.is_unspecified() => IpAddr::V6(Ipv6Addr::LOCALHOST),
+        value => value,
+    };
+    let port = std::env::var("SELFHOST_CONTROL_PORT")
+        .unwrap_or_else(|_| "3000".into())
+        .parse::<u16>()
+        .context("SELFHOST_CONTROL_PORT must be a port from 1 to 65535")?;
+    if port == 0 {
+        bail!("SELFHOST_CONTROL_PORT must be a port from 1 to 65535");
+    }
+    let authority = match probe_address {
+        IpAddr::V4(value) => format!("{value}:{port}"),
+        IpAddr::V6(value) => format!("[{value}]:{port}"),
+    };
+    let mut stream = tokio::time::timeout(
+        Duration::from_secs(3),
+        tokio::net::TcpStream::connect((probe_address, port)),
+    )
+    .await
+    .context("readiness connection timed out")?
+    .context("readiness connection failed")?;
+    let request = format!("GET /ready HTTP/1.1\r\nHost: {authority}\r\nConnection: close\r\n\r\n");
+    stream.write_all(request.as_bytes()).await?;
+    let mut response = Vec::with_capacity(1024);
+    tokio::time::timeout(
+        Duration::from_secs(3),
+        (&mut stream).take(65_536).read_to_end(&mut response),
+    )
+    .await
+    .context("readiness response timed out")??;
+    let response = String::from_utf8(response).context("readiness response was not UTF-8")?;
+    if !response.starts_with("HTTP/1.1 200 ") || !response.contains("\r\n\r\n{\"ok\":true") {
+        bail!("readiness probe failed");
+    }
+    println!("ready");
+    Ok(())
+}
+
+fn stream_verified_backup(source: &std::path::Path) -> Result<()> {
+    let parent = source
+        .parent()
+        .context("backup source has no parent directory")?;
+    let mut temporary = None;
+    for nonce in 0..16_u8 {
+        let candidate = parent.join(format!(
+            ".blackglass-backup-stream-{}-{nonce}.sqlite",
+            std::process::id(),
+        ));
+        if !candidate.exists() {
+            temporary = Some(candidate);
+            break;
+        }
+    }
+    let temporary = temporary.context("unable to allocate a backup streaming path")?;
+    db::backup_database(source, &temporary)?;
+    let result = (|| -> Result<()> {
+        let mut backup = std::fs::File::open(&temporary)?;
+        let stdout = std::io::stdout();
+        let mut output = stdout.lock();
+        std::io::copy(&mut backup, &mut output)?;
+        std::io::Write::flush(&mut output)?;
+        Ok(())
+    })();
+    let cleanup = std::fs::remove_file(&temporary);
+    result?;
+    cleanup.context("remove streamed backup staging file")?;
+    Ok(())
 }
 fn init_tracing(json: bool) {
     let filter = EnvFilter::try_from_default_env()

@@ -1,0 +1,19 @@
+{
+	email {$BLACKGLASS_ACME_EMAIL}
+	admin off
+}
+
+{$BLACKGLASS_CONTROL_DOMAIN} {
+	encode zstd gzip
+	@operations path /health /ready /metrics
+	respond @operations 404
+	reverse_proxy 127.0.0.1:3000 {
+		header_up X-Forwarded-For {remote_host}
+	}
+}
+
+{$BLACKGLASS_DATA_DOMAIN} {
+	reverse_proxy 127.0.0.1:3003 {
+		header_up X-Forwarded-For {remote_host}
+	}
+}

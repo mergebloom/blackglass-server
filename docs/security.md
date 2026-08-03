@@ -20,7 +20,7 @@ E2EE does not hide those facts.
 
 | Risk | Control |
 | --- | --- |
-| Internet exposure | Native and OCI defaults are loopback; the qualified Linux Docker topology uses host networking without published plaintext ports; Caddy is the only public TLS/WSS boundary |
+| Internet exposure | Native and OCI defaults are loopback; the Linux Compose topology uses host networking without published plaintext ports; its digest-pinned Caddy is the only public TLS/WSS boundary |
 | Password theft | Account hashes live only in mode-0600 SQLite state; offline commands read plaintext from standard input; generated hashes use the qualified maximum Argon2id work policy and imported hashes are bounded before verification |
 | Token theft | Random 256-bit user-bound sessions, SHA-256 digests at rest, bounded lifetime, immediate sign-out revocation, and scoped offline revocation commands |
 | Login guessing/CPU exhaustion | Uniform credential error with a valid dummy hash, one bounded Argon2 check off the async reactor, an eight-waiter fair queue, a six-attempt/60-second per-source bucket, and forwarded addresses trusted only from one exact configured proxy |

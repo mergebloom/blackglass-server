@@ -1,0 +1,81 @@
+name: blackglass
+
+services:
+  server:
+    image: ${BLACKGLASS_SERVER_IMAGE:?set BLACKGLASS_SERVER_IMAGE in .env}
+    network_mode: host
+    user: "65532:65532"
+    read_only: true
+    restart: unless-stopped
+    stop_grace_period: 30s
+    environment:
+      SELFHOST_BIND_HOST: 127.0.0.1
+      SELFHOST_CONTROL_PORT: "3000"
+      SELFHOST_DATA_PORT: "3003"
+      SELFHOST_DATA_HOST: ${BLACKGLASS_DATA_DOMAIN:?set BLACKGLASS_DATA_DOMAIN in .env}
+      SELFHOST_DATABASE: /var/lib/blackglass-server/server.sqlite
+      SELFHOST_STAGING_DIR: /var/lib/blackglass-server/uploads
+      SELFHOST_ALLOWED_ORIGINS: app://obsidian.md
+      SELFHOST_TRUSTED_PROXY: 127.0.0.1
+      SELFHOST_SHARING_ENABLED: "true"
+      SELFHOST_LOG_FORMAT: json
+      RUST_LOG: info
+    volumes:
+      - blackglass-data:/var/lib/blackglass-server
+    tmpfs:
+      - /tmp:rw,noexec,nosuid,nodev,size=32m,mode=1777
+    cap_drop:
+      - ALL
+    security_opt:
+      - no-new-privileges:true
+    pids_limit: 64
+    mem_limit: 384m
+    memswap_limit: 384m
+    ulimits:
+      nofile:
+        soft: 4096
+        hard: 4096
+    healthcheck:
+      test: ["CMD", "/usr/local/bin/blackglass-server", "healthcheck"]
+      interval: 30s
+      timeout: 5s
+      start_period: 10s
+      retries: 3
+
+  caddy:
+    image: ${BLACKGLASS_CADDY_IMAGE:-caddy:2.10.2-alpine@sha256:4c6e91c6ed0e2fa03efd5b44747b625fec79bc9cd06ac5235a779726618e530d}
+    network_mode: host
+    user: "65532:65532"
+    restart: unless-stopped
+    read_only: true
+    depends_on:
+      server:
+        condition: service_healthy
+    environment:
+      BLACKGLASS_CONTROL_DOMAIN: ${BLACKGLASS_CONTROL_DOMAIN:?set BLACKGLASS_CONTROL_DOMAIN in .env}
+      BLACKGLASS_DATA_DOMAIN: ${BLACKGLASS_DATA_DOMAIN:?set BLACKGLASS_DATA_DOMAIN in .env}
+      BLACKGLASS_ACME_EMAIL: ${BLACKGLASS_ACME_EMAIL:?set BLACKGLASS_ACME_EMAIL in .env}
+    volumes:
+      - ./ops/Caddyfile.compose:/etc/caddy/Caddyfile:ro
+      - blackglass-caddy-data:/data
+      - blackglass-caddy-config:/config
+    tmpfs:
+      - /tmp:rw,noexec,nosuid,nodev,size=32m,mode=1777
+    cap_drop:
+      - ALL
+    cap_add:
+      - NET_BIND_SERVICE
+    security_opt:
+      - no-new-privileges:true
+    pids_limit: 64
+    mem_limit: 192m
+    memswap_limit: 192m
+    ulimits:
+      nofile:
+        soft: 4096
+        hard: 4096
+
+volumes:
+  blackglass-data:
+  blackglass-caddy-data:
+  blackglass-caddy-config:

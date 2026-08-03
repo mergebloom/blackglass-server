@@ -195,9 +195,6 @@ jobs:
           sha256sum -c ./blackglass-server-v*-linux-*.sha256
           printf 'VERSION=%s\n' "$version" >> "$GITHUB_ENV"
           printf 'IMAGE=ghcr.io/%s\n' "${GITHUB_REPOSITORY,,}" >> "$GITHUB_ENV"
-      - uses: actions/attest@f7c74d28b9d84cb8768d0b8ca14a4bac6ef463e6 # v4.2.0
-        with:
-          subject-path: release-assets/*
       - uses: docker/setup-buildx-action@bb05f3f5519dd87d3ba754cc423b652a5edd6d2c # v4.2.0
         with:
           version: v0.33.0
@@ -217,6 +214,20 @@ jobs:
             "$IMAGE" \
             "$GITHUB_SHA" \
             release-assets
+      - name: Finalize release checksums
+        shell: bash
+        run: |
+          set -euo pipefail
+          cd release-assets
+          temporary=$(mktemp)
+          find . -maxdepth 1 -type f ! -name SHA256SUMS -print0 \
+            | sort -z \
+            | xargs -0 sha256sum > "$temporary"
+          mv "$temporary" SHA256SUMS
+          sha256sum -c SHA256SUMS
+      - uses: actions/attest@f7c74d28b9d84cb8768d0b8ca14a4bac6ef463e6 # v4.2.0
+        with:
+          subject-path: release-assets/*
       - uses: actions/attest@f7c74d28b9d84cb8768d0b8ca14a4bac6ef463e6 # v4.2.0
         with:
           subject-name: ${{ env.IMAGE }}
@@ -231,7 +242,7 @@ jobs:
           mapfile -d '' -t release_files < <(
             find release-assets -maxdepth 1 -type f -print0 | sort -z
           )
-          test "${#release_files[@]}" -eq 13
+          test "${#release_files[@]}" -eq 14
           bash ops/publish-release.sh \
             "$GITHUB_REF_NAME" \
             "Blackglass Server $VERSION" \

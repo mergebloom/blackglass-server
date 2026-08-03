@@ -18,8 +18,8 @@ Obsidian -> HTTPS control hostname -> Caddy -> 127.0.0.1:3000
 Obsidian -> WSS data hostname      -> Caddy -> 127.0.0.1:3003
 ```
 
-The native binary and OCI image both default to loopback. The qualified Linux
-Docker topology uses host networking so the same host Caddy process can reach
+The native binary and OCI image both default to loopback. The Linux Compose
+topology uses host networking so its Caddy container can reach
 those loopback listeners without exposing plaintext ports. A TLS ingress
 remains the only client-facing boundary.
 SQLite runs in WAL mode with
@@ -33,6 +33,46 @@ a file-sized memory spike. Legacy inline BLOB rows remain readable. The
 advertised per-file limit defaults to 200 MiB and is capped at 900 MiB so an
 encrypted row remains safely below bundled SQLite's default maximum value
 length; larger operator values fail during startup rather than after staging.
+
+## Docker Compose operations
+
+`compose.yaml` and `.env.example` are the shortest supported Linux deployment
+path. Pin the Server image to an immutable release digest, set two exact DNS
+names and an ACME email, then use `ops/compose-ops.sh`:
+
+```sh
+cp .env.example .env
+chmod 0600 .env
+./ops/compose-ops.sh config
+printf '%s\n' "$INITIAL_PASSWORD" | \
+  ./ops/compose-ops.sh init owner@example.com 'Vault owner'
+./ops/compose-ops.sh up
+./ops/compose-ops.sh health
+```
+
+The helper never accepts a password as an argument and never overwrites a
+backup. `backup` uses SQLite's online backup API, streams the verified database
+out of the shell-free container, writes through a private partial file, and
+emits an adjacent checksum. Keep that result off-host and encrypted:
+
+```sh
+./ops/compose-ops.sh backup /safe/off-host/blackglass.sqlite
+./ops/compose-ops.sh verify-backup /safe/off-host/blackglass.sqlite
+./ops/compose-ops.sh restore-drill /safe/off-host/blackglass.sqlite
+```
+
+For upgrades, complete those three commands, change only
+`BLACKGLASS_SERVER_IMAGE`, run `docker compose --env-file .env pull`, then
+`./ops/compose-ops.sh up` and `./ops/compose-ops.sh health`. Retain the prior
+digest and backup. A rollback to the prior binary is safe only while the schema
+is unchanged and the release contract permits it; otherwise use the offline
+copy-first migration and roll-forward procedure below.
+
+Compose uses native Linux host networking so Caddy alone owns ports 80/443 and
+the Server listeners remain on loopback. Docker Desktop is useful for local
+checks but is not the Linux production topology. The named `blackglass-data`
+volume is the one portable application data root; Caddy certificate/config
+volumes are separate operational state.
 
 ## Build and install
 
@@ -203,8 +243,8 @@ storage contention, an undersized host, or an unexpectedly expensive query.
 Alert on `blackglass_share_invites_total{outcome="rate_limited"}`. The fixed
 outcome labels contain no email address, user ID, vault ID, or target digest.
 
-The `v0.4.5` archive includes `release-contract.json`. Release automation
-checks that it binds server 0.4.5 to schema 6 and schema-5 migration input,
+The `v0.5.0` archive includes `release-contract.json`. Release automation
+checks that it binds server 0.5.0 to schema 6 and schema-5 migration input,
 the previous rollback tag, the exact client tooling revision, both qualified
 renderer baselines, and the required primary/recovery monitoring selectors.
 
@@ -289,9 +329,11 @@ the new file. The source stays unchanged. Each migration step validates its
 input/output inside the transaction and rolls back on failure. The Phase 4
 migration accepts a schema-v5 source, creates a new schema-v6 file, starts with
 no memberships, and invalidates existing sessions for one required re-login.
-Keep the exact v0.3.0 binary and untouched v5 source until activation. After
-the first accepted v6 write, recovery is roll-forward only; never run the
-v0.3.0 binary against schema v6.
+Keep the exact v0.3.0 binary and untouched v5 source until a v5-to-v6 migration
+is activated; never run it against schema v6. The v0.5.0 release does not
+change schema v6, so its direct rollback boundary is v0.4.5 after stopping the
+service and verifying the database. Once a future release accepts writes on a
+newer schema, recovery becomes roll-forward only.
 
 A pre-v4/pre-0.2.2 rollback is safe only before activation, while the untouched
 old database has received no client writes. After the new database has served

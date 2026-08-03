@@ -1,20 +1,20 @@
 {
   "schemaVersion": 1,
-  "serverVersion": "0.4.5",
+  "serverVersion": "0.5.0",
   "database": {
     "supportedSourceSchemas": [5],
     "destinationSchema": 6
   },
-  "previousRollbackTag": "v0.3.0",
-  "clientToolingRevision": "f175c461517c08644bd927f62445a15007a7e6b3",
+  "previousRollbackTag": "v0.4.5",
+  "clientToolingRevision": "57d3258357a782d58a65a1737d9f692a476aca4a",
   "qualifiedRenderers": [
     {
       "version": "1.12.7",
-      "baselineSha256": "5cb05ed9959ca19f3d0cd229993e09c162de14a8ea1289ab748e0a03eaefd810"
+      "baselineSha256": "579f1a49f8394175453c671f52b64ea541ff833bc3eb847b2fbd7fff439baa6c"
     },
     {
       "version": "1.13.4",
-      "baselineSha256": "93360025880ee356bd407e39d4d0cf39fa57bd1043d8e7e0506b0a90af554023"
+      "baselineSha256": "c118242a7fd25ed9b473a4d56910da5e1c350d911a73b0f6159f4591cb9a8d6b"
     }
   ],
   "monitoring": {

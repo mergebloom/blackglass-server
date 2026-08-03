@@ -269,5 +269,39 @@ jq -e \
     any(.manifests[]; .platform.os == "linux" and .platform.architecture == "arm64" and .digest == $arm64)
   ' "$published_manifest" >/dev/null
 
+oci_metadata="$release_assets/blackglass-server-v${version}-oci.json"
+[[ ! -e "$oci_metadata" && ! -L "$oci_metadata" ]] || {
+  echo "error: OCI release metadata output already exists" >&2
+  exit 1
+}
+jq -n \
+  --arg version "$version" \
+  --arg image "$image" \
+  --arg digest "$candidate_digest" \
+  --arg revision "$source_revision" \
+  --arg amd64 "${architecture_digests[amd64]}" \
+  --arg arm64 "${architecture_digests[arm64]}" '
+  {
+    schemaVersion: 1,
+    name: "blackglass-server",
+    version: $version,
+    image: $image,
+    digest: $digest,
+    sourceRevision: $revision,
+    platforms: [
+      {os: "linux", architecture: "amd64", digest: $amd64},
+      {os: "linux", architecture: "arm64", digest: $arm64}
+    ]
+  }' > "$oci_metadata"
+jq -e \
+  --arg version "$version" \
+  --arg image "$image" \
+  --arg digest "$candidate_digest" \
+  --arg revision "$source_revision" '
+  .schemaVersion == 1 and .name == "blackglass-server" and
+  .version == $version and .image == $image and .digest == $digest and
+  .sourceRevision == $revision and (.platforms | length) == 2
+' "$oci_metadata" >/dev/null
+
 printf 'IMAGE_DIGEST=%s\n' "$candidate_digest" >> "$GITHUB_ENV"
 echo "process-protected OCI image verified: $image:$version@$candidate_digest"

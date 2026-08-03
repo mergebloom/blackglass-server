@@ -154,7 +154,7 @@ jq -e \
       .serverVersion == $version and
       .database.destinationSchema == $schema and
       .database.supportedSourceSchemas == [5] and
-      .previousRollbackTag == "v0.3.0" and
+      .previousRollbackTag == "v0.4.5" and
       (.clientToolingRevision | test("^[a-f0-9]{40}$")) and
       (.qualifiedRenderers | map(.version)) == ["1.12.7", "1.13.4"] and
       all(.qualifiedRenderers[]; .baselineSha256 | test("^[a-f0-9]{64}$")) and

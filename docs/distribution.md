@@ -9,7 +9,7 @@ OCI image:
 | --- | --- | --- | --- |
 | `linux-amd64` | x86-64 | static musl | Intel/AMD cloud VMs, servers, and NAS hosts |
 | `linux-arm64` | AArch64 | static musl | Graviton, Ampere, ARM cloud VMs, and 64-bit ARM hosts |
-| OCI image | amd64 + arm64 | scratch | Linux Docker with host networking and host Caddy |
+| OCI image | amd64 + arm64 | scratch | Linux Docker with host networking and Compose Caddy |
 
 The static binaries have no glibc, OpenSSL, or external SQLite dependency.
 They are therefore the preferred distribution for Ubuntu, Debian, Fedora,
@@ -131,7 +131,7 @@ Its writable state belongs at
 `/var/lib/blackglass-server`.
 
 The native binary and OCI image retain the safe loopback default. The qualified
-Linux Docker topology uses host networking so a host Caddy process reaches the
+Linux Compose topology uses host networking so its Caddy container reaches the
 same loopback listeners and is the server's one exact trusted proxy. There are
 no published plaintext ports:
 

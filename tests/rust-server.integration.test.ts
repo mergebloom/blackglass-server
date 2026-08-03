@@ -2,7 +2,7 @@ import { afterAll, afterEach, beforeAll, describe, expect, test } from "bun:test
 import { createConnection, createServer } from "node:net";
 import { createHash, randomBytes } from "node:crypto";
 import { existsSync, readFileSync } from "node:fs";
-import { mkdtemp, readFile, readdir, stat } from "node:fs/promises";
+import { mkdtemp, readFile, readdir, stat, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join, resolve } from "node:path";
 import { Database } from "bun:sqlite";
@@ -52,6 +52,7 @@ describe("production Rust server", () => {
     expect(help.stdout.toString()).toContain("migrate <versioned-database> <new-database>");
     expect(help.stdout.toString()).toContain("migrate-legacy <legacy-database> <new-database>");
     expect(help.stdout.toString()).toContain("rebind-data-host <database> <new-host> <backup>");
+    expect(help.stdout.toString()).toContain("healthcheck");
     directory = await mkdtemp(join(tmpdir(), "obsidian-rust-sync-"));
     [controlPort, dataPort] = await Promise.all([freePort(), freePort()]);
     processHandle = spawnRustServer(directory, controlPort, dataPort, {
@@ -86,6 +87,46 @@ describe("production Rust server", () => {
   });
 
   afterEach(closeTrackedSockets);
+
+  test("provides a dependency-free container readiness probe", () => {
+    const ready = Bun.spawnSync([binary, "healthcheck"], {
+      env: {
+        ...process.env,
+        SELFHOST_BIND_HOST: "127.0.0.1",
+        SELFHOST_CONTROL_PORT: String(controlPort),
+      },
+      stdout: "pipe",
+      stderr: "pipe",
+    });
+    expect(ready.exitCode, ready.stderr.toString()).toBe(0);
+    expect(ready.stdout.toString().trim()).toBe("ready");
+
+    const unavailable = Bun.spawnSync([binary, "healthcheck"], {
+      env: {
+        ...process.env,
+        SELFHOST_BIND_HOST: "127.0.0.1",
+        SELFHOST_CONTROL_PORT: "1",
+      },
+      stdout: "pipe",
+      stderr: "pipe",
+    });
+    expect(unavailable.exitCode).not.toBe(0);
+  });
+
+  test("streams an online verified backup without retaining a staging copy", async () => {
+    const streamed = Bun.spawnSync([binary, "backup-stdout", join(directory, "server.sqlite")], {
+      stdout: "pipe",
+      stderr: "pipe",
+    });
+    expect(streamed.exitCode, streamed.stderr.toString()).toBe(0);
+    expect(streamed.stdout.subarray(0, 16).toString()).toBe("SQLite format 3\0");
+    const backup = join(directory, "streamed-backup.sqlite");
+    await writeFile(backup, streamed.stdout, { flag: "wx", mode: 0o600 });
+    const verify = Bun.spawnSync([binary, "verify", backup], { stdout: "pipe", stderr: "pipe" });
+    expect(verify.exitCode, verify.stderr.toString()).toBe(0);
+    expect((await readdir(directory)).some((name) => name.startsWith(".blackglass-backup-stream-")))
+      .toBe(false);
+  });
 
   test("uses expiring sessions, client-managed E2EE vaults, and exact origins", async () => {
     expect(vault).toMatchObject({

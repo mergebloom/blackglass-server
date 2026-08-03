@@ -1,6 +1,6 @@
 {
   "name": "blackglass-server",
-  "version": "0.4.5",
+  "version": "0.5.0",
   "private": true,
   "license": "MIT",
   "engines": {
@@ -18,6 +18,7 @@
     "build:release": "./ops/build-release.sh",
     "licenses:check": "bun run tools/third-party-notices.ts",
     "licenses:generate": "bun run tools/third-party-notices.ts --write",
+    "distribution:check": "bun run tools/distribution-boundary.ts",
     "server": "cargo run --release --manifest-path apps/server-rust/Cargo.toml -- serve",
     "server:bun-oracle": "bun run apps/server/src/index.ts",
     "server:check": "cargo check --manifest-path apps/server-rust/Cargo.toml",
@@ -25,8 +26,8 @@
     "server:measure": "bun run tools/measure-rust-server.ts",
     "test:integration": "bun test tests/server.integration.test.ts",
     "verify:release-metadata": "./ops/verify-release-metadata.sh",
-    "check:fast": "bun run verify:release-metadata && bun run licenses:check && bun run typecheck && cargo fmt --manifest-path apps/server-rust/Cargo.toml -- --check && cargo check --locked --manifest-path apps/server-rust/Cargo.toml --all-targets && bun test tests/release-metadata.test.ts tests/client-contract.integration.test.ts tests/collaboration.integration.test.ts tests/tenant-isolation.integration.test.ts",
-    "check:full": "bun run verify:release-metadata && bun run licenses:check && bun run typecheck && cargo fmt --manifest-path apps/server-rust/Cargo.toml -- --check && cargo clippy --locked --manifest-path apps/server-rust/Cargo.toml --all-targets -- -D warnings && bun run server:test && bun test",
+    "check:fast": "bun run verify:release-metadata && bun run distribution:check && bun run licenses:check && bun run typecheck && cargo fmt --manifest-path apps/server-rust/Cargo.toml -- --check && cargo check --locked --manifest-path apps/server-rust/Cargo.toml --all-targets && bun test tests/release-metadata.test.ts tests/client-contract.integration.test.ts tests/collaboration.integration.test.ts tests/tenant-isolation.integration.test.ts",
+    "check:full": "bun run verify:release-metadata && bun run distribution:check && bun run licenses:check && bun run typecheck && cargo fmt --manifest-path apps/server-rust/Cargo.toml -- --check && cargo clippy --locked --manifest-path apps/server-rust/Cargo.toml --all-targets -- -D warnings && bun run server:test && bun test",
     "check:release": "bun run check:full && shellcheck ops/*.sh",
     "check": "bun run check:full",
     "test": "bun test",

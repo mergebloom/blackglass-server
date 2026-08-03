@@ -47,7 +47,7 @@ rollback instructions are maintained in `docs/production.md` in the source
 repository.
 
 Native service configuration and OCI images default to loopback. The supported
-Linux Docker deployment uses host networking so host Caddy reaches loopback
+Linux Compose deployment uses host networking so its Caddy container reaches loopback
 without published plaintext ports. Never expose the control or data listeners
 directly; follow the exact topology in `docs/distribution.md`.
 Scrape `/ready` and `/metrics` only over loopback or a private administration

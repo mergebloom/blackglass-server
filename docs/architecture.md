@@ -77,8 +77,8 @@ renaming a binary creates a new artifact that must earn a new client E2E record.
 ## Security posture
 
 - Production origins use HTTPS and WSS through a reverse proxy.
-- Native installs and OCI images default to loopback; qualified Linux Docker
-  uses host networking behind host Caddy without published plaintext ports.
+- Native installs and OCI images default to loopback; Linux Compose uses host
+  networking behind its Caddy container without published plaintext ports.
 - Endpoint authorization uses exact origins.
 - Account tokens and vault key material are never logged.
 - Custom-password vault secrets never reach the server; managed mode stores its
