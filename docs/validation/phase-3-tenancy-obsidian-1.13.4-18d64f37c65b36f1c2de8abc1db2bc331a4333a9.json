@@ -1,0 +1,93 @@
+{
+  "schemaVersion": 1,
+  "passed": true,
+  "scenarioId": "E2E-P3-TENANCY",
+  "rendererVersion": "1.13.4",
+  "serverRevision": "18d64f37c65b36f1c2de8abc1db2bc331a4333a9",
+  "runManifestSha256": "ebbd4f8b5a651146ca72f2e36559f498afca723578f912845190653b455ddeb3",
+  "releaseManifestSha256": "4a07bfec23cfd26c69d1a663e8345bb6437d293025253f74f4632ab706fbccac",
+  "validationFileName": "phase-3-tenancy-obsidian-1.13.4-18d64f37c65b36f1c2de8abc1db2bc331a4333a9.json",
+  "checkpoints": [
+    {
+      "checkpoint": "phase-3/client-a-owned-vault",
+      "client": "client-a",
+      "observedAt": "2026-08-03T01:34:56.608Z",
+      "proofSha256": "93ad95c6d30cdd518c0cf82b14f070fe4a835019c944d4f72107dc545da0fd3a",
+      "uiStateSha256": "fb59b31ef34759de5cf0e11fe0dc970a5277ebbd2a0529591541778c2a8fd355",
+      "screenshotSha256": "703e8a09306c48a3dc5d20206a29ca2cb20bae6399a113ba327c130546e7bc97",
+      "databaseSha256": "9ee73bae6a3e36ae106c529dd3d9a987dea567a1fb4139966eeb1ce1f8c44092"
+    },
+    {
+      "checkpoint": "phase-3/client-a-converged",
+      "client": "client-a",
+      "observedAt": "2026-08-03T01:35:41.041Z",
+      "proofSha256": "13e72203e46a5ba3565eba339d487af3b73c3e998abe1a8ca10ac62f0b88144f",
+      "uiStateSha256": "2d0715db095b06063404332e394f561ce472ae255d74b4cd0d576eb1a5a62da5",
+      "screenshotSha256": "703e8a09306c48a3dc5d20206a29ca2cb20bae6399a113ba327c130546e7bc97",
+      "databaseSha256": "32048aa928eb73a26817f38e3835eafe6937a201460e2c59cd47190da20815d0"
+    },
+    {
+      "checkpoint": "phase-3/client-b-owned-vault",
+      "client": "client-b",
+      "observedAt": "2026-08-03T01:37:15.942Z",
+      "proofSha256": "e32d2ad09d0faa4a06da06cbdfd0c8a90452a984a9318d1e51f62b7b37b6f971",
+      "uiStateSha256": "f8c1c23b947ecb87730289f0b59b96f55876ad3fbc978f20d7ebaf8698bbe593",
+      "screenshotSha256": "703e8a09306c48a3dc5d20206a29ca2cb20bae6399a113ba327c130546e7bc97",
+      "databaseSha256": "1464bfbf59453210e5cf2746f25ece6764e04bbedaa8642ef677b7951c255652"
+    },
+    {
+      "checkpoint": "phase-3/client-b-converged",
+      "client": "client-b",
+      "observedAt": "2026-08-03T01:37:59.059Z",
+      "proofSha256": "8541b19c8001dc49689295da8f39cdfb9c0d9a0f55e1f2eb36fbefd7d63a87cc",
+      "uiStateSha256": "17368a9a25db9b6258464c58e5f6eb63c3cdad7038318890073bead4e10be689",
+      "screenshotSha256": "703e8a09306c48a3dc5d20206a29ca2cb20bae6399a113ba327c130546e7bc97",
+      "databaseSha256": "bccdb7e1822396e09a80cf9f31a01831563b792fe3c0cf1d34bb5c8a41a11ff6"
+    },
+    {
+      "checkpoint": "phase-3/client-a-isolated",
+      "client": "client-a",
+      "observedAt": "2026-08-03T01:38:18.249Z",
+      "proofSha256": "a4f91407418fc992177a430e955c0248575393264749b531f6130a12975ae3d8",
+      "uiStateSha256": "a7f1afdd75af9bedd5571da9fb22ead556a0459868c6cb1db30675985182c100",
+      "screenshotSha256": "703e8a09306c48a3dc5d20206a29ca2cb20bae6399a113ba327c130546e7bc97",
+      "databaseSha256": "bccdb7e1822396e09a80cf9f31a01831563b792fe3c0cf1d34bb5c8a41a11ff6"
+    },
+    {
+      "checkpoint": "phase-3/client-b-isolated",
+      "client": "client-b",
+      "observedAt": "2026-08-03T01:38:37.536Z",
+      "proofSha256": "d9c67ce3e4fd7c5e6504b88a80d8a71ed9f20557546d7f4a8d0fab163f9802d9",
+      "uiStateSha256": "dce353c9f563d93245b4351a8e00d9a5f77c429945bd7aefebc7caa1b31f29a3",
+      "screenshotSha256": "703e8a09306c48a3dc5d20206a29ca2cb20bae6399a113ba327c130546e7bc97",
+      "databaseSha256": "bccdb7e1822396e09a80cf9f31a01831563b792fe3c0cf1d34bb5c8a41a11ff6"
+    },
+    {
+      "checkpoint": "phase-3/client-c-isolated",
+      "client": "client-c",
+      "observedAt": "2026-08-03T01:39:16.565Z",
+      "proofSha256": "971fabf8d81be510a7666234b1e62aff85d00d65ea9876d504387c9a046ebb68",
+      "uiStateSha256": "4df2261c9d55463b9fc21994890e7cad7da6b00565fa037a43ee9e74f1188295",
+      "screenshotSha256": "7334dd3bc82616f3561d167a514af5fc1a39cf7d074191ae6800fe7a92026aea",
+      "databaseSha256": "bccdb7e1822396e09a80cf9f31a01831563b792fe3c0cf1d34bb5c8a41a11ff6"
+    },
+    {
+      "checkpoint": "phase-3/client-a-reauthenticated",
+      "client": "client-a",
+      "observedAt": "2026-08-03T01:40:43.618Z",
+      "proofSha256": "7bc55fe2159dd4001004f24c6f6aa8f6a15ff504cf2d47a3c95e4862d8324d95",
+      "uiStateSha256": "5173402f784c8b994cacebcb474d7be87ead7ef02a60416184468f272a4515ba",
+      "screenshotSha256": "0008e8d844f0e7f2f1644b0493adabede877a8d29850886a72939cc287cac109",
+      "databaseSha256": "bccdb7e1822396e09a80cf9f31a01831563b792fe3c0cf1d34bb5c8a41a11ff6"
+    },
+    {
+      "checkpoint": "phase-3/client-b-disabled",
+      "client": "client-b",
+      "observedAt": "2026-08-03T01:41:30.850Z",
+      "proofSha256": "f162604642518ef6144673d816e4a329ed81336769ff389b95696b4eee957269",
+      "uiStateSha256": "a61ab430a2c44aba401b7f424dcccfe873e236177a5a1e44bec167b4508b9f6b",
+      "screenshotSha256": "703e8a09306c48a3dc5d20206a29ca2cb20bae6399a113ba327c130546e7bc97",
+      "databaseSha256": "8cd45010a95976a882b89a60fb64bf42b4163e8e469f99fed56e5dcdd5919e6d"
+    }
+  ]
+}
