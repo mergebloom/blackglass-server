@@ -15,11 +15,11 @@
   "qualifiedRenderers": [
     {
       "version": "1.12.7",
-      "baselineSha256": "579f1a49f8394175453c671f52b64ea541ff833bc3eb847b2fbd7fff439baa6c"
+      "baselineSha256": "afd44c0174495b9932d01b1c6870b6c22faa40993e8b049562d55de68c8522fa"
     },
     {
       "version": "1.13.4",
-      "baselineSha256": "c118242a7fd25ed9b473a4d56910da5e1c350d911a73b0f6159f4591cb9a8d6b"
+      "baselineSha256": "316a127bd4c27520f789145be40c72a9c573c4f37650fa47cd15b29526760824"
     }
   ],
   "monitoring": {
