@@ -11,7 +11,7 @@
     "directRollbackTag": "v0.5.0",
     "directRollbackSupported": true
   },
-  "clientToolingRevision": "e8b6c3b0ccff02796ef7df8fb470daf7bb37b3eb",
+  "clientToolingRevision": "40969d0fb6404bc91e08f47d884b099ee58d0b5a",
   "qualifiedRenderers": [
     {
       "version": "1.12.7",
