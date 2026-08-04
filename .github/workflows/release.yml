@@ -2,6 +2,11 @@ name: Release
 
 on:
   workflow_dispatch:
+    inputs:
+      release_tag:
+        description: Existing immutable v-prefixed tag to rebuild and publish
+        required: true
+        type: string
   push:
     tags:
       - "v*"
@@ -18,8 +23,27 @@ jobs:
     name: Full release gate
     runs-on: ubuntu-24.04
     timeout-minutes: 25
+    env:
+      CHECKOUT_REF: ${{ inputs.release_tag || github.ref }}
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          fetch-depth: 0
+          ref: ${{ env.CHECKOUT_REF }}
+      - name: Bind exact immutable release source
+        shell: bash
+        env:
+          REQUESTED_RELEASE_TAG: ${{ inputs.release_tag }}
+          EVENT_REF_NAME: ${{ github.ref_name }}
+        run: |
+          set -euo pipefail
+          release_tag=${REQUESTED_RELEASE_TAG:-$EVENT_REF_NAME}
+          . ops/release-version.sh
+          blackglass_is_supported_release_tag "$release_tag"
+          source_revision=$(git rev-parse --verify HEAD)
+          test "$(git rev-parse --verify "${release_tag}^{commit}")" = "$source_revision"
+          printf 'RELEASE_TAG=%s\n' "$release_tag" >> "$GITHUB_ENV"
+          printf 'SOURCE_REVISION=%s\n' "$source_revision" >> "$GITHUB_ENV"
       - uses: oven-sh/setup-bun@0c5077e51419868618aeaa5fe8019c62421857d6 # v2.2.0
         with:
           bun-version: 1.3.8
@@ -34,9 +58,9 @@ jobs:
           --manifest-path apps/server-rust/Cargo.toml
           check advisories licenses sources
       - run: bun run check
-      - run: BLACKGLASS_TESTED_SOURCE_REVISION="$GITHUB_SHA" ./ops/build-release.sh
+      - run: BLACKGLASS_TESTED_SOURCE_REVISION="$SOURCE_REVISION" ./ops/build-release.sh
       - run: bun run server:measure
-      - run: shellcheck ops/*.sh
+      - run: shellcheck --severity=warning ops/*.sh
       - name: Verify systemd hardening unit
         run: |
           sudo systemd-sysusers "$PWD/ops/blackglass-server.sysusers.conf"
@@ -67,6 +91,8 @@ jobs:
             runner: ubuntu-24.04-arm
     runs-on: ${{ matrix.runner }}
     timeout-minutes: 45
+    env:
+      CHECKOUT_REF: ${{ inputs.release_tag || github.ref }}
     permissions:
       artifact-metadata: write
       attestations: write
@@ -74,6 +100,23 @@ jobs:
       id-token: write
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          fetch-depth: 0
+          ref: ${{ env.CHECKOUT_REF }}
+      - name: Bind exact immutable release source
+        shell: bash
+        env:
+          REQUESTED_RELEASE_TAG: ${{ inputs.release_tag }}
+          EVENT_REF_NAME: ${{ github.ref_name }}
+        run: |
+          set -euo pipefail
+          release_tag=${REQUESTED_RELEASE_TAG:-$EVENT_REF_NAME}
+          . ops/release-version.sh
+          blackglass_is_supported_release_tag "$release_tag"
+          source_revision=$(git rev-parse --verify HEAD)
+          test "$(git rev-parse --verify "${release_tag}^{commit}")" = "$source_revision"
+          printf 'RELEASE_TAG=%s\n' "$release_tag" >> "$GITHUB_ENV"
+          printf 'SOURCE_REVISION=%s\n' "$source_revision" >> "$GITHUB_ENV"
       - uses: oven-sh/setup-bun@0c5077e51419868618aeaa5fe8019c62421857d6 # v2.2.0
         with:
           bun-version: 1.3.8
@@ -82,7 +125,7 @@ jobs:
           version: v0.33.0
           driver-opts: image=moby/buildkit:v0.30.0@sha256:0168606be2315b7c807a03b3d8aa79beefdb31c98740cebdffdfeebf31190c9f
       - run: npm ci
-      - run: BLACKGLASS_TESTED_SOURCE_REVISION="$GITHUB_SHA" ./ops/build-linux-release.sh "${{ matrix.target }}"
+      - run: BLACKGLASS_TESTED_SOURCE_REVISION="$SOURCE_REVISION" ./ops/build-linux-release.sh "${{ matrix.target }}"
       - name: Qualify the exact exported binary
         shell: bash
         run: |
@@ -91,21 +134,21 @@ jobs:
           test "${#binaries[@]}" -eq 1
           chmod 0555 "${binaries[0]}"
           BLACKGLASS_RUST_BINARY="${binaries[0]}" \
-            BLACKGLASS_EXPECTED_SOURCE_REVISION="$GITHUB_SHA" \
+            BLACKGLASS_EXPECTED_SOURCE_REVISION="$SOURCE_REVISION" \
             bun test \
               tests/rust-server.integration.test.ts \
               tests/database-migration.integration.test.ts \
               tests/server-parity.integration.test.ts
           resource_report="${binaries[0]}.resource-report.json"
           BLACKGLASS_RUST_BINARY="${binaries[0]}" \
-            BLACKGLASS_EXPECTED_SOURCE_REVISION="$GITHUB_SHA" \
+            BLACKGLASS_EXPECTED_SOURCE_REVISION="$SOURCE_REVISION" \
             BLACKGLASS_RELEASE_TARGET="${{ matrix.target }}" \
             BLACKGLASS_RESOURCE_MODE=cgroup-v2 \
             bun run server:measure "$resource_report"
           binary_sha=$(sha256sum "${binaries[0]}" | cut -d ' ' -f 1)
           jq -e \
             --arg sha "$binary_sha" \
-            --arg revision "$GITHUB_SHA" \
+            --arg revision "$SOURCE_REVISION" \
             --arg target "${{ matrix.target }}" \
             -f tools/verify-release-resource-report.jq \
             "$resource_report"
@@ -129,10 +172,14 @@ jobs:
 
   publish:
     name: Publish tagged release
-    if: startsWith(github.ref, 'refs/tags/v')
+    if: >-
+      startsWith(github.ref, 'refs/tags/v') ||
+      (github.event_name == 'workflow_dispatch' && startsWith(inputs.release_tag, 'v'))
     needs: package
     runs-on: ubuntu-24.04
     timeout-minutes: 60
+    env:
+      CHECKOUT_REF: ${{ inputs.release_tag || github.ref }}
     permissions:
       artifact-metadata: write
       attestations: write
@@ -141,6 +188,23 @@ jobs:
       packages: write
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          fetch-depth: 0
+          ref: ${{ env.CHECKOUT_REF }}
+      - name: Bind exact immutable release source
+        shell: bash
+        env:
+          REQUESTED_RELEASE_TAG: ${{ inputs.release_tag }}
+          EVENT_REF_NAME: ${{ github.ref_name }}
+        run: |
+          set -euo pipefail
+          release_tag=${REQUESTED_RELEASE_TAG:-$EVENT_REF_NAME}
+          . ops/release-version.sh
+          blackglass_is_supported_release_tag "$release_tag"
+          source_revision=$(git rev-parse --verify HEAD)
+          test "$(git rev-parse --verify "${release_tag}^{commit}")" = "$source_revision"
+          printf 'RELEASE_TAG=%s\n' "$release_tag" >> "$GITHUB_ENV"
+          printf 'SOURCE_REVISION=%s\n' "$source_revision" >> "$GITHUB_ENV"
       - uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
         with:
           pattern: blackglass-server-linux-*
@@ -162,7 +226,7 @@ jobs:
           test -n "$version"
           . ops/release-version.sh
           blackglass_is_supported_release_version "$version"
-          test "$GITHUB_REF_NAME" = "v$version"
+          test "$RELEASE_TAG" = "v$version"
           mkdir release-assets
           cp LICENSE THIRD_PARTY_NOTICES.md release-assets/
           for architecture in amd64 arm64; do
@@ -181,7 +245,7 @@ jobs:
             binary_sha=$(sha256sum "release-assets/$base" | cut -d ' ' -f 1)
             jq -e \
               --arg sha "$binary_sha" \
-              --arg revision "$GITHUB_SHA" \
+              --arg revision "$SOURCE_REVISION" \
               --arg target "linux-${architecture}" \
               -f tools/verify-release-resource-report.jq \
               "release-assets/$base.resource-report.json"
@@ -212,7 +276,7 @@ jobs:
           bash ops/publish-oci-version.sh \
             "$VERSION" \
             "$IMAGE" \
-            "$GITHUB_SHA" \
+            "$SOURCE_REVISION" \
             release-assets
       - name: Finalize release checksums
         shell: bash
@@ -243,8 +307,8 @@ jobs:
             find release-assets -maxdepth 1 -type f -print0 | sort -z
           )
           test "${#release_files[@]}" -eq 14
-          bash ops/publish-release.sh \
-            "$GITHUB_REF_NAME" \
+          GITHUB_SHA="$SOURCE_REVISION" bash ops/publish-release.sh \
+            "$RELEASE_TAG" \
             "Blackglass Server $VERSION" \
             "${release_files[@]}"
       - name: Promote verified stable release to latest

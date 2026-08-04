@@ -66,27 +66,27 @@ case "$command" in
     backup)
         [ "$#" -eq 2 ] || usage
         output=$2
-        [ ! -e "$output" ] && [ ! -L "$output" ] || {
+        if [ -e "$output" ] || [ -L "$output" ]; then
             echo "refusing to overwrite backup output: $output" >&2
             exit 1
-        }
+        fi
         output_parent=$(cd -- "$(dirname -- "$output")" && pwd -P)
         output="$output_parent/$(basename -- "$output")"
         temporary="$output.partial.$$"
         checksum="$output.sha256"
         checksum_temporary="$checksum.partial.$$"
-        [ ! -e "$temporary" ] && [ ! -L "$temporary" ] || {
+        if [ -e "$temporary" ] || [ -L "$temporary" ]; then
             echo "backup staging path already exists: $temporary" >&2
             exit 1
-        }
-        [ ! -e "$checksum" ] && [ ! -L "$checksum" ] || {
+        fi
+        if [ -e "$checksum" ] || [ -L "$checksum" ]; then
             echo "refusing to overwrite backup checksum: $checksum" >&2
             exit 1
-        }
-        [ ! -e "$checksum_temporary" ] && [ ! -L "$checksum_temporary" ] || {
+        fi
+        if [ -e "$checksum_temporary" ] || [ -L "$checksum_temporary" ]; then
             echo "backup checksum staging path already exists: $checksum_temporary" >&2
             exit 1
-        }
+        fi
         umask 077
         trap 'rm -f -- "$temporary" "$checksum_temporary"' EXIT HUP INT TERM
         compose exec -T server /usr/local/bin/blackglass-server backup-stdout \
@@ -125,10 +125,10 @@ case "$command" in
     verify-backup|restore-drill)
         [ "$#" -eq 2 ] || usage
         require_regular_backup "$2"
-        [ -f "$backup.sha256" ] && [ ! -L "$backup.sha256" ] || {
+        if [ ! -f "$backup.sha256" ] || [ -L "$backup.sha256" ]; then
             echo "backup checksum is required and must be a regular file: $backup.sha256" >&2
             exit 1
-        }
+        fi
         if command -v sha256sum >/dev/null 2>&1; then
             (cd -- "$(dirname -- "$backup")" && sha256sum -c "$(basename -- "$backup.sha256")")
         else
