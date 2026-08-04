@@ -243,10 +243,11 @@ storage contention, an undersized host, or an unexpectedly expensive query.
 Alert on `blackglass_share_invites_total{outcome="rate_limited"}`. The fixed
 outcome labels contain no email address, user ID, vault ID, or target digest.
 
-The `v0.5.0` archive includes `release-contract.json`. Release automation
-checks that it binds server 0.5.0 to schema 6 and schema-4/schema-5 migration input,
-the exact published-predecessor and direct-rollback boundary, the exact client tooling revision, both qualified
-renderer baselines, and the required primary/recovery monitoring selectors.
+The `v0.5.1` archive includes `release-contract.json`. Release automation
+checks that it binds server 0.5.1 to schema 6 and schema-4/schema-5 migration
+input, the exact v0.5.0 same-schema predecessor and direct-rollback boundary,
+the exact client tooling revision, both reviewed renderer baselines, and the
+required primary/recovery monitoring selectors.
 
 ## Backup and recovery
 
@@ -346,11 +347,12 @@ input/output inside the transaction and rolls back on failure. The Phase 4
 migration accepts a schema-v5 source, creates a new schema-v6 file, starts with
 no memberships, and invalidates existing sessions for one required re-login.
 Keep the exact v0.3.0 binary and untouched v5 source until a v5-to-v6 migration
-is activated; never run it against schema v6. There is no published schema-v6
-predecessor for v0.5.0: the previous published tag, v0.2.5, supports schema v4
-and is not a direct binary rollback target. Preserve the exact pre-migration
-binary and untouched database privately when upgrading. Once a release accepts
-writes on a newer schema, recovery becomes roll-forward only.
+is activated; never run it against schema v6. The v0.5.1 patch release has the
+schema-v6 v0.5.0 predecessor and supports a direct binary rollback to that exact
+tag. The original v0.5.0 transition from v0.2.5/schema 4 is not a direct binary
+rollback boundary: preserve the exact pre-migration binary and untouched
+database privately when crossing it. Once a release accepts writes on a newer
+schema, recovery becomes roll-forward only.
 
 A pre-v4/pre-0.2.2 rollback is safe only before activation, while the untouched
 old database has received no client writes. After the new database has served

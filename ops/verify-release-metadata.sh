@@ -150,15 +150,15 @@ jq -e \
         "serverVersion",
         "sharingEnabled"
       ] | sort) and
-      .schemaVersion == 2 and
+      .schemaVersion == 3 and
       .serverVersion == $version and
       .database.destinationSchema == $schema and
       .database.supportedSourceSchemas == [4, 5] and
       .rollback == {
-        "previousPublishedTag": "v0.2.5",
-        "previousPublishedSchema": 4,
-        "directRollbackTag": null,
-        "directRollbackSupported": false
+        "previousPublishedTag": "v0.5.0",
+        "previousPublishedSchema": 6,
+        "directRollbackTag": "v0.5.0",
+        "directRollbackSupported": true
       } and
       (.clientToolingRevision | test("^[a-f0-9]{40}$")) and
       (.qualifiedRenderers | map(.version)) == ["1.12.7", "1.13.4"] and
