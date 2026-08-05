@@ -96,11 +96,11 @@ describe("release metadata consistency", () => {
       (contract: any) => (contract.schemaVersion = 2),
       (contract: any) => (contract.serverVersion = mismatchedVersion),
       (contract: any) => contract.database.destinationSchema++,
-      (contract: any) => (contract.database.supportedSourceSchemas = [5]),
+      (contract: any) => (contract.database.supportedSourceSchemas = [5, 6]),
       (contract: any) => (contract.rollback.previousPublishedTag = "v0.4.5"),
       (contract: any) => (contract.rollback.previousPublishedSchema = 5),
-      (contract: any) => (contract.rollback.directRollbackTag = "v0.4.9"),
-      (contract: any) => (contract.rollback.directRollbackSupported = false),
+      (contract: any) => (contract.rollback.directRollbackTag = "v0.5.1"),
+      (contract: any) => (contract.rollback.directRollbackSupported = true),
       (contract: any) => (contract.sharingEnabled = false),
     ]) {
       const fixture = await copyMetadataFixture();

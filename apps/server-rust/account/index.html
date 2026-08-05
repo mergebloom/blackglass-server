@@ -1,0 +1,51 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8">
+    <meta name="viewport" content="width=device-width,initial-scale=1">
+    <meta name="theme-color" content="#070a0e">
+    <title>Blackglass · Create account</title>
+    <link rel="icon" href="/account/logo.png" type="image/png">
+    <link rel="stylesheet" href="/account/styles.css">
+    <script defer src="/account/app.js"></script>
+  </head>
+  <body>
+    <header class="topbar">
+      <div class="brand">
+        <img src="/account/logo.png" width="40" height="40" alt="">
+        <span><strong>Blackglass</strong><small>Self-hosted Sync</small></span>
+      </div>
+    </header>
+    <main>
+      <section class="auth-shell">
+        <div class="auth-card">
+          <img class="auth-mark" src="/account/logo.png" width="104" height="104" alt="Blackglass prism">
+          <p class="eyebrow">Private Sync access</p>
+          <h1>Create your Blackglass account</h1>
+          <p class="lede">Register with this self-hosted server, then use the same email and password in Blackglass Bridge.</p>
+          <div id="checking" role="status">Checking registration availability…</div>
+          <div id="closed" hidden>
+            <p>Self-registration is currently disabled by this server’s administrator.</p>
+          </div>
+          <form id="signup-form" hidden>
+            <label for="name">Display name</label>
+            <input id="name" name="name" autocomplete="name" maxlength="128" required>
+            <label for="email">Email</label>
+            <input id="email" name="email" type="email" autocomplete="email" maxlength="254" required>
+            <label for="password">Password</label>
+            <input id="password" name="password" type="password" autocomplete="new-password" minlength="12" maxlength="256" required>
+            <label for="confirm-password">Confirm password</label>
+            <input id="confirm-password" type="password" autocomplete="new-password" minlength="12" maxlength="256" required>
+            <button id="create" type="submit">Create account</button>
+            <p id="form-message" role="alert"></p>
+          </form>
+          <div id="success" hidden role="status">
+            <h2>Account created</h2>
+            <p>You can now sign in from Blackglass Bridge using this email and password.</p>
+          </div>
+          <p class="privacy-note">Your credentials are sent only to this Blackglass Server.</p>
+        </div>
+      </section>
+    </main>
+  </body>
+</html>

@@ -23,14 +23,16 @@
           <img class="auth-mark" src="/admin/logo.png" width="104" height="104" alt="Blackglass prism">
           <p class="eyebrow">Self-hosted operations</p>
           <h1>Server administration</h1>
-          <p class="lede">A private, read-only view of health, storage, users, vaults, and active Sync sessions.</p>
+          <p class="lede">Sign in with an administrator account to manage access and view this Blackglass Server.</p>
           <form id="login-form">
-            <label for="token">Admin token</label>
-            <input id="token" type="password" autocomplete="off" spellcheck="false" minlength="64" maxlength="64" pattern="[0-9a-f]{64}" placeholder="64-character operator token" required>
+            <label for="email">Email</label>
+            <input id="email" type="email" autocomplete="username" maxlength="254" required>
+            <label for="password">Password</label>
+            <input id="password" type="password" autocomplete="current-password" required>
             <button id="connect" type="submit">Open console</button>
             <p id="login-error" role="alert"></p>
           </form>
-          <p class="privacy-note">Your token stays in this browser tab and is never written to server logs.</p>
+          <p class="privacy-note">The console uses a private, HTTP-only session cookie. Credentials are never written to server logs.</p>
         </div>
       </section>
       <div id="dashboard" hidden aria-busy="false">
@@ -45,10 +47,21 @@
           </div>
           <div class="actions">
             <button id="refresh">Refresh</button>
-            <button id="signout" class="secondary">Forget token</button>
+            <button id="signout" class="secondary">Sign out</button>
           </div>
         </div>
         <div class="dashboard-grid">
+          <section class="panel wide registration-panel">
+            <div>
+              <h2>Self-registration</h2>
+              <p>Allow new users to create ordinary accounts from <code>/account</code>. Administrator access is never granted through registration.</p>
+            </div>
+            <label class="switch-row" for="registration-enabled">
+              <input id="registration-enabled" type="checkbox">
+              <span id="registration-label">Disabled</span>
+            </label>
+            <p id="registration-message" role="status"></p>
+          </section>
           <section class="panel wide"><h2>Overview &amp; limits</h2><dl id="overview"></dl></section>
           <section class="panel"><h2 id="user-title">Users</h2><div id="users" class="rows"></div></section>
           <section class="panel"><h2 id="vault-title">Vaults</h2><div id="vaults" class="rows"></div></section>

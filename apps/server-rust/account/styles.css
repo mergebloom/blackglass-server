@@ -1,0 +1,73 @@
+:root {
+  color-scheme: dark;
+  --bg: #070a0e;
+  --surface: #111820;
+  --ink: #f4f7f9;
+  --muted: #8f9ca8;
+  --line: rgba(155, 184, 207, 0.16);
+  --accent: #43c9ff;
+  --bad: #ff8d8d;
+  --good: #55d6a4;
+}
+
+* { box-sizing: border-box; }
+[hidden] { display: none !important; }
+body {
+  min-height: 100vh;
+  margin: 0;
+  color: var(--ink);
+  background:
+    radial-gradient(circle at 50% -10%, rgba(30, 172, 232, 0.13), transparent 34rem),
+    linear-gradient(180deg, #090d12 0%, var(--bg) 60%);
+  font: 15px/1.55 Inter, ui-sans-serif, -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif;
+}
+.topbar {
+  display: flex;
+  align-items: center;
+  min-height: 72px;
+  padding: 0 max(1.25rem, calc((100% - 72rem) / 2));
+  border-bottom: 1px solid var(--line);
+  background: rgba(7, 10, 14, 0.78);
+  backdrop-filter: blur(18px);
+}
+.brand { display: flex; align-items: center; gap: 0.75rem; }
+.brand span { display: grid; line-height: 1.18; }
+.brand small { color: var(--muted); font-size: 0.75rem; }
+main { width: min(72rem, 100%); margin: auto; padding: 2rem 1.25rem 5rem; }
+.auth-shell { display: grid; min-height: calc(100vh - 9rem); place-items: center; padding: 3rem 0 6rem; }
+.auth-card {
+  width: min(32rem, 100%);
+  padding: clamp(1.75rem, 6vw, 3rem);
+  text-align: center;
+  border: 1px solid var(--line);
+  border-radius: 24px;
+  background: linear-gradient(150deg, rgba(22, 30, 39, 0.97), rgba(10, 14, 19, 0.97));
+  box-shadow: 0 24px 80px rgba(0, 0, 0, 0.36);
+}
+.auth-mark { display: block; margin: 0 auto 0.8rem; object-fit: contain; }
+.eyebrow { margin: 0 0 0.45rem; color: var(--accent); font-size: 0.72rem; font-weight: 700; letter-spacing: 0.14em; text-transform: uppercase; }
+h1 { margin: 0; font-size: clamp(1.75rem, 5vw, 2.35rem); line-height: 1.12; letter-spacing: -0.035em; }
+h2 { color: var(--good); }
+.lede { margin: 1rem auto 1.75rem; color: var(--muted); }
+form { display: grid; gap: 0.7rem; text-align: left; }
+label { color: #c8d1d9; font-size: 0.82rem; font-weight: 650; }
+button, input {
+  min-height: 48px;
+  width: 100%;
+  border: 1px solid var(--line);
+  border-radius: 10px;
+  padding: 0.72rem 0.9rem;
+  color: var(--ink);
+  font: inherit;
+}
+input { margin-bottom: 0.2rem; background: rgba(4, 7, 10, 0.76); }
+button { margin-top: 0.5rem; border-color: rgba(67, 201, 255, 0.38); background: linear-gradient(180deg, #29b9f2, #158dc1); color: #031018; font-weight: 750; cursor: pointer; }
+button:disabled { cursor: wait; opacity: 0.55; }
+button:focus-visible, input:focus-visible { outline: 3px solid rgba(67, 201, 255, 0.38); outline-offset: 2px; border-color: var(--accent); }
+#checking, #closed { padding: 1rem; border: 1px solid var(--line); border-radius: 10px; color: var(--muted); }
+#form-message { min-height: 1.5rem; margin: 0; color: var(--bad); }
+.privacy-note { margin: 1rem 0 0; color: #677480; font-size: 0.76rem; }
+@media (max-width: 600px) {
+  main { padding-inline: 0.8rem; }
+  .auth-card { border-radius: 16px; }
+}

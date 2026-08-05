@@ -44,6 +44,8 @@ services:
       SELFHOST_STAGING_DIR: /var/lib/blackglass-server/uploads
       SELFHOST_ALLOWED_ORIGINS: app://obsidian.md
       SELFHOST_TRUSTED_PROXY: 127.0.0.1
+      SELFHOST_ADMIN_BIND_HOST: 127.0.0.1
+      SELFHOST_ADMIN_PORT: "3010"
       SELFHOST_SHARING_ENABLED: "true"
       SELFHOST_LOG_FORMAT: json
       RUST_LOG: info

@@ -20,6 +20,9 @@ describe("one-command production deployment", () => {
     expect(compose).toContain('["CMD", "/usr/local/bin/blackglass-server", "healthcheck"]');
     expect(compose).toContain("SELFHOST_ALLOWED_ORIGINS: app://obsidian.md");
     expect(compose).toContain("SELFHOST_TRUSTED_PROXY: 127.0.0.1");
+    expect(compose).toContain("SELFHOST_ADMIN_BIND_HOST: 127.0.0.1");
+    expect(compose).toContain('SELFHOST_ADMIN_PORT: "3010"');
+    expect(compose).not.toContain("SELFHOST_ADMIN_TOKEN_HASH");
     expect(compose).not.toMatch(/^\s+ports:/mu);
     expect(compose).toContain("service_completed_successfully");
     expect(compose).toContain("exec chown -R 65532:65532 /var/lib/blackglass-server /data /config");

@@ -19,8 +19,8 @@ use std::{
 };
 use uuid::Uuid;
 
-const CURRENT_SCHEMA_VERSION: i64 = 6;
-const SUPPORTED_MIGRATIONS: &[i64] = &[1, 2, 3, 4, 5, 6];
+const CURRENT_SCHEMA_VERSION: i64 = 7;
+const SUPPORTED_MIGRATIONS: &[i64] = &[1, 2, 3, 4, 5, 6, 7];
 pub(crate) const MAX_VAULTS: i64 = 100;
 pub(crate) const MAX_JS_SAFE_INTEGER: i64 = 9_007_199_254_740_991;
 pub(crate) const MAX_USERS: i64 = 256;
@@ -48,6 +48,7 @@ pub(crate) struct UserSummary {
     pub email: String,
     pub name: String,
     pub status: String,
+    pub role: String,
     pub owned_vaults: i64,
     pub sessions: i64,
 }
@@ -114,6 +115,7 @@ pub(crate) struct AdminUser {
     pub email: String,
     pub name: String,
     pub status: String,
+    pub role: String,
     pub owned_vaults: i64,
     pub shared_vaults: i64,
     pub sessions: i64,
@@ -138,6 +140,14 @@ pub(crate) struct AdminDatabaseSnapshot {
     pub membership_count: i64,
     pub active_memberships: i64,
     pub mismatched_data_hosts: i64,
+    pub self_registration_enabled: bool,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum RegistrationResult {
+    Created(i64),
+    Disabled,
+    Unavailable,
 }
 
 #[derive(Debug)]
@@ -274,7 +284,7 @@ impl Db {
     pub(crate) fn list_users(&self) -> Result<Vec<UserSummary>> {
         self.with(|connection| {
             let mut query = connection.prepare(
-                "SELECT u.id,u.email,u.name,u.status,
+                "SELECT u.id,u.email,u.name,u.status,u.role,
                         (SELECT COUNT(*) FROM vaults v WHERE v.owner_user_id=u.id),
                         (SELECT COUNT(*) FROM sessions s WHERE s.user_id=u.id)
                    FROM users u ORDER BY u.id LIMIT ?",
@@ -286,8 +296,9 @@ impl Db {
                         email: row.get(1)?,
                         name: row.get(2)?,
                         status: row.get(3)?,
-                        owned_vaults: row.get(4)?,
-                        sessions: row.get(5)?,
+                        role: row.get(4)?,
+                        owned_vaults: row.get(5)?,
+                        sessions: row.get(6)?,
                     })
                 })?
                 .collect::<rusqlite::Result<Vec<_>>>()?)
@@ -318,8 +329,8 @@ impl Db {
             let now = now_ms();
             transaction.execute(
                 "INSERT INTO users(
-                    email_canonical,email,name,password_hash,status,created_at,updated_at
-                 ) VALUES(?,?,?,?,'active',?,?)",
+                    email_canonical,email,name,password_hash,status,role,created_at,updated_at
+                 ) VALUES(?,?,?,?,'active','user',?,?)",
                 params![
                     email.canonical,
                     email.display,
@@ -332,6 +343,102 @@ impl Db {
             let id = transaction.last_insert_rowid();
             transaction.commit()?;
             Ok(id)
+        })
+    }
+
+    pub(crate) fn create_self_registered_user(
+        &self,
+        email: &str,
+        name: &str,
+        password_hash: &str,
+    ) -> Result<RegistrationResult> {
+        let email = auth::canonicalize_email(email)?;
+        let name = auth::normalize_display_name(name)?;
+        if !auth::password_hash_is_production_grade(password_hash) {
+            bail!("password hash does not meet the production Argon2 policy")
+        }
+        self.with(|connection| {
+            let transaction =
+                connection.transaction_with_behavior(TransactionBehavior::Immediate)?;
+            let enabled: bool = transaction.query_row(
+                "SELECT self_registration_enabled=1 FROM server_settings WHERE id=1",
+                [],
+                |row| row.get(0),
+            )?;
+            if !enabled {
+                return Ok(RegistrationResult::Disabled);
+            }
+            let count: i64 =
+                transaction.query_row("SELECT COUNT(*) FROM users", [], |row| row.get(0))?;
+            let exists: bool = transaction.query_row(
+                "SELECT EXISTS(SELECT 1 FROM users WHERE email_canonical=?)",
+                [&email.canonical],
+                |row| row.get(0),
+            )?;
+            if count >= MAX_USERS || exists {
+                return Ok(RegistrationResult::Unavailable);
+            }
+            let sequence: i64 = transaction.query_row(
+                "SELECT COALESCE((SELECT seq FROM sqlite_sequence WHERE name='users'),0)",
+                [],
+                |row| row.get(0),
+            )?;
+            if sequence >= MAX_JS_SAFE_INTEGER {
+                return Ok(RegistrationResult::Unavailable);
+            }
+            let now = now_ms();
+            transaction.execute(
+                "INSERT INTO users(
+                    email_canonical,email,name,password_hash,status,role,created_at,updated_at
+                 ) VALUES(?,?,?,?,'active','user',?,?)",
+                params![
+                    email.canonical,
+                    email.display,
+                    name,
+                    password_hash,
+                    now,
+                    now
+                ],
+            )?;
+            let id = transaction.last_insert_rowid();
+            transaction.commit()?;
+            Ok(RegistrationResult::Created(id))
+        })
+    }
+
+    pub(crate) fn self_registration_enabled(&self) -> Result<bool> {
+        self.with(|connection| {
+            Ok(connection.query_row(
+                "SELECT self_registration_enabled=1 FROM server_settings WHERE id=1",
+                [],
+                |row| row.get(0),
+            )?)
+        })
+    }
+
+    pub(crate) fn set_self_registration_enabled(
+        &self,
+        administrator_id: i64,
+        enabled: bool,
+    ) -> Result<()> {
+        self.with(|connection| {
+            let changed = connection.execute(
+                "UPDATE server_settings
+                    SET self_registration_enabled=?,updated_at=?,updated_by=?
+                  WHERE id=1 AND EXISTS(
+                    SELECT 1 FROM users WHERE id=? AND status='active' AND role='admin'
+                  )",
+                params![
+                    i64::from(enabled),
+                    now_ms(),
+                    administrator_id,
+                    administrator_id
+                ],
+            )?;
+            if changed != 1 {
+                bail!("administrator authorization changed")
+            }
+            Ok(())
         })
     }
 
@@ -376,11 +483,35 @@ impl Db {
             bail!("user status must be active or disabled")
         }
         if status == "disabled" {
-            self.update_user_and_revoke(user_id, |transaction, now| {
+            self.with(|connection| {
+                let transaction =
+                    connection.transaction_with_behavior(TransactionBehavior::Immediate)?;
+                let role: String = transaction
+                    .query_row("SELECT role FROM users WHERE id=?", [user_id], |row| {
+                        row.get(0)
+                    })
+                    .optional()?
+                    .context("user not found")?;
+                let active_admins: i64 = transaction.query_row(
+                    "SELECT COUNT(*) FROM users WHERE role='admin' AND status='active'",
+                    [],
+                    |row| row.get(0),
+                )?;
+                if role == "admin" && active_admins <= 1 {
+                    bail!("cannot disable the last active administrator")
+                }
+                let now = now_ms();
                 transaction.execute(
                     "UPDATE users SET status='disabled',updated_at=? WHERE id=?",
                     params![now, user_id],
-                )
+                )?;
+                transaction.execute(
+                    "UPDATE sessions SET revoked_at=MAX(?,created_at)
+                      WHERE user_id=? AND revoked_at IS NULL",
+                    params![now, user_id],
+                )?;
+                transaction.commit()?;
+                Ok(())
             })
         } else {
             self.with(|connection| {
@@ -394,6 +525,45 @@ impl Db {
                 Ok(())
             })
         }
+    }
+
+    pub(crate) fn set_user_role(&self, user_id: i64, role: &str) -> Result<()> {
+        if !matches!(role, "admin" | "user") {
+            bail!("user role must be admin or user")
+        }
+        self.with(|connection| {
+            let transaction =
+                connection.transaction_with_behavior(TransactionBehavior::Immediate)?;
+            let (current_role, status): (String, String) = transaction
+                .query_row(
+                    "SELECT role,status FROM users WHERE id=?",
+                    [user_id],
+                    |row| Ok((row.get(0)?, row.get(1)?)),
+                )
+                .optional()?
+                .context("user not found")?;
+            let active_admins: i64 = transaction.query_row(
+                "SELECT COUNT(*) FROM users WHERE role='admin' AND status='active'",
+                [],
+                |row| row.get(0),
+            )?;
+            if current_role == "admin" && role == "user" && status == "active" && active_admins <= 1
+            {
+                bail!("cannot demote the last active administrator")
+            }
+            let now = now_ms();
+            transaction.execute(
+                "UPDATE users SET role=?,updated_at=? WHERE id=?",
+                params![role, now, user_id],
+            )?;
+            transaction.execute(
+                "UPDATE sessions SET revoked_at=MAX(?,created_at)
+                  WHERE user_id=? AND revoked_at IS NULL",
+                params![now, user_id],
+            )?;
+            transaction.commit()?;
+            Ok(())
+        })
     }
 
     pub(crate) fn revoke_user_sessions(&self, user_id: i64) -> Result<usize> {
@@ -508,7 +678,7 @@ impl Db {
                 })?
                 .collect::<rusqlite::Result<Vec<_>>>()?;
             let mut user_query = c.prepare(
-                "SELECT u.id,u.email,u.name,u.status,
+                "SELECT u.id,u.email,u.name,u.status,u.role,
                         (SELECT COUNT(*) FROM vaults v WHERE v.owner_user_id=u.id),
                         (SELECT COUNT(*) FROM memberships m WHERE m.user_id=u.id AND m.revoked_at IS NULL),
                         (SELECT COUNT(*) FROM sessions s WHERE s.user_id=u.id),
@@ -522,10 +692,11 @@ impl Db {
                         email: r.get(1)?,
                         name: r.get(2)?,
                         status: r.get(3)?,
-                        owned_vaults: r.get(4)?,
-                        shared_vaults: r.get(5)?,
-                        sessions: r.get(6)?,
-                        retained_bytes: r.get(7)?,
+                        role: r.get(4)?,
+                        owned_vaults: r.get(5)?,
+                        shared_vaults: r.get(6)?,
+                        sessions: r.get(7)?,
+                        retained_bytes: r.get(8)?,
                     })
                 })?
                 .collect::<rusqlite::Result<Vec<_>>>()?;
@@ -550,6 +721,11 @@ impl Db {
                 [],
                 |r| Ok((r.get(0)?, r.get(1)?)),
             )?;
+            let self_registration_enabled = c.query_row(
+                "SELECT self_registration_enabled=1 FROM server_settings WHERE id=1",
+                [],
+                |r| r.get(0),
+            )?;
             Ok(AdminDatabaseSnapshot {
                 schema_version: CURRENT_SCHEMA_VERSION_PUBLIC,
                 max_sessions: MAX_SESSIONS,
@@ -569,6 +745,7 @@ impl Db {
                 membership_count,
                 active_memberships,
                 mismatched_data_hosts,
+                self_registration_enabled,
             })
         })();
         c.progress_handler(0, None::<fn() -> bool>);
@@ -626,7 +803,7 @@ impl Db {
         self.with(|connection| {
             Ok(connection
                 .query_row(
-                    "SELECT id,email,name,password_hash,status='active'
+                    "SELECT id,email,name,password_hash,status='active',role
                        FROM users WHERE email_canonical=?",
                     [canonical_email],
                     |row| {
@@ -636,6 +813,7 @@ impl Db {
                             name: row.get(2)?,
                             password_hash: row.get(3)?,
                             active: row.get(4)?,
+                            role: row.get(5)?,
                         })
                     },
                 )
@@ -658,7 +836,7 @@ impl Db {
         self.with(|connection| {
             Ok(connection
                 .query_row(
-                    "SELECT u.id,u.email,u.name,s.token_hash,s.expires_at
+                    "SELECT u.id,u.email,u.name,u.role,s.token_hash,s.expires_at
                        FROM sessions s JOIN users u ON u.id=s.user_id
                       WHERE s.token_hash=? AND s.expires_at>? AND s.revoked_at IS NULL
                         AND u.status='active'",
@@ -668,8 +846,9 @@ impl Db {
                             user_id: row.get(0)?,
                             email: row.get(1)?,
                             name: row.get(2)?,
-                            token_hash: row.get(3)?,
-                            expires_at: row.get(4)?,
+                            role: row.get(3)?,
+                            token_hash: row.get(4)?,
+                            expires_at: row.get(5)?,
                         })
                     },
                 )
@@ -1911,6 +2090,10 @@ fn migrate(c: &Connection, initial_user: Option<&InitialUser>) -> Result<()> {
             apply_migration(c, version, MIGRATION_6_SQL)?;
             continue;
         }
+        if version == 7 {
+            apply_migration(c, version, MIGRATION_7_SQL)?;
+            continue;
+        }
         let sql = match version {
             1 => MIGRATION_1_SQL,
             2 => MIGRATION_2_SQL,
@@ -1965,6 +2148,20 @@ const MIGRATION_6_SQL: &str = "
         ON memberships(user_id,vault_id,id);
     CREATE INDEX memberships_vault_state
         ON memberships(vault_id,revoked_at,id);
+    DELETE FROM sessions;
+";
+
+const MIGRATION_7_SQL: &str = "
+    ALTER TABLE users ADD COLUMN role TEXT NOT NULL DEFAULT 'user';
+    UPDATE users SET role='admin' WHERE id=(SELECT MIN(id) FROM users);
+    CREATE TABLE server_settings(
+        id INTEGER PRIMARY KEY,
+        self_registration_enabled INTEGER NOT NULL DEFAULT 0,
+        updated_at INTEGER NOT NULL,
+        updated_by INTEGER NOT NULL REFERENCES users(id) ON DELETE NO ACTION
+    );
+    INSERT INTO server_settings(id,self_registration_enabled,updated_at,updated_by)
+        SELECT 1,0,unixepoch()*1000,id FROM users ORDER BY id LIMIT 1;
     DELETE FROM sessions;
 ";
 
@@ -2199,6 +2396,13 @@ fn verify_schema_at_version(c: &Connection, version: i64) -> Result<()> {
             verify_logical_invariants(c, true, true)?;
             verify_membership_invariants(c)?;
         }
+        7 => {
+            verify_v7_schema(c)?;
+            verify_foreign_keys(c)?;
+            verify_logical_invariants(c, true, true)?;
+            verify_membership_invariants(c)?;
+            verify_v7_invariants(c)?;
+        }
         _ => bail!("no validator for database schema version {version}"),
     }
     Ok(())
@@ -2243,6 +2447,11 @@ pub fn recover_stale_backup(source: &Path, destination: &Path) -> Result<()> {
         transaction.execute("DELETE FROM sessions", [])?;
         transaction.execute(
             "UPDATE users SET status='disabled',updated_at=MAX(updated_at,?)",
+            [now_ms()],
+        )?;
+        transaction.execute(
+            "UPDATE server_settings
+                SET self_registration_enabled=0,updated_at=MAX(updated_at,?)",
             [now_ms()],
         )?;
         transaction.commit()?;
@@ -2747,10 +2956,22 @@ fn verify_v5_schema(c: &Connection) -> Result<()> {
 }
 
 fn verify_v6_schema(c: &Connection) -> Result<()> {
-    verify_v5_or_v6_schema(c, true)
+    verify_v5_v6_or_v7_schema(c, true, false)
 }
 
 fn verify_v5_or_v6_schema(c: &Connection, memberships: bool) -> Result<()> {
+    verify_v5_v6_or_v7_schema(c, memberships, false)
+}
+
+fn verify_v7_schema(c: &Connection) -> Result<()> {
+    verify_v5_v6_or_v7_schema(c, true, true)
+}
+
+fn verify_v5_v6_or_v7_schema(
+    c: &Connection,
+    memberships: bool,
+    account_management: bool,
+) -> Result<()> {
     let mut objects = vec![
         ("index", "retired_vaults_owner", "retired_vaults"),
         ("index", "revisions_vault_path", "revisions"),
@@ -2784,6 +3005,10 @@ fn verify_v5_or_v6_schema(c: &Connection, memberships: bool) -> Result<()> {
         ]);
         objects.sort_unstable();
     }
+    if account_management {
+        objects.push(("table", "server_settings", "server_settings"));
+        objects.sort_unstable();
+    }
     verify_schema_objects(c, &objects, "Blackglass")?;
     verify_exact_table(
         c,
@@ -2791,7 +3016,16 @@ fn verify_v5_or_v6_schema(c: &Connection, memberships: bool) -> Result<()> {
         SCHEMA_MIGRATION_COLUMNS,
         "Blackglass",
     )?;
-    verify_exact_table(c, "users", USER_COLUMNS, "Blackglass")?;
+    verify_exact_table(
+        c,
+        "users",
+        if account_management {
+            USER_V7_COLUMNS
+        } else {
+            USER_COLUMNS
+        },
+        "Blackglass",
+    )?;
     verify_exact_table(c, "vaults", VAULT_V5_COLUMNS, "Blackglass")?;
     verify_exact_table(c, "revisions", REVISION_TABLE_COLUMNS, "Blackglass")?;
     verify_exact_table(
@@ -2804,6 +3038,9 @@ fn verify_v5_or_v6_schema(c: &Connection, memberships: bool) -> Result<()> {
     verify_exact_table(c, "retired_vaults", RETIRED_VAULT_V5_COLUMNS, "Blackglass")?;
     if memberships {
         verify_exact_table(c, "memberships", MEMBERSHIP_COLUMNS, "Blackglass")?;
+    }
+    if account_management {
+        verify_exact_table(c, "server_settings", SERVER_SETTINGS_COLUMNS, "Blackglass")?;
     }
     verify_exact_table(c, "sqlite_sequence", SQLITE_SEQUENCE_COLUMNS, "Blackglass")?;
 
@@ -2880,6 +3117,9 @@ fn verify_v5_or_v6_schema(c: &Connection, memberships: bool) -> Result<()> {
             "Blackglass",
         )?;
     }
+    if account_management {
+        verify_exact_indexes(c, "server_settings", &[], "Blackglass")?;
+    }
 
     verify_exact_foreign_keys(c, "schema_migrations", &[], "Blackglass")?;
     verify_exact_foreign_keys(c, "users", &[], "Blackglass")?;
@@ -2934,6 +3174,18 @@ fn verify_v5_or_v6_schema(c: &Connection, memberships: bool) -> Result<()> {
                 ForeignKeyExpectation::no_action("users", "user_id", "id"),
                 ForeignKeyExpectation::cascade("vaults", "vault_id", "id"),
             ],
+            "Blackglass",
+        )?;
+    }
+    if account_management {
+        verify_exact_foreign_keys(
+            c,
+            "server_settings",
+            &[ForeignKeyExpectation::no_action(
+                "users",
+                "updated_by",
+                "id",
+            )],
             "Blackglass",
         )?;
     }
@@ -3148,6 +3400,23 @@ const USER_COLUMNS: &[ExpectedColumn] = &[
     ("status", "TEXT", true, None, 0),
     ("created_at", "INTEGER", true, None, 0),
     ("updated_at", "INTEGER", true, None, 0),
+];
+const USER_V7_COLUMNS: &[ExpectedColumn] = &[
+    ("id", "INTEGER", false, None, 1),
+    ("email_canonical", "TEXT", true, None, 0),
+    ("email", "TEXT", true, None, 0),
+    ("name", "TEXT", true, None, 0),
+    ("password_hash", "TEXT", true, None, 0),
+    ("status", "TEXT", true, None, 0),
+    ("created_at", "INTEGER", true, None, 0),
+    ("updated_at", "INTEGER", true, None, 0),
+    ("role", "TEXT", true, Some("'user'"), 0),
+];
+const SERVER_SETTINGS_COLUMNS: &[ExpectedColumn] = &[
+    ("id", "INTEGER", false, None, 1),
+    ("self_registration_enabled", "INTEGER", true, Some("0"), 0),
+    ("updated_at", "INTEGER", true, None, 0),
+    ("updated_by", "INTEGER", true, None, 0),
 ];
 const VAULT_V5_COLUMNS: &[ExpectedColumn] = &[
     ("id", "TEXT", false, None, 1),
@@ -3609,6 +3878,38 @@ fn verify_membership_invariants(c: &Connection) -> Result<()> {
     )?;
     if sequence_rows > 1 || (max_id > 0 && sequence_rows != 1) {
         bail!("membership sequence shape is invalid")
+    }
+    Ok(())
+}
+
+fn verify_v7_invariants(c: &Connection) -> Result<()> {
+    reject_invalid_row(
+        c,
+        "SELECT CAST(id AS TEXT) FROM users
+          WHERE typeof(role)<>'text' OR role NOT IN ('admin','user')
+          LIMIT 1",
+        "user role",
+    )?;
+    let administrators: i64 =
+        c.query_row("SELECT COUNT(*) FROM users WHERE role='admin'", [], |row| {
+            row.get(0)
+        })?;
+    if administrators < 1 {
+        bail!("database must retain at least one administrator")
+    }
+    let settings_rows: i64 = c.query_row(
+        "SELECT COUNT(*) FROM server_settings
+          WHERE id=1
+            AND typeof(self_registration_enabled)='integer'
+            AND self_registration_enabled IN (0,1)
+            AND typeof(updated_at)='integer'
+            AND updated_at BETWEEN 0 AND ?
+            AND typeof(updated_by)='integer'",
+        [MAX_JS_SAFE_INTEGER],
+        |row| row.get(0),
+    )?;
+    if settings_rows != 1 {
+        bail!("server settings singleton invariant violation")
     }
     Ok(())
 }
@@ -4165,6 +4466,86 @@ mod tests {
                 password: None,
             })
             .unwrap();
+    }
+
+    #[test]
+    fn registration_is_default_off_atomic_and_never_grants_admin() {
+        let dir = tempfile::tempdir().unwrap();
+        let database = Db::open(&dir.path().join("registration.sqlite")).unwrap();
+        let hash = auth::hash_password("registered-password").unwrap();
+        assert!(!database.self_registration_enabled().unwrap());
+        assert_eq!(
+            database
+                .create_self_registered_user("member@example.test", "Member", &hash)
+                .unwrap(),
+            RegistrationResult::Disabled
+        );
+        database.set_self_registration_enabled(1, true).unwrap();
+
+        let outcomes = std::thread::scope(|scope| {
+            [database.clone(), database.clone()]
+                .map(|database| {
+                    let hash = hash.clone();
+                    scope.spawn(move || {
+                        database.create_self_registered_user("Member@Example.Test", "Member", &hash)
+                    })
+                })
+                .map(|thread| thread.join().unwrap().unwrap())
+        });
+        assert_eq!(
+            outcomes
+                .iter()
+                .filter(|outcome| matches!(outcome, RegistrationResult::Created(_)))
+                .count(),
+            1
+        );
+        assert_eq!(
+            outcomes
+                .iter()
+                .filter(|outcome| matches!(outcome, RegistrationResult::Unavailable))
+                .count(),
+            1
+        );
+        let users = database.list_users().unwrap();
+        assert_eq!(users[0].role, "admin");
+        assert_eq!(users[1].role, "user");
+
+        database.set_self_registration_enabled(1, false).unwrap();
+        assert_eq!(
+            database
+                .create_self_registered_user("other@example.test", "Other", &hash)
+                .unwrap(),
+            RegistrationResult::Disabled
+        );
+        assert!(
+            database
+                .set_self_registration_enabled(users[1].id, true)
+                .is_err()
+        );
+    }
+
+    #[test]
+    fn the_last_active_administrator_cannot_be_disabled_or_demoted() {
+        let dir = tempfile::tempdir().unwrap();
+        let database = Db::open(&dir.path().join("administrator.sqlite")).unwrap();
+        let hash = auth::hash_password("second-admin-password").unwrap();
+        let second = database
+            .create_user("second@example.test", "Second", &hash)
+            .unwrap();
+
+        assert_error_contains(
+            database.set_user_status(1, "disabled"),
+            "last active administrator",
+        );
+        assert_error_contains(
+            database.set_user_role(1, "user"),
+            "last active administrator",
+        );
+        database.set_user_role(second, "admin").unwrap();
+        database.set_user_status(1, "disabled").unwrap();
+        database.set_user_status(1, "active").unwrap();
+        database.set_user_role(1, "user").unwrap();
+        assert_eq!(database.list_users().unwrap()[0].role, "user");
     }
 
     #[test]
@@ -4973,7 +5354,7 @@ mod tests {
     }
 
     #[test]
-    fn shipped_v3_migrates_to_v6_without_rotating_identity_and_invalidates_sessions() {
+    fn shipped_v3_migrates_to_v7_without_rotating_identity_and_invalidates_sessions() {
         let dir = tempfile::tempdir().unwrap();
         let source = dir.path().join("shipped-v3.sqlite");
         let destination = dir.path().join("current-v5.sqlite");
@@ -5004,17 +5385,17 @@ mod tests {
         assert!(!migrated.is_retired_vault("legacy-vault").unwrap());
         migrated
             .with(|connection| {
-                assert_eq!(migration_versions(connection)?, vec![1, 2, 3, 4, 5, 6]);
+                assert_eq!(migration_versions(connection)?, vec![1, 2, 3, 4, 5, 6, 7]);
                 Ok(())
             })
             .unwrap();
     }
 
     #[test]
-    fn previous_published_v4_schema_migrates_copy_first_to_v6() {
+    fn previous_published_v4_schema_migrates_copy_first_to_v7() {
         let dir = tempfile::tempdir().unwrap();
         let source = dir.path().join("published-v4.sqlite");
-        let destination = dir.path().join("current-v6.sqlite");
+        let destination = dir.path().join("current-v7.sqlite");
         create_v1_database(&source);
         let connection = Connection::open(&source).unwrap();
         connection
@@ -5034,7 +5415,7 @@ mod tests {
         let migrated = Db::open(&destination).unwrap();
         migrated
             .with(|connection| {
-                assert_eq!(migration_versions(connection)?, vec![1, 2, 3, 4, 5, 6]);
+                assert_eq!(migration_versions(connection)?, vec![1, 2, 3, 4, 5, 6, 7]);
                 assert_eq!(
                     connection
                         .query_row("SELECT COUNT(*) FROM users", [], |row| row.get::<_, i64>(0))?,
@@ -5058,7 +5439,7 @@ mod tests {
         create_current_database(&source);
         assert_error_contains(
             migrate_versioned_database(&source, &destination),
-            "already at schema version 6",
+            "already at schema version 7",
         );
         assert!(!destination.exists());
     }
@@ -5600,6 +5981,7 @@ mod tests {
             .unwrap();
         let owner_one_session = database.issue_session_for_user(1, 3600).unwrap();
         let owner_two_session = database.issue_session_for_user(owner_two, 3600).unwrap();
+        database.set_self_registration_enabled(1, true).unwrap();
         database.checkpoint().unwrap();
 
         let recovered = dir.path().join("stale-recovered.sqlite");
@@ -5616,6 +5998,7 @@ mod tests {
         assert_eq!(users[1].owned_vaults, 1);
         assert!(!copy.valid_session(&owner_one_session));
         assert!(!copy.valid_session(&owner_two_session));
+        assert!(!copy.self_registration_enabled().unwrap());
         assert_eq!(copy.list_vaults_for_user(1).unwrap().len(), 1);
         assert_eq!(copy.list_vaults_for_user(owner_two).unwrap().len(), 1);
 
@@ -6019,6 +6402,21 @@ mod tests {
                 "UPDATE vaults SET keyhash='',salt=lower(hex(zeroblob(16))),password=lower(hex(zeroblob(32)));",
                 "vault encryption credential shape",
             ),
+            (
+                "invalid-user-role",
+                "UPDATE users SET role='superuser';",
+                "user role",
+            ),
+            (
+                "missing-administrator",
+                "UPDATE users SET role='user';",
+                "retain at least one administrator",
+            ),
+            (
+                "invalid-registration-setting",
+                "UPDATE server_settings SET self_registration_enabled=2;",
+                "server settings singleton invariant violation",
+            ),
         ] {
             let path = create_migrated_database(dir.path(), name);
             execute_sql(&path, mutation);
@@ -6053,7 +6451,7 @@ mod tests {
         let connection = Connection::open(&source).unwrap();
         connection
             .execute(
-                "INSERT INTO schema_migrations(version, applied_at) VALUES(7, 7)",
+                "INSERT INTO schema_migrations(version, applied_at) VALUES(8, 8)",
                 [],
             )
             .unwrap();
@@ -6068,7 +6466,7 @@ mod tests {
             revoke_all_sessions(&source).map(|_| ()),
             Db::open(&source).map(|_| ()),
         ] {
-            assert_error_contains(result, "schema version 7 is newer");
+            assert_error_contains(result, "schema version 8 is newer");
         }
         assert!(!backup.exists());
         assert!(!restored.exists());
@@ -6285,7 +6683,7 @@ mod tests {
         let connection = Connection::open(&current).unwrap();
         connection
             .execute(
-                "INSERT INTO schema_migrations(version, applied_at) VALUES(7, 7)",
+                "INSERT INTO schema_migrations(version, applied_at) VALUES(8, 8)",
                 [],
             )
             .unwrap();
@@ -6293,7 +6691,7 @@ mod tests {
         let future_destination = dir.path().join("future-destination.sqlite");
         assert_error_contains(
             migrate_legacy_database(&current, &future_destination),
-            "schema version 7 is newer",
+            "schema version 8 is newer",
         );
         assert!(!future_destination.exists());
     }

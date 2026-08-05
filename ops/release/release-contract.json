@@ -1,15 +1,15 @@
 {
   "schemaVersion": 3,
-  "serverVersion": "0.5.1",
+  "serverVersion": "0.6.0",
   "database": {
-    "supportedSourceSchemas": [4, 5],
-    "destinationSchema": 6
+    "supportedSourceSchemas": [4, 5, 6],
+    "destinationSchema": 7
   },
   "rollback": {
-    "previousPublishedTag": "v0.5.0",
+    "previousPublishedTag": "v0.5.1",
     "previousPublishedSchema": 6,
-    "directRollbackTag": "v0.5.0",
-    "directRollbackSupported": true
+    "directRollbackTag": null,
+    "directRollbackSupported": false
   },
   "clientToolingRevision": "40969d0fb6404bc91e08f47d884b099ee58d0b5a",
   "qualifiedRenderers": [

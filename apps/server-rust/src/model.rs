@@ -7,6 +7,7 @@ pub struct UserCredential {
     pub name: String,
     pub password_hash: String,
     pub active: bool,
+    pub role: String,
 }
 
 #[derive(Clone, Debug)]
@@ -14,6 +15,7 @@ pub struct AuthContext {
     pub user_id: i64,
     pub email: String,
     pub name: String,
+    pub role: String,
     pub token_hash: String,
     pub expires_at: i64,
 }

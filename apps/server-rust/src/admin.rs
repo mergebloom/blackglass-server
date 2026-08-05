@@ -1,18 +1,21 @@
 use crate::{
     db::{AdminActivity, AdminDatabaseSnapshot, AdminSession, AdminUser, AdminVault},
-    server::{AppState, DatabaseOperation, observe_database_error},
+    model::AuthContext,
+    server::{
+        AppState, DatabaseOperation, authenticate_credentials, db_task, issue_user_session,
+        observe_database_error,
+    },
 };
 use anyhow::{Result, bail};
 use axum::{
     Json, Router,
-    extract::{ConnectInfo, State},
+    extract::{ConnectInfo, DefaultBodyLimit, State},
     http::{HeaderMap, HeaderValue, StatusCode, header, uri::Authority},
     middleware::{self, Next},
     response::{Html, IntoResponse, Response},
-    routing::get,
+    routing::{get, post},
 };
-use serde::Serialize;
-use sha2::{Digest, Sha256};
+use serde::{Deserialize, Serialize};
 use std::{
     collections::HashMap,
     net::{IpAddr, SocketAddr},
@@ -23,32 +26,34 @@ use uuid::Uuid;
 
 pub(crate) const CSP: &str = "default-src 'none'; script-src 'self'; style-src 'self'; img-src 'self'; connect-src 'self'; frame-ancestors 'none'; base-uri 'none'; form-action 'none'";
 const MAX_DEVICE_BYTES: usize = 128;
-pub(crate) const ADMIN_TOKEN_HEX_LENGTH: usize = 64;
 pub(crate) const ADMIN_AUTH_FAILURES_PER_SOURCE: u8 = 8;
 const ADMIN_AUTH_FAILURE_WINDOW: Duration = Duration::from_secs(60);
 const MAX_ADMIN_AUTH_SOURCES: usize = 8;
+const ADMIN_SESSION_COOKIE: &str = "blackglass_admin_session";
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub(crate) struct AdminConfig {
     pub bind_host: IpAddr,
     pub port: u16,
-    pub token_hash: String,
 }
 
 pub(crate) fn parse_admin_config(
     host: Option<&str>,
     port: Option<&str>,
-    hash: Option<&str>,
+    legacy_hash: Option<&str>,
     control_port: u16,
     data_port: u16,
 ) -> Result<Option<AdminConfig>> {
-    if host.is_none() && port.is_none() && hash.is_none() {
+    if legacy_hash.is_some() {
+        bail!(
+            "SELFHOST_ADMIN_TOKEN_HASH is no longer supported; administrators now sign in with their Blackglass account"
+        );
+    }
+    if host.is_none() && port.is_none() {
         return Ok(None);
     }
-    let (Some(host), Some(port), Some(hash)) = (host, port, hash) else {
-        bail!(
-            "SELFHOST_ADMIN_BIND_HOST, SELFHOST_ADMIN_PORT, and SELFHOST_ADMIN_TOKEN_HASH must be set together"
-        );
+    let (Some(host), Some(port)) = (host, port) else {
+        bail!("SELFHOST_ADMIN_BIND_HOST and SELFHOST_ADMIN_PORT must be set together");
     };
     let bind_host: IpAddr = host
         .parse()
@@ -62,45 +67,7 @@ pub(crate) fn parse_admin_config(
     if port == 0 || port == control_port || port == data_port {
         bail!("admin, control, and data ports must be distinct and non-zero");
     }
-    if hash.len() != 64
-        || !hash
-            .bytes()
-            .all(|b| b.is_ascii_digit() || (b'a'..=b'f').contains(&b))
-    {
-        bail!("SELFHOST_ADMIN_TOKEN_HASH must be exactly 64 lowercase SHA-256 hex characters");
-    }
-    Ok(Some(AdminConfig {
-        bind_host,
-        port,
-        token_hash: hash.to_owned(),
-    }))
-}
-
-pub(crate) fn authorized(value: Option<&str>, expected_hex: &str) -> bool {
-    let Some(token) = value
-        .and_then(|v| v.strip_prefix("Bearer "))
-        .filter(|v| admin_token_has_valid_shape(v))
-    else {
-        return false;
-    };
-    let actual = Sha256::digest(token.as_bytes());
-    let Ok(expected) = hex::decode(expected_hex) else {
-        return false;
-    };
-    constant_time_eq(actual.as_slice(), &expected)
-}
-fn admin_token_has_valid_shape(token: &str) -> bool {
-    token.len() == ADMIN_TOKEN_HEX_LENGTH
-        && token
-            .bytes()
-            .all(|b| b.is_ascii_digit() || (b'a'..=b'f').contains(&b))
-}
-fn constant_time_eq(a: &[u8], b: &[u8]) -> bool {
-    let mut different = a.len() ^ b.len();
-    for i in 0..a.len().max(b.len()) {
-        different |= usize::from(a.get(i).copied().unwrap_or(0) ^ b.get(i).copied().unwrap_or(0));
-    }
-    different == 0
+    Ok(Some(AdminConfig { bind_host, port }))
 }
 
 #[derive(Clone, Debug, Serialize)]
@@ -282,6 +249,11 @@ struct Snapshot {
     storage: Storage,
     diagnostics: Diagnostics,
     counts: Counts,
+    registration: Registration,
+}
+#[derive(Serialize)]
+struct Registration {
+    enabled: bool,
 }
 #[derive(Serialize)]
 #[serde(rename_all = "camelCase")]
@@ -419,7 +391,12 @@ pub(crate) fn router(state: AppState) -> Router {
         .route("/admin/styles.css", get(styles))
         .route("/admin/app.js", get(script))
         .route("/admin/logo.png", get(logo))
+        .route("/admin/api/login", post(login))
+        .route("/admin/api/logout", post(logout))
+        .route("/admin/api/session", get(session_status))
         .route("/admin/api/snapshot", get(snapshot))
+        .route("/admin/api/registration", post(update_registration))
+        .layer(DefaultBodyLimit::max(4 * 1024))
         .layer(middleware::from_fn_with_state(
             state.clone(),
             security_headers,
@@ -490,35 +467,128 @@ async fn script() -> impl IntoResponse {
 async fn logo() -> impl IntoResponse {
     ([(header::CONTENT_TYPE, "image/png")], ADMIN_LOGO)
 }
-async fn snapshot(
+
+#[derive(Deserialize)]
+struct LoginRequest {
+    email: String,
+    password: String,
+}
+
+async fn login(
     State(state): State<AdminRouterState>,
     ConnectInfo(peer): ConnectInfo<SocketAddr>,
-    headers: HeaderMap,
+    Json(request): Json<LoginRequest>,
 ) -> Response {
-    let s = &state.app;
-    let Some(admin) = s.config.admin.as_ref() else {
-        return StatusCode::NOT_FOUND.into_response();
+    let user = match authenticate_credentials(
+        &state.app,
+        peer.ip(),
+        Some(request.email),
+        Some(request.password),
+    )
+    .await
+    {
+        Ok(user) if user.role == "admin" => user,
+        _ => {
+            let Some(retry_after) = state.auth_failures.register(peer.ip()) else {
+                return StatusCode::UNAUTHORIZED.into_response();
+            };
+            return (
+                StatusCode::TOO_MANY_REQUESTS,
+                [(
+                    header::RETRY_AFTER,
+                    HeaderValue::from_str(&retry_after.to_string())
+                        .unwrap_or_else(|_| HeaderValue::from_static("60")),
+                )],
+            )
+                .into_response();
+        }
     };
-    if !authorized(
-        headers
-            .get(header::AUTHORIZATION)
-            .and_then(|v| v.to_str().ok()),
-        &admin.token_hash,
-    ) {
-        let Some(retry_after) = state.auth_failures.register(peer.ip()) else {
-            return StatusCode::UNAUTHORIZED.into_response();
-        };
-        let retry_after = HeaderValue::from_str(&retry_after.to_string())
-            .unwrap_or_else(|_| HeaderValue::from_static("60"));
-        return (
-            StatusCode::TOO_MANY_REQUESTS,
-            [(header::RETRY_AFTER, retry_after)],
-        )
-            .into_response();
-    }
-    // A valid credential always bypasses and clears the failure budget, so a
-    // noisy local peer or private proxy cannot lock the owner out.
+    let token = match issue_user_session(&state.app, user.id).await {
+        Ok(token) => token,
+        Err(_) => return StatusCode::SERVICE_UNAVAILABLE.into_response(),
+    };
     state.auth_failures.clear(peer.ip());
+    let max_age = state.app.config.session_ttl.as_secs();
+    let cookie = format!(
+        "{ADMIN_SESSION_COOKIE}={token}; HttpOnly; SameSite=Strict; Path=/admin; Max-Age={max_age}"
+    );
+    (
+        StatusCode::OK,
+        [(header::SET_COOKIE, cookie)],
+        Json(serde_json::json!({"signedIn":true,"name":user.name})),
+    )
+        .into_response()
+}
+
+async fn logout(State(state): State<AdminRouterState>, headers: HeaderMap) -> Response {
+    if headers
+        .get("x-blackglass-admin")
+        .and_then(|value| value.to_str().ok())
+        != Some("1")
+    {
+        return StatusCode::FORBIDDEN.into_response();
+    }
+    if let Some(token) = session_token(&headers) {
+        let _ = db_task(&state.app, move |db| db.revoke_session(&token)).await;
+    }
+    (
+        StatusCode::NO_CONTENT,
+        [(
+            header::SET_COOKIE,
+            format!("{ADMIN_SESSION_COOKIE}=; HttpOnly; SameSite=Strict; Path=/admin; Max-Age=0"),
+        )],
+    )
+        .into_response()
+}
+
+fn session_token(headers: &HeaderMap) -> Option<String> {
+    headers
+        .get(header::COOKIE)?
+        .to_str()
+        .ok()?
+        .split(';')
+        .map(str::trim)
+        .find_map(|cookie| cookie.strip_prefix(&format!("{ADMIN_SESSION_COOKIE}=")))
+        .filter(|token| {
+            token.len() == 64
+                && token
+                    .bytes()
+                    .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte))
+        })
+        .map(str::to_owned)
+}
+
+async fn administrator(
+    state: &AdminRouterState,
+    headers: &HeaderMap,
+) -> Option<(String, AuthContext)> {
+    let token = session_token(headers)?;
+    let lookup = token.clone();
+    let context = db_task(&state.app, move |db| db.auth_context(&lookup))
+        .await
+        .ok()??;
+    (context.role == "admin").then_some((token, context))
+}
+
+async fn session_status(State(state): State<AdminRouterState>, headers: HeaderMap) -> Response {
+    match administrator(&state, &headers).await {
+        Some((_, administrator)) => Json(serde_json::json!({
+            "signedIn": true,
+            "name": administrator.name,
+        }))
+        .into_response(),
+        None => Json(serde_json::json!({"signedIn":false})).into_response(),
+    }
+}
+
+async fn snapshot(State(state): State<AdminRouterState>, headers: HeaderMap) -> Response {
+    let s = &state.app;
+    if s.config.admin.is_none() {
+        return StatusCode::NOT_FOUND.into_response();
+    }
+    if administrator(&state, &headers).await.is_none() {
+        return StatusCode::UNAUTHORIZED.into_response();
+    }
     let Ok(_permit) = s.admin_snapshots.clone().try_acquire_owned() else {
         return (StatusCode::TOO_MANY_REQUESTS, [(header::RETRY_AFTER, "30")]).into_response();
     };
@@ -533,6 +603,39 @@ async fn snapshot(
         _ => return StatusCode::SERVICE_UNAVAILABLE.into_response(),
     };
     Json(build_snapshot(s, data)).into_response()
+}
+
+#[derive(Deserialize)]
+struct RegistrationUpdate {
+    enabled: bool,
+}
+
+async fn update_registration(
+    State(state): State<AdminRouterState>,
+    headers: HeaderMap,
+    Json(update): Json<RegistrationUpdate>,
+) -> Response {
+    if headers
+        .get("x-blackglass-admin")
+        .and_then(|value| value.to_str().ok())
+        != Some("1")
+    {
+        return StatusCode::FORBIDDEN.into_response();
+    }
+    let Some((_, administrator)) = administrator(&state, &headers).await else {
+        return StatusCode::UNAUTHORIZED.into_response();
+    };
+    match db_task(&state.app, move |db| {
+        db.set_self_registration_enabled(administrator.user_id, update.enabled)
+    })
+    .await
+    {
+        Ok(()) => Json(Registration {
+            enabled: update.enabled,
+        })
+        .into_response(),
+        Err(_) => StatusCode::CONFLICT.into_response(),
+    }
 }
 fn build_snapshot(s: &AppState, data: AdminDatabaseSnapshot) -> Snapshot {
     let ready = s.db.ready();
@@ -605,6 +708,9 @@ fn build_snapshot(s: &AppState, data: AdminDatabaseSnapshot) -> Snapshot {
             transport_security: "TLS is expected at the private reverse proxy; not observable by Blackglass",
         },
         counts,
+        registration: Registration {
+            enabled: data.self_registration_enabled,
+        },
     }
 }
 struct StagingFacts {
@@ -655,30 +761,25 @@ mod tests {
             parse_admin_config(None, None, None, 3000, 3003).unwrap(),
             None
         );
-        let hash = "ab".repeat(32);
         for p in [
             (Some("127.0.0.1"), None, None),
             (None, Some("3100"), None),
-            (None, None, Some(hash.as_str())),
+            (None, None, Some("legacy-hash")),
         ] {
             assert!(parse_admin_config(p.0, p.1, p.2, 3000, 3003).is_err())
         }
-        let c = parse_admin_config(Some("127.0.0.1"), Some("3100"), Some(&hash), 3000, 3003)
+        let c = parse_admin_config(Some("127.0.0.1"), Some("3100"), None, 3000, 3003)
             .unwrap()
             .unwrap();
         assert!(c.bind_host.is_loopback());
         assert_eq!(c.port, 3100);
-        assert!(
-            parse_admin_config(Some("0.0.0.0"), Some("3100"), Some(&hash), 3000, 3003).is_err()
-        );
-        assert!(
-            parse_admin_config(Some("127.0.0.1"), Some("3000"), Some(&hash), 3000, 3003).is_err()
-        );
+        assert!(parse_admin_config(Some("0.0.0.0"), Some("3100"), None, 3000, 3003).is_err());
+        assert!(parse_admin_config(Some("127.0.0.1"), Some("3000"), None, 3000, 3003).is_err());
         assert!(
             parse_admin_config(
                 Some("127.0.0.1"),
                 Some("3100"),
-                Some(&"A".repeat(64)),
+                Some("legacy-hash"),
                 3000,
                 3003
             )
@@ -686,25 +787,28 @@ mod tests {
         )
     }
     #[test]
-    fn bearer_auth_is_exact_and_hash_based() {
-        let t = "0123456789abcdef".repeat(4);
-        let h = hex::encode(Sha256::digest(t.as_bytes()));
-        assert!(authorized(Some(&format!("Bearer {t}")), &h));
-        assert!(!authorized(None, &h));
-        assert!(!authorized(Some("Bearer ordinary-sync-token"), &h));
-        assert!(!authorized(Some(&format!("bearer {t}")), &h));
-        assert!(!authorized(
-            Some(&format!("Bearer {}", t.to_uppercase())),
-            &h
-        ));
-        assert!(!authorized(Some(&format!("Bearer {t}0")), &h));
+    fn admin_cookie_parsing_is_exact_and_bounded() {
+        let token = "0123456789abcdef".repeat(4);
+        let mut headers = HeaderMap::new();
+        headers.insert(
+            header::COOKIE,
+            HeaderValue::from_str(&format!("theme=dark; {ADMIN_SESSION_COOKIE}={token}")).unwrap(),
+        );
+        assert_eq!(session_token(&headers), Some(token));
+        for value in [
+            "blackglass_admin_session=short",
+            "BLACKGLASS_ADMIN_SESSION=0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef",
+            "blackglass_admin_session=0123456789ABCDEF0123456789ABCDEF0123456789ABCDEF0123456789ABCDEF",
+        ] {
+            headers.insert(header::COOKIE, HeaderValue::from_str(value).unwrap());
+            assert_eq!(session_token(&headers), None);
+        }
     }
     #[test]
     fn admin_authority_is_exact_loopback_or_localhost() {
         let admin = AdminConfig {
             bind_host: "127.0.0.1".parse().unwrap(),
             port: 3010,
-            token_hash: "ab".repeat(32),
         };
         for value in ["127.0.0.1:3010", "localhost:3010", "LOCALHOST:3010"] {
             assert!(allowed_authority(
@@ -728,7 +832,6 @@ mod tests {
         let ipv6 = AdminConfig {
             bind_host: "::1".parse().unwrap(),
             port: 3010,
-            token_hash: "ab".repeat(32),
         };
         for value in ["[::1]:3010", "localhost:3010"] {
             assert!(allowed_authority(
@@ -782,20 +885,25 @@ mod tests {
         assert!(ADMIN_HTML.contains("/admin/logo.png"));
         assert_eq!(&ADMIN_LOGO[..8], b"\x89PNG\r\n\x1a\n");
         for marker in [
-            "sessionStorage",
-            "Authorization",
+            "/admin/api/login",
+            "/admin/api/logout",
+            "/admin/api/session",
+            "/admin/api/registration",
+            "X-Blackglass-Admin",
             "30000",
             "Request rate limited; retry shortly.",
         ] {
             assert!(ADMIN_JS.contains(marker))
         }
         assert!(!ADMIN_JS.contains("localStorage"));
+        assert!(!ADMIN_JS.contains("sessionStorage"));
+        assert!(!ADMIN_JS.contains("Authorization"));
         for marker in [
             "aria-busy=\"false\"",
             "tabindex=\"-1\"",
-            "minlength=\"64\"",
-            "maxlength=\"64\"",
-            "pattern=\"[0-9a-f]{64}\"",
+            "autocomplete=\"username\"",
+            "autocomplete=\"current-password\"",
+            "registration-enabled",
             "new AbortController()",
             "pending.controller.abort()",
             "requestGeneration !== generation",

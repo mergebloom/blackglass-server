@@ -14,6 +14,8 @@ const MAX_PASSWORD_HASH_LENGTH: usize = 512;
 pub(crate) const DUMMY_PASSWORD_HASH: &str = "$argon2id$v=19$m=65536,t=5,p=4$YmxhY2tnbGFzcy1yZXNvdXJjZS1lbnZlbG9wZS12MQ$qF1GQ0hLTNgx8hhl7Qo3R7r1pSYB+eYXdX4KtmWP5VI";
 pub(crate) const MAX_EMAIL_BYTES: usize = 254;
 pub(crate) const MAX_DISPLAY_NAME_BYTES: usize = 128;
+pub(crate) const MIN_SELF_REGISTERED_PASSWORD_BYTES: usize = 12;
+pub(crate) const MAX_SELF_REGISTERED_PASSWORD_BYTES: usize = 256;
 pub(crate) const MAX_CONCURRENT_PASSWORD_CHECKS: usize = 1;
 const SERVICE_MEMORY_LIMIT_KIB: usize = 384 * 1024;
 const MAX_WS_FRAME_MEMORY_KIB: usize = crate::config::MAX_WS_CONNECTIONS_LIMIT * 2 * 1024;
@@ -102,6 +104,17 @@ pub(crate) fn normalize_display_name(value: &str) -> Result<String> {
         bail!("name must not contain control characters")
     }
     Ok(name.to_owned())
+}
+
+pub(crate) fn validate_self_registered_password(value: &str) -> Result<()> {
+    if !(MIN_SELF_REGISTERED_PASSWORD_BYTES..=MAX_SELF_REGISTERED_PASSWORD_BYTES)
+        .contains(&value.len())
+    {
+        bail!(
+            "password must be between {MIN_SELF_REGISTERED_PASSWORD_BYTES} and {MAX_SELF_REGISTERED_PASSWORD_BYTES} bytes"
+        )
+    }
+    Ok(())
 }
 
 fn accepted_password_hash(encoded: &str) -> Option<PasswordHash<'_>> {
@@ -225,6 +238,16 @@ mod tests {
         assert!(normalize_display_name("").is_err());
         assert!(normalize_display_name("Alice\u{0000}Example").is_err());
         assert!(normalize_display_name(&"a".repeat(MAX_DISPLAY_NAME_BYTES + 1)).is_err());
+    }
+
+    #[test]
+    fn self_registered_passwords_have_explicit_byte_bounds() {
+        assert!(validate_self_registered_password(&"a".repeat(11)).is_err());
+        assert!(validate_self_registered_password(&"a".repeat(12)).is_ok());
+        assert!(validate_self_registered_password(&"a".repeat(256)).is_ok());
+        assert!(validate_self_registered_password(&"a".repeat(257)).is_err());
+        assert!(validate_self_registered_password(&"é".repeat(128)).is_ok());
+        assert!(validate_self_registered_password(&"é".repeat(129)).is_err());
     }
 
     #[test]

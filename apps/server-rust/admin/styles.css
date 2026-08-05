@@ -87,7 +87,7 @@ button, input {
   color: var(--ink);
   font: inherit;
 }
-input { background: rgba(4, 7, 10, 0.76); font-family: ui-monospace, SFMono-Regular, Menlo, monospace; }
+input { background: rgba(4, 7, 10, 0.76); }
 input::placeholder { color: #56636e; }
 button { border-color: rgba(67, 201, 255, 0.38); background: linear-gradient(180deg, #29b9f2, #158dc1); color: #031018; font-weight: 750; cursor: pointer; }
 button.secondary { border-color: var(--line); background: transparent; color: #c7d0d8; }
@@ -118,6 +118,14 @@ button:focus-visible, input:focus-visible { outline: 3px solid rgba(67, 201, 255
 .dashboard-grid { display: grid; grid-template-columns: repeat(2, minmax(0, 1fr)); gap: 1rem; }
 .wide { grid-column: 1 / -1; }
 h2 { margin: 0 0 1rem; color: #dbe4ea; font-size: 0.76rem; font-weight: 750; letter-spacing: 0.1em; text-transform: uppercase; }
+code { color: var(--accent); }
+.registration-panel { display: grid; grid-template-columns: 1fr auto; align-items: center; gap: 0.5rem 2rem; }
+.registration-panel h2 { margin-bottom: 0.35rem; }
+.registration-panel p { margin: 0; color: var(--muted); }
+.switch-row { display: flex; align-items: center; gap: 0.65rem; cursor: pointer; }
+.switch-row input { width: 2.8rem; min-height: 1.5rem; accent-color: var(--accent-strong); }
+.switch-row span { min-width: 4.5rem; color: #dbe4ea; font-weight: 700; }
+#registration-message { grid-column: 1 / -1; min-height: 1.4rem; color: var(--good); font-size: 0.82rem; }
 
 .rows > article { display: grid; grid-template-columns: minmax(9rem, 0.65fr) 2fr; gap: 0.75rem; padding: 0.85rem 0; border-top: 1px solid var(--line); min-width: 0; }
 .rows > article:first-child { border-top: 0; }
@@ -135,6 +143,7 @@ dd { margin: 0; color: #dbe4ea; font-family: ui-monospace, SFMono-Regular, Menlo
   .actions { width: 100%; }
   .actions button { flex: 1; }
   .dashboard-grid { grid-template-columns: 1fr; }
+  .registration-panel { grid-template-columns: 1fr; }
   .wide { grid-column: auto; }
 }
 @media (max-width: 600px) {

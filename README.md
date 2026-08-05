@@ -70,16 +70,19 @@ The [production guide](docs/production.md) covers monitoring, account changes,
 scheduled off-host backups, real recovery, upgrades, schema migration, and
 rollback. Back up and run a restore drill before changing an image digest.
 
-## Administration
+## Accounts and administration
 
-The optional read-only admin console runs on its own loopback-only listener. It
-shows service health, configured limits, storage, users, vaults, live Sync
-connections, sessions, and recent activity. Its operator token remains in the
-current browser tab and is never stored by the console or written to logs. See
-the [production guide](docs/production.md#read-only-admin-console) for secure
-access and configuration.
+The first account is an administrator. The loopback-only admin console uses
+that account's normal email and password, shows operational state, and can
+enable or disable self-registration. Registration is off by default; when
+enabled, new users can create ordinary accounts at
+`https://YOUR-CONTROL-DOMAIN/account`. Self-registration can never grant the
+administrator role. See the [production guide](docs/production.md#admin-console-and-self-registration)
+for access, role recovery, and security details.
 
 ![Blackglass Server admin login](docs/images/admin-login.png)
+
+![Blackglass account registration](docs/images/account-registration.png)
 
 ![Blackglass Server dashboard](docs/images/admin-dashboard.png)
 

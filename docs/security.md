@@ -24,6 +24,7 @@ E2EE does not hide those facts.
 | Password theft | Account hashes live only in mode-0600 SQLite state; offline commands read plaintext from standard input; generated hashes use the qualified maximum Argon2id work policy and imported hashes are bounded before verification |
 | Token theft | Random 256-bit user-bound sessions, SHA-256 digests at rest, bounded lifetime, immediate sign-out revocation, and scoped offline revocation commands |
 | Login guessing/CPU exhaustion | Uniform credential error with a valid dummy hash, one bounded Argon2 check off the async reactor, an eight-waiter fair queue, a six-attempt/60-second per-source bucket, and forwarded addresses trusted only from one exact configured proxy |
+| Registration abuse | Disabled by default; ordinary-user role only; exact email uniqueness and user cap inside one immediate transaction; bounded request body, password size, Argon2 queue/memory, and per-source attempt budget |
 | Cross-origin control calls | Bounded exact renderer-origin allowlist, matched-origin preflight responses, bounded 64 KiB JSON bodies |
 | Memory/disk exhaustion | 2 MiB frames, bounded global and per-user WebSocket/upload ceilings, four unauthenticated sockets per source, declared-size/piece validation, per-file cap, atomic global and per-owner retained-ciphertext quotas, upload/response/database semaphores, private staging files, and external disk monitoring |
 | Partial uploads/crashes | Unique mode-0600 staging files, a bounded progress deadline that releases capacity and removes idle partials, commit only after exact byte/piece match and fsync, cleanup on every commit result, and startup cleanup |
@@ -36,14 +37,14 @@ E2EE does not hide those facts.
 | Client drift | Version-specific deterministic patch anchors, upstream/generated hashes, updates disabled in the copied profile, and official-client E2E qualification |
 | Dependency supply chain | Locked crates, a checksum-pinned advisory/license/source scanner, explicit license allowlist, Cargo plus native/runtime notices, digest-pinned build images, and commit-pinned CI actions |
 | Operations endpoint exposure | Health, readiness, and metrics remain loopback/private by default; the example public Caddy route returns 404 for them |
-| Admin console exposure | Disabled by default on a distinct loopback listener; exact loopback HTTP authority; independent fixed-shape, hash-only bearer authentication with a bounded per-source failure budget that never blocks valid credentials; bounded API projections; restrictive CSP and no-store responses; no admin routes on Sync listeners |
+| Admin console exposure | Distinct loopback listener; exact loopback HTTP authority; normal account credentials restricted to active administrators; HttpOnly SameSite=Strict session cookie; explicit mutation header; bounded failure budget and API projections; restrictive CSP and no-store responses; no admin routes on Sync listeners |
 
 ## Residual risk and exclusions
 
 This is an authorized compatibility implementation, not an Obsidian-supported
 server. The client protocol can change without notice. The server does not
-provide public registration, fine-grained collaborator roles, high
-availability, object storage, mobile qualification, malware
+provide email verification, password reset, fine-grained collaborator roles,
+high availability, object storage, mobile qualification, malware
 scanning, quotas per vault, or protection against a compromised desktop
 client. A malicious or stolen authenticated client can read and mutate every
 vault authorized for that user.

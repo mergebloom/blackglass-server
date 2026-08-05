@@ -3,7 +3,6 @@
 const $ = (id) => document.getElementById(id);
 let pending = null;
 let generation = 0;
-const token = () => sessionStorage.getItem('blackglass-admin-token');
 const label = (key) => key.replace(/[A-Z]/g, (match) => ` ${match.toLowerCase()}`);
 const bytes = (value) => {
   if (value == null) return 'Unavailable';
@@ -73,23 +72,28 @@ function rows(id, items, empty) {
 function busy(active) {
   $('connect').disabled = active;
   $('refresh').disabled = active;
+  $('registration-enabled').disabled = active;
   $('refresh').textContent = active ? 'Refreshing…' : 'Refresh';
   $('dashboard').setAttribute('aria-busy', String(active));
-  if (active) $('refreshed').textContent = 'Refreshing dashboard…';
+  if (active && !$('dashboard').hidden) $('refreshed').textContent = 'Refreshing dashboard…';
 }
 
-function forget(message = '') {
+function showLogin(message = '') {
   generation += 1;
   if (pending) pending.controller.abort();
   pending = null;
   busy(false);
-  sessionStorage.removeItem('blackglass-admin-token');
   $('dashboard').hidden = true;
   $('login').hidden = false;
-  $('token').value = '';
+  $('password').value = '';
   $('refreshed').textContent = 'Not connected';
   $('login-error').textContent = message;
-  $('token').focus();
+  $('email').focus();
+}
+
+function renderRegistration(registration) {
+  $('registration-enabled').checked = registration.enabled;
+  $('registration-label').textContent = registration.enabled ? 'Enabled' : 'Disabled';
 }
 
 async function load(manual = false) {
@@ -102,23 +106,23 @@ async function load(manual = false) {
     $('login-error').textContent = '';
     try {
       const response = await fetch('/admin/api/snapshot', {
-        headers: { Authorization: `Bearer ${token() || ''}` },
         cache: 'no-store',
         signal: controller.signal,
       });
       if (requestGeneration !== generation) return;
-      if (response.status === 401) { forget('Invalid admin token.'); return; }
+      if (response.status === 401) { showLogin(wasHidden ? '' : 'Your admin session expired.'); return; }
       if (!response.ok) throw Error(response.status === 429
         ? 'Request rate limited; retry shortly.'
         : 'Snapshot unavailable.');
       const snapshot = await response.json();
-      if (requestGeneration !== generation || !token()) return;
+      if (requestGeneration !== generation) return;
       $('login').hidden = true;
       $('dashboard').hidden = false;
       $('health').textContent = snapshot.overview.healthy ? 'Healthy' : 'Degraded';
       $('health').className = snapshot.overview.healthy ? 'good' : 'bad';
       $('version').textContent = `Version ${snapshot.overview.version}`;
       $('refreshed').textContent = `Refreshed ${time(snapshot.generatedAt)}`;
+      renderRegistration(snapshot.registration);
       definitionList('overview', {
         ...snapshot.overview,
         perFileLimitBytes: snapshot.limits.perFileBytes,
@@ -157,12 +161,77 @@ async function load(manual = false) {
   return promise;
 }
 
-$('login-form').addEventListener('submit', (event) => {
+$('login-form').addEventListener('submit', async (event) => {
   event.preventDefault();
-  sessionStorage.setItem('blackglass-admin-token', $('token').value);
-  load(true);
+  busy(true);
+  $('login-error').textContent = '';
+  try {
+    const response = await fetch('/admin/api/login', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ email: $('email').value, password: $('password').value }),
+    });
+    if (!response.ok) throw Error(response.status === 429
+      ? 'Too many attempts; try again shortly.'
+      : 'Invalid administrator email or password.');
+    $('password').value = '';
+    await load(true);
+  } catch (error) {
+    $('login-error').textContent = error instanceof Error
+      ? error.message
+      : 'Unable to sign in.';
+  } finally {
+    busy(false);
+  }
 });
+
+$('registration-enabled').addEventListener('change', async () => {
+  const enabled = $('registration-enabled').checked;
+  $('registration-message').textContent = 'Saving…';
+  $('registration-enabled').disabled = true;
+  try {
+    const response = await fetch('/admin/api/registration', {
+      method: 'POST',
+      headers: {
+        'Content-Type': 'application/json',
+        'X-Blackglass-Admin': '1',
+      },
+      body: JSON.stringify({ enabled }),
+    });
+    if (response.status === 401) { showLogin('Your admin session expired.'); return; }
+    if (!response.ok) throw Error('Registration setting could not be saved.');
+    renderRegistration(await response.json());
+    $('registration-message').textContent = enabled
+      ? 'New users can now register at /account.'
+      : 'New account registration is closed.';
+  } catch (error) {
+    $('registration-enabled').checked = !enabled;
+    $('registration-label').textContent = enabled ? 'Disabled' : 'Enabled';
+    $('registration-message').textContent = error instanceof Error ? error.message : 'Unable to save.';
+  } finally {
+    $('registration-enabled').disabled = false;
+  }
+});
+
 $('refresh').onclick = () => load(true);
-$('signout').onclick = () => forget();
-if (token()) load();
-setInterval(() => { if (token()) load(); }, 30000);
+$('signout').onclick = async () => {
+  await fetch('/admin/api/logout', {
+    method: 'POST',
+    headers: { 'X-Blackglass-Admin': '1' },
+  });
+  showLogin();
+};
+
+async function bootstrap() {
+  try {
+    const response = await fetch('/admin/api/session', { cache: 'no-store' });
+    const session = response.ok ? await response.json() : { signedIn: false };
+    if (session.signedIn) await load();
+    else showLogin();
+  } catch {
+    showLogin('The admin service is unavailable.');
+  }
+}
+
+bootstrap();
+setInterval(() => { if (!$('dashboard').hidden) load(); }, 30000);

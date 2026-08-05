@@ -12,14 +12,14 @@ const children:Array<ReturnType<typeof Bun.spawn>>=[];const sockets:WebSocket[]=
 afterAll(async()=>{for(const socket of sockets)socket.close();for(const child of children)if(child.exitCode===null)child.kill("SIGTERM");await Promise.all(children.map(c=>c.exited));});
 
 describe("Bun SQLite to Rust migration",()=>{
-  test("P4-MIGRATE-V6 preserves a v5 source and creates an empty, sessionless v6 destination", async () => {
+  test("schema-v6 migrates copy-first to schema-v7 with one admin and registration disabled", async () => {
     if (!configuredBinary) {
       const build = Bun.spawnSync(["cargo", "build", "--manifest-path", join(root, "apps/server-rust/Cargo.toml")], { cwd: root, stdout: "pipe", stderr: "pipe" });
       expect(build.exitCode, build.stderr.toString()).toBe(0);
     }
-    const directory = await mkdtemp(join(tmpdir(), "blackglass-v5-v6-migration-"));
-    const source = join(directory, "source-v5.sqlite");
-    const destination = join(directory, "destination-v6.sqlite");
+    const directory = await mkdtemp(join(tmpdir(), "blackglass-v6-v7-migration-"));
+    const source = join(directory, "source-v6.sqlite");
+    const destination = join(directory, "destination-v7.sqlite");
     const created = Bun.spawnSync([rustBinary, "user", "create", source, "owner@example.test", "Owner"], {
       cwd: root,
       stdin: Buffer.from("migration-password\n"),
@@ -29,11 +29,9 @@ describe("Bun SQLite to Rust migration",()=>{
     expect(created.exitCode, created.stderr.toString()).toBe(0);
     const fixture = new Database(source);
     fixture.exec(`
-      DROP INDEX memberships_active_vault_user;
-      DROP INDEX memberships_user_vault;
-      DROP INDEX memberships_vault_state;
-      DROP TABLE memberships;
-      DELETE FROM schema_migrations WHERE version=6;
+      DROP TABLE server_settings;
+      ALTER TABLE users DROP COLUMN role;
+      DELETE FROM schema_migrations WHERE version=7;
       INSERT INTO sessions(token_hash,user_id,created_at,expires_at,revoked_at)
       VALUES('${"a".repeat(64)}',1,1,${Date.now() + 3_600_000},NULL);
     `);
@@ -54,9 +52,11 @@ describe("Bun SQLite to Rust migration",()=>{
     const result = new Database(destination, { readonly: true });
     expect(
       result.query("SELECT version FROM schema_migrations ORDER BY version").all(),
-    ).toEqual([1, 2, 3, 4, 5, 6].map((version) => ({ version })));
-    expect(result.query("SELECT COUNT(*) AS count FROM memberships").get()).toEqual({ count: 0 });
+    ).toEqual([1, 2, 3, 4, 5, 6, 7].map((version) => ({ version })));
     expect(result.query("SELECT COUNT(*) AS count FROM sessions").get()).toEqual({ count: 0 });
+    expect(result.query("SELECT id, role FROM users").all()).toEqual([{ id: 1, role: "admin" }]);
+    expect(result.query("SELECT self_registration_enabled AS enabled FROM server_settings").get())
+      .toEqual({ enabled: 0 });
     expect(result.query("PRAGMA foreign_key_check").all()).toEqual([]);
     expect(result.query("PRAGMA integrity_check").get()).toEqual({ integrity_check: "ok" });
     result.close();
@@ -74,7 +74,7 @@ describe("Bun SQLite to Rust migration",()=>{
     const rust=Bun.spawn([rustBinary,"serve"],{cwd:root,stdout:"pipe",stderr:"pipe",env:{...process.env,SELFHOST_BIND_HOST:"127.0.0.1",SELFHOST_CONTROL_PORT:String(controlPort),SELFHOST_DATA_PORT:String(dataPort),SELFHOST_DATA_HOST:`127.0.0.1:${dataPort}`,SELFHOST_DATABASE:databasePath,SELFHOST_STAGING_DIR:join(directory,"uploads"),SELFHOST_PER_FILE_MAX:String(8*1024*1024),SELFHOST_ALLOWED_ORIGIN:"app://obsidian.md",SELFHOST_LOG_FORMAT:"pretty"}});children.push(rust);await health(controlPort,rust);
     const signin=await post(controlPort,"/user/signin",{email:"migration@example.test",password:"migration-password"});const stale=await Probe.connect(`ws://127.0.0.1:${dataPort}`);stale.json(init(signin.token,vault,"Retired legacy client",0,true));expect(await stale.nextJson()).toEqual({res:"err",msg:"Vault not found"});const listed=await post(controlPort,"/vault/list",{token:signin.token});expect(listed.vaults).toHaveLength(1);const migratedVault=listed.vaults[0];expect(migratedVault.id).not.toBe(vault.id);const reader=await Probe.connect(`ws://127.0.0.1:${dataPort}`);reader.json(init(signin.token,migratedVault,"Rust reader",0,true));expect(await reader.nextJson()).toMatchObject({res:"ok"});expect(await reader.nextJson()).toMatchObject({op:"push",uid:legacyNotice.uid,path:"legacy-path"});expect(await reader.nextJson()).toEqual({op:"ready",version:legacyNotice.uid});reader.json({op:"pull",uid:legacyNotice.uid});expect(await reader.nextJson()).toMatchObject({res:"ok",size:legacy.length});expect(new Uint8Array(await reader.nextBinary())).toEqual(legacy);
     const modern=new TextEncoder().encode("new external opaque ciphertext");reader.json(push("modern-path","modern-hash",modern.length));expect(await reader.nextJson()).toEqual({res:"next"});reader.socket.send(modern);const modernNotice=await reader.nextJson();expect(await reader.nextJson()).toEqual({res:"ok"});reader.json({op:"pull",uid:modernNotice.uid});expect(await reader.nextJson()).toMatchObject({res:"ok",size:modern.length});expect(new Uint8Array(await reader.nextBinary())).toEqual(modern);
-    const sqlite=new Database(databasePath,{readonly:true});const rows=sqlite.query("SELECT r.uid,r.content IS NOT NULL AS inline,rc.content IS NOT NULL AS external FROM revisions r LEFT JOIN revision_content rc ON rc.uid=r.uid ORDER BY r.uid").all() as Array<{uid:number;inline:number;external:number}>;const migrations=sqlite.query("SELECT version FROM schema_migrations ORDER BY version").all() as Array<{version:number}>;sqlite.close();expect(rows).toEqual([{uid:legacyNotice.uid,inline:1,external:0},{uid:modernNotice.uid,inline:0,external:1}]);expect(migrations.map(m=>m.version)).toEqual([1,2,3,4,5,6]);const legacySqlite=new Database(legacyDatabasePath,{readonly:true});expect(legacySqlite.query("SELECT COUNT(*) AS count FROM sqlite_schema WHERE name='schema_migrations'").get()).toEqual({count:0});legacySqlite.close();
+    const sqlite=new Database(databasePath,{readonly:true});const rows=sqlite.query("SELECT r.uid,r.content IS NOT NULL AS inline,rc.content IS NOT NULL AS external FROM revisions r LEFT JOIN revision_content rc ON rc.uid=r.uid ORDER BY r.uid").all() as Array<{uid:number;inline:number;external:number}>;const migrations=sqlite.query("SELECT version FROM schema_migrations ORDER BY version").all() as Array<{version:number}>;sqlite.close();expect(rows).toEqual([{uid:legacyNotice.uid,inline:1,external:0},{uid:modernNotice.uid,inline:0,external:1}]);expect(migrations.map(m=>m.version)).toEqual([1,2,3,4,5,6,7]);const legacySqlite=new Database(legacyDatabasePath,{readonly:true});expect(legacySqlite.query("SELECT COUNT(*) AS count FROM sqlite_schema WHERE name='schema_migrations'").get()).toEqual({count:0});legacySqlite.close();
   },60_000);
 });
 

@@ -2,10 +2,11 @@
 
 ## Supported production shape
 
-The production target is deliberately narrow: administrator-provisioned local
-accounts with isolated or explicitly shared end-to-end-encrypted vaults, one
-Rust process, one SQLite database, and one static node. Publish, public
-registration, high availability, and mobile clients are not supported. Both
+The production target is deliberately narrow: local accounts with isolated or
+explicitly shared end-to-end-encrypted vaults, one Rust process, one SQLite
+database, and one static node. Administrators may provision users offline or
+temporarily enable web self-registration. Publish, email verification,
+password recovery, high availability, and mobile clients are not supported. Both
 custom-password and managed-encryption vaults are compatible. Prefer a custom
 vault password when the server operator must not be able to derive the vault
 key; managed mode stores its generated recovery password in SQLite and backups.
@@ -174,16 +175,13 @@ manage other collaborators. Revocation closes matching live sockets and
 discards staged uploads. It cannot erase an already-downloaded local copy or
 make a previously disclosed custom encryption password secret again.
 
-## Read-only admin console
+## Admin console and self-registration
 
-The optional Blackglass admin console is observation-only: it has no mutation,
-backup, configuration, revocation, deletion, purge, or restore controls. Enable
-it only by setting `SELFHOST_ADMIN_BIND_HOST`, `SELFHOST_ADMIN_PORT`, and
-`SELFHOST_ADMIN_TOKEN_HASH` together. The hash is exactly 64 lowercase SHA-256
-hex characters; never put the plaintext admin token in the environment. The
-plaintext token must itself be exactly 64 lowercase hexadecimal characters;
-generate it with `openssl rand -hex 32` and keep it independent from all Sync
-sessions.
+Enable the console by setting `SELFHOST_ADMIN_BIND_HOST` and
+`SELFHOST_ADMIN_PORT` together. The first account created in a new database—or
+the lowest-ID account migrated from schema 6—has the `admin` role. Sign in with
+that account's normal email and password. No separate administrator token or
+environment secret exists.
 
 The admin bind is strictly loopback-only; unspecified addresses are rejected
 even when external Sync binding is acknowledged. Keep the listener on
@@ -195,18 +193,32 @@ safe remote shape is a tailnet-only hostname whose proxy route forwards
 `127.0.0.1:3010`, and is not present in public DNS or the public Caddy site. Do
 not proxy the admin listener
 from the public control/data virtual hosts. The shell assets contain no server
-data; every `/admin/api/*` request requires `Authorization: Bearer <admin-token>`.
-Invalid credentials have a bounded per-source failure budget; a valid token
-always bypasses and clears that budget, so failed attempts cannot lock the owner
-out. The browser stores the token in `sessionStorage`, polls no faster than 30
-seconds, and can forget it with **Forget token**.
+data. Successful login creates a normal expiring user session in an HttpOnly,
+`SameSite=Strict` cookie scoped to `/admin`; logout revokes it. Every request
+rechecks that the user remains active and has the administrator role. Invalid
+credentials have a bounded per-source failure budget, and the console polls no
+faster than 30 seconds.
 
 The console exposes bounded, explicit projections: readiness/version/schema,
 global and per-user limits, active/disabled users, per-owner vault and retained
 byte counts, vault metadata and encryption mode, user-attributed recent
 revision metadata without encrypted paths, user-attributed session timestamps
 without token hashes, staging diagnostics, and a bounded user-attributed
-live-connection view.
+live-connection view. Its only configuration mutation is the self-registration
+switch. Registration starts disabled. While enabled,
+`https://CONTROL-DOMAIN/account` accepts a bounded email, display name, and
+12-to-256-byte password, then creates an active ordinary user. Email uniqueness,
+the 256-user deployment cap, and the enabled flag are checked together in one
+SQLite transaction. The page cannot create an administrator.
+
+Use the offline role command with the service stopped to grant or remove
+administrator access. The server refuses to disable or demote the final active
+administrator and revokes that user's sessions after a role change:
+
+```sh
+blackglass-server user set-role server.sqlite USER_ID admin
+blackglass-server user set-role server.sqlite USER_ID user
+```
 
 ## Health, metrics, and logs
 
@@ -245,9 +257,9 @@ storage contention, an undersized host, or an unexpectedly expensive query.
 Alert on `blackglass_share_invites_total{outcome="rate_limited"}`. The fixed
 outcome labels contain no email address, user ID, vault ID, or target digest.
 
-The `v0.5.1` archive includes `release-contract.json`. Release automation
-checks that it binds server 0.5.1 to schema 6 and schema-4/schema-5 migration
-input, the exact v0.5.0 same-schema predecessor and direct-rollback boundary,
+The `v0.6.0` archive includes `release-contract.json`. Release automation
+checks that it binds server 0.6.0 to schema 7 and schema-4/schema-5/schema-6
+migration input, the exact v0.5.1 predecessor and no-direct-rollback boundary,
 the exact client tooling revision, both reviewed renderer baselines, and the
 required primary/recovery monitoring selectors.
 
@@ -294,15 +306,16 @@ export SELFHOST_PASSWORD_HASH=$(printf '%s\n' "$BLACKGLASS_MIGRATION_PASSWORD" |
   blackglass-server hash-password)
 unset BLACKGLASS_MIGRATION_PASSWORD
 export SELFHOST_EMAIL=owner@example.com SELFHOST_NAME='Vault owner'
-blackglass-server migrate server-v4.sqlite server-v6.sqlite
+blackglass-server migrate server-v4.sqlite server-v7.sqlite
 unset SELFHOST_PASSWORD_HASH SELFHOST_EMAIL SELFHOST_NAME
-blackglass-server verify server-v6.sqlite
+blackglass-server verify server-v7.sqlite
 ```
 
 Both recovery commands establish a new recovery epoch: every remote vault ID
 rotates and every session is cleared. Use `recover-stale-backup` for disaster
-recovery from an older point in time; it additionally disables every account so
-the backup cannot resurrect access that was removed after it was created.
+recovery from an older point in time; it additionally disables every account
+and self-registration so the backup cannot resurrect access that was removed
+after it was created.
 Review `user list`, replace passwords as appropriate, and explicitly run
 `user set-status <database> <user-id> active` for each intended account while
 the service remains stopped. The narrower `restore` command preserves account
@@ -345,16 +358,14 @@ blackglass-server migrate server-vOLD.sqlite server-vNEW.sqlite
 
 Only after `verify server-vNEW.sqlite` succeeds should configuration point at
 the new file. The source stays unchanged. Each migration step validates its
-input/output inside the transaction and rolls back on failure. The Phase 4
-migration accepts a schema-v5 source, creates a new schema-v6 file, starts with
-no memberships, and invalidates existing sessions for one required re-login.
-Keep the exact v0.3.0 binary and untouched v5 source until a v5-to-v6 migration
-is activated; never run it against schema v6. The v0.5.1 patch release has the
-schema-v6 v0.5.0 predecessor and supports a direct binary rollback to that exact
-tag. The original v0.5.0 transition from v0.2.5/schema 4 is not a direct binary
-rollback boundary: preserve the exact pre-migration binary and untouched
-database privately when crossing it. Once a release accepts writes on a newer
-schema, recovery becomes roll-forward only.
+input/output inside the transaction and rolls back on failure. The
+schema-6-to-7 migration creates a new schema-v7 file, assigns the
+lowest-ID user the administrator role, disables self-registration, and
+invalidates existing sessions for one required re-login. Preserve the exact
+v0.5.1 binary and untouched schema-v6 source until schema 7 is activated.
+There is no direct binary rollback after the schema-v7 database accepts writes;
+recovery is roll-forward. Earlier schema-4-to-schema-6 boundaries remain
+copy-first and are validated when migrating directly to schema 7.
 
 A pre-v4/pre-0.2.2 rollback is safe only before activation, while the untouched
 old database has received no client writes. After the new database has served

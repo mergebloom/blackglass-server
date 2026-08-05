@@ -1,8 +1,8 @@
 {
   "schemaVersion": 2,
   "cargoAboutVersion": "0.9.1",
-  "cargoLockSha256": "586d0635584c5e88e8f26d6cbbb162bee641ea535e9038f19e6a52a62c15970e",
-  "cargoManifestSha256": "f27f5350d6ea905df3b1b3cbfd2cd0c05aff65cbb9f90b96db78109ee8569f84",
+  "cargoLockSha256": "7cc2864a08908e3160585beba8bbbe4295064b9dc582a5d47f97116433dd4862",
+  "cargoManifestSha256": "4f9031ebc4a2926e8032d1d5394fef0d00556efd2324fab67823abc139ddaa2e",
   "configSha256": "8784b8b858938847f5e01287a7f92ac43bddc27e2dc5f20803673d9ca67c2c13",
   "generatorSha256": "7429ee1d4a476955b426ad5c3f474ea4fe96ca890c9bb6a74fd5901394164732",
   "nativeRuntimeNoticesSha256": "ebc360ab7dbc3c4ae4b05da0f4d63c78cac0d55b8b8318ad65c4a4be2a6e8877",

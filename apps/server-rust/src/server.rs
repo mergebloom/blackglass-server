@@ -525,6 +525,7 @@ pub async fn run(config: Config) -> Result<()> {
 }
 
 fn control_router(state: AppState) -> Router {
+    let account = crate::account::router();
     let mut r = Router::new();
     for path in [
         "/user/signin",
@@ -565,6 +566,7 @@ fn control_router(state: AppState) -> Router {
     .route("/health", get(health))
     .route("/ready", get(ready))
     .route("/metrics", get(metrics))
+    .merge(account)
     .with_state(state)
     .layer(DefaultBodyLimit::max(64 * 1024))
 }
@@ -778,9 +780,22 @@ async fn control(
 }
 
 async fn signin(s: &AppState, source: IpAddr, v: Value) -> std::result::Result<Value, String> {
-    let queue_deadline = tokio::time::Instant::now() + SIGNIN_QUEUE_TIMEOUT;
     let req: Signin =
         serde_json::from_value(v).map_err(|_| "Invalid email or password".to_string())?;
+    let user = authenticate_credentials(s, source, req.email, req.password).await?;
+    let token = issue_user_session(s, user.id).await?;
+    s.metrics.signins.fetch_add(1, Ordering::Relaxed);
+    info!(event = "signin_succeeded");
+    Ok(json!({"email":user.email,"name":user.name,"license":null,"token":token}))
+}
+
+pub(crate) async fn authenticate_credentials(
+    s: &AppState,
+    source: IpAddr,
+    email: Option<String>,
+    password: Option<String>,
+) -> std::result::Result<UserCredential, String> {
+    let queue_deadline = tokio::time::Instant::now() + SIGNIN_QUEUE_TIMEOUT;
     let admitted = s
         .source_limits
         .lock()
@@ -821,8 +836,7 @@ async fn signin(s: &AppState, source: IpAddr, v: Value) -> std::result::Result<V
         warn!(event = "signin_memory_capacity_reached");
         return Err("Try again later".into());
     };
-    let canonical_email = req
-        .email
+    let canonical_email = email
         .as_deref()
         .and_then(|email| auth::canonicalize_email(email).ok())
         .map(|email| email.canonical);
@@ -833,7 +847,7 @@ async fn signin(s: &AppState, source: IpAddr, v: Value) -> std::result::Result<V
     } else {
         None
     };
-    let password = req.password.unwrap_or_default();
+    let password = password.unwrap_or_default();
     let encoded = candidate
         .as_ref()
         .filter(|user| user.active)
@@ -854,14 +868,96 @@ async fn signin(s: &AppState, source: IpAddr, v: Value) -> std::result::Result<V
     if let Ok(mut limits) = s.source_limits.lock() {
         limits.refund_successful_signin(source);
     }
+    Ok(user)
+}
+
+pub(crate) async fn issue_user_session(
+    s: &AppState,
+    user_id: i64,
+) -> std::result::Result<String, String> {
     let ttl = s.config.session_ttl.as_secs() as i64;
-    let user_id = user.id;
-    let token = db_task(s, move |db| db.issue_session_for_user(user_id, ttl))
+    db_task(s, move |db| db.issue_session_for_user(user_id, ttl))
         .await
-        .map_err(internal)?;
-    s.metrics.signins.fetch_add(1, Ordering::Relaxed);
-    info!(event = "signin_succeeded");
-    Ok(json!({"email":user.email,"name":user.name,"license":null,"token":token}))
+        .map_err(internal)
+}
+
+pub(crate) enum RegistrationError {
+    Invalid(String),
+    RateLimited,
+    Unavailable,
+}
+
+pub(crate) async fn register_account(
+    s: &AppState,
+    source: IpAddr,
+    email: String,
+    name: String,
+    password: String,
+) -> std::result::Result<crate::db::RegistrationResult, RegistrationError> {
+    auth::canonicalize_email(&email)
+        .map_err(|error| RegistrationError::Invalid(error.to_string()))?;
+    auth::normalize_display_name(&name)
+        .map_err(|error| RegistrationError::Invalid(error.to_string()))?;
+    auth::validate_self_registered_password(&password)
+        .map_err(|error| RegistrationError::Invalid(error.to_string()))?;
+    let enabled = db_task(s, |db| db.self_registration_enabled())
+        .await
+        .map_err(registration_internal)?;
+    if !enabled {
+        return Ok(crate::db::RegistrationResult::Disabled);
+    }
+    let admitted = s
+        .source_limits
+        .lock()
+        .map_err(|_| RegistrationError::Unavailable)?
+        .admit_signin(source, Instant::now());
+    if !admitted {
+        warn!(event = "registration_rate_limited");
+        return Err(RegistrationError::RateLimited);
+    }
+    let queue_deadline = tokio::time::Instant::now() + SIGNIN_QUEUE_TIMEOUT;
+    let waiter = s
+        .auth_waiters
+        .clone()
+        .try_acquire_owned()
+        .map_err(|_| RegistrationError::Unavailable)?;
+    let permit = timeout_at(queue_deadline, s.auth_checks.clone().acquire_owned())
+        .await
+        .map_err(|_| RegistrationError::Unavailable)?
+        .map_err(|_| RegistrationError::Unavailable)?;
+    drop(waiter);
+    let Some(bulk_memory) =
+        acquire_password_memory(s.bulk_memory.clone(), s.shutdown.clone(), queue_deadline)
+            .await
+            .map_err(registration_internal)?
+    else {
+        drop(permit);
+        return Err(RegistrationError::Unavailable);
+    };
+    let password_hash = tokio::task::spawn_blocking(move || {
+        let result = auth::hash_password(&password);
+        drop((permit, bulk_memory));
+        result
+    })
+    .await
+    .map_err(registration_internal)?
+    .map_err(registration_internal)?;
+    let result = db_task(s, move |db| {
+        db.create_self_registered_user(&email, &name, &password_hash)
+    })
+    .await
+    .map_err(registration_internal)?;
+    match result {
+        crate::db::RegistrationResult::Created(_) => info!(event = "registration_succeeded"),
+        crate::db::RegistrationResult::Disabled => info!(event = "registration_disabled"),
+        crate::db::RegistrationResult::Unavailable => warn!(event = "registration_unavailable"),
+    }
+    Ok(result)
+}
+
+fn registration_internal(error: impl std::fmt::Display) -> RegistrationError {
+    let _ = internal(error);
+    RegistrationError::Unavailable
 }
 
 async fn authorized_control(
@@ -2810,7 +2906,7 @@ fn permitted_origin<'a>(
     }
 }
 
-fn request_source(config: &Config, peer: SocketAddr, headers: &HeaderMap) -> IpAddr {
+pub(crate) fn request_source(config: &Config, peer: SocketAddr, headers: &HeaderMap) -> IpAddr {
     if config.trusted_proxy != Some(peer.ip()) {
         return peer.ip();
     }
@@ -2829,7 +2925,7 @@ fn request_source(config: &Config, peer: SocketAddr, headers: &HeaderMap) -> IpA
     forwarded
 }
 
-async fn db_task<T, F>(state: &AppState, operation: F) -> Result<T>
+pub(crate) async fn db_task<T, F>(state: &AppState, operation: F) -> Result<T>
 where
     T: Send + 'static,
     F: FnOnce(Db) -> Result<T> + Send + 'static,
@@ -3225,7 +3321,7 @@ fn unexpected_listener_result(name: &str, result: ListenerJoinResult) -> Result<
 mod tests {
     use super::*;
     use axum::{
-        body::Body,
+        body::{Body, to_bytes},
         extract::ConnectInfo,
         http::{Request, StatusCode, header},
     };
@@ -3271,20 +3367,18 @@ mod tests {
     fn admin_test_state(
         directory: &std::path::Path,
         admin_port: u16,
-    ) -> (AppState, String, String) {
+    ) -> (AppState, String, String, watch::Sender<bool>) {
         let mut config = Config::test(directory, 3000, 3003).unwrap();
         prepare_staging(&config.staging_dir).unwrap();
-        let admin_token = "0123456789abcdef".repeat(4);
         config.admin = Some(crate::admin::AdminConfig {
             bind_host: "127.0.0.1".parse().unwrap(),
             port: admin_port,
-            token_hash: hex::encode(Sha256::digest(admin_token.as_bytes())),
         });
         let max_connections = config.max_ws_connections;
         let max_uploads = config.max_concurrent_uploads;
         let db = Db::open(&config.database_path).unwrap();
         let sync_token = db.issue_session(3600).unwrap();
-        let (_shutdown_tx, shutdown) = watch::channel(false);
+        let (shutdown_tx, shutdown) = watch::channel(false);
         (
             AppState {
                 config: Arc::new(config),
@@ -3311,24 +3405,52 @@ mod tests {
                 admin_snapshots: Arc::new(Semaphore::new(1)),
                 started: Instant::now(),
             },
-            admin_token,
+            "test-password".to_owned(),
             sync_token,
+            shutdown_tx,
         )
     }
 
     fn admin_request(
         uri: &str,
         host: &str,
-        authorization: Option<&str>,
+        session: Option<&str>,
         source: IpAddr,
     ) -> Request<Body> {
         let mut request = Request::get(uri)
             .header(header::HOST, host)
             .extension(ConnectInfo(SocketAddr::new(source, 49152)));
-        if let Some(authorization) = authorization {
-            request = request.header(header::AUTHORIZATION, authorization);
+        if let Some(session) = session {
+            request = request.header(
+                header::COOKIE,
+                format!("blackglass_admin_session={session}"),
+            );
         }
         request.body(Body::empty()).unwrap()
+    }
+
+    fn admin_post_request(
+        uri: &str,
+        host: &str,
+        session: Option<&str>,
+        source: IpAddr,
+        body: serde_json::Value,
+    ) -> Request<Body> {
+        let mut request = Request::post(uri)
+            .header(header::HOST, host)
+            .header(header::CONTENT_TYPE, "application/json")
+            .extension(ConnectInfo(SocketAddr::new(source, 49152)));
+        if let Some(session) = session {
+            request = request
+                .header(
+                    header::COOKIE,
+                    format!("blackglass_admin_session={session}"),
+                )
+                .header("x-blackglass-admin", "1");
+        }
+        request
+            .body(Body::from(serde_json::to_vec(&body).unwrap()))
+            .unwrap()
     }
 
     #[test]
@@ -3422,8 +3544,31 @@ mod tests {
     #[tokio::test]
     async fn admin_http_routes_are_isolated_authenticated_and_hardened() {
         let directory = tempfile::tempdir().unwrap();
-        let (state, admin_token, sync_token) = admin_test_state(directory.path(), 3010);
+        let (state, admin_password, admin_session, _shutdown_tx) =
+            admin_test_state(directory.path(), 3010);
+        let candidate = state
+            .db
+            .signin_candidate("owner@example.test")
+            .unwrap()
+            .unwrap();
+        assert_eq!(candidate.role, "admin");
+        assert!(auth::verify_password(
+            &admin_password,
+            &candidate.password_hash
+        ));
         let admin = crate::admin::router(state.clone());
+        let ordinary_user = state
+            .db
+            .create_user(
+                "member@example.test",
+                "Member",
+                &auth::hash_password("member-password").unwrap(),
+            )
+            .unwrap();
+        let ordinary_session = state
+            .db
+            .issue_session_for_user(ordinary_user, 3600)
+            .unwrap();
 
         let shell = admin
             .clone()
@@ -3443,6 +3588,22 @@ mod tests {
         assert_eq!(shell.headers()[header::CACHE_CONTROL], "no-store");
         assert_eq!(shell.headers()["x-content-type-options"], "nosniff");
         assert_eq!(shell.headers()["referrer-policy"], "no-referrer");
+
+        let signed_out = admin
+            .clone()
+            .oneshot(admin_request(
+                "/admin/api/session",
+                "127.0.0.1:3010",
+                None,
+                IpAddr::from([127, 0, 0, 1]),
+            ))
+            .await
+            .unwrap();
+        assert_eq!(signed_out.status(), StatusCode::OK);
+        assert_eq!(
+            to_bytes(signed_out.into_body(), 1024).await.unwrap(),
+            Bytes::from_static(br#"{"signedIn":false}"#)
+        );
 
         let logo = admin
             .clone()
@@ -3479,17 +3640,13 @@ mod tests {
             .unwrap();
         assert_eq!(missing_host.status(), StatusCode::MISDIRECTED_REQUEST);
 
-        for authorization in [
-            None,
-            Some("Bearer wrong".to_owned()),
-            Some(format!("Bearer {sync_token}")),
-        ] {
+        for session in [None, Some("f".repeat(64)), Some(ordinary_session)] {
             let response = admin
                 .clone()
                 .oneshot(admin_request(
                     "/admin/api/snapshot",
                     "127.0.0.1:3010",
-                    authorization.as_deref(),
+                    session.as_deref(),
                     IpAddr::from([127, 0, 0, 1]),
                 ))
                 .await
@@ -3502,7 +3659,7 @@ mod tests {
             .oneshot(admin_request(
                 "/admin/api/snapshot?fresh=1",
                 "127.0.0.1:3010",
-                Some(&format!("Bearer {admin_token}")),
+                Some(&admin_session),
                 IpAddr::from([127, 0, 0, 1]),
             ))
             .await
@@ -3510,55 +3667,99 @@ mod tests {
         assert_eq!(authorized.status(), StatusCode::OK);
         assert_eq!(authorized.headers()[header::CACHE_CONTROL], "no-store");
 
-        let wrong_token = format!("Bearer {}", "f".repeat(64));
-        for _ in 0..crate::admin::ADMIN_AUTH_FAILURES_PER_SOURCE {
-            let response = admin
-                .clone()
-                .oneshot(admin_request(
-                    "/admin/api/snapshot",
-                    "127.0.0.1:3010",
-                    Some(&wrong_token),
-                    IpAddr::from([127, 0, 0, 1]),
-                ))
-                .await
-                .unwrap();
-            assert_eq!(response.status(), StatusCode::UNAUTHORIZED);
-        }
-        let limited = admin
+        let invalid_login = admin
             .clone()
-            .oneshot(admin_request(
-                "/admin/api/snapshot",
+            .oneshot(admin_post_request(
+                "/admin/api/login",
                 "127.0.0.1:3010",
-                Some(&wrong_token),
+                None,
                 IpAddr::from([127, 0, 0, 1]),
+                json!({"email":"owner@example.test","password":"wrong-password"}),
             ))
             .await
             .unwrap();
-        assert_eq!(limited.status(), StatusCode::TOO_MANY_REQUESTS);
-        assert!(limited.headers().contains_key(header::RETRY_AFTER));
+        assert_eq!(invalid_login.status(), StatusCode::UNAUTHORIZED);
 
-        let valid_after_failures = admin
+        let valid_login = admin
+            .clone()
+            .oneshot(admin_post_request(
+                "/admin/api/login",
+                "127.0.0.1:3010",
+                None,
+                IpAddr::from([127, 0, 0, 1]),
+                json!({"email":"owner@example.test","password":admin_password}),
+            ))
+            .await
+            .unwrap();
+        assert_eq!(valid_login.status(), StatusCode::OK);
+        let login_cookie = valid_login.headers()[header::SET_COOKIE]
+            .to_str()
+            .unwrap()
+            .to_owned();
+        assert!(login_cookie.contains("HttpOnly; SameSite=Strict; Path=/admin"));
+        let login_session = login_cookie
+            .strip_prefix("blackglass_admin_session=")
+            .unwrap()
+            .split(';')
+            .next()
+            .unwrap()
+            .to_owned();
+
+        let mut csrf = admin_post_request(
+            "/admin/api/registration",
+            "127.0.0.1:3010",
+            Some(&login_session),
+            IpAddr::from([127, 0, 0, 1]),
+            json!({"enabled":true}),
+        );
+        csrf.headers_mut().remove("x-blackglass-admin");
+        let csrf = admin.clone().oneshot(csrf).await.unwrap();
+        assert_eq!(csrf.status(), StatusCode::FORBIDDEN);
+        assert!(!state.db.self_registration_enabled().unwrap());
+
+        let registration = admin
+            .clone()
+            .oneshot(admin_post_request(
+                "/admin/api/registration",
+                "127.0.0.1:3010",
+                Some(&admin_session),
+                IpAddr::from([127, 0, 0, 1]),
+                json!({"enabled":true}),
+            ))
+            .await
+            .unwrap();
+        assert_eq!(registration.status(), StatusCode::OK);
+        assert!(state.db.self_registration_enabled().unwrap());
+
+        let logout = admin
+            .clone()
+            .oneshot(admin_post_request(
+                "/admin/api/logout",
+                "127.0.0.1:3010",
+                Some(&login_session),
+                IpAddr::from([127, 0, 0, 1]),
+                json!({}),
+            ))
+            .await
+            .unwrap();
+        assert_eq!(logout.status(), StatusCode::NO_CONTENT);
+        assert!(
+            logout.headers()[header::SET_COOKIE]
+                .to_str()
+                .unwrap()
+                .contains("Max-Age=0")
+        );
+        let revoked = admin
             .clone()
             .oneshot(admin_request(
                 "/admin/api/snapshot",
                 "127.0.0.1:3010",
-                Some(&format!("Bearer {admin_token}")),
+                Some(&login_session),
                 IpAddr::from([127, 0, 0, 1]),
             ))
             .await
             .unwrap();
-        assert_eq!(valid_after_failures.status(), StatusCode::OK);
-        let cleared = admin
-            .clone()
-            .oneshot(admin_request(
-                "/admin/api/snapshot",
-                "127.0.0.1:3010",
-                Some(&wrong_token),
-                IpAddr::from([127, 0, 0, 1]),
-            ))
-            .await
-            .unwrap();
-        assert_eq!(cleared.status(), StatusCode::UNAUTHORIZED);
+        assert_eq!(revoked.status(), StatusCode::UNAUTHORIZED);
 
         for public in [control_router(state.clone()), data_router(state)] {
             let response = public
@@ -3567,6 +3768,75 @@ mod tests {
                 .unwrap();
             assert_eq!(response.status(), StatusCode::NOT_FOUND);
         }
+    }
+
+    #[tokio::test]
+    async fn account_registration_creates_an_ordinary_client_account() {
+        let directory = tempfile::tempdir().unwrap();
+        let (state, _, _, _shutdown_tx) = admin_test_state(directory.path(), 3010);
+        let control = control_router(state.clone());
+        let source = IpAddr::from([127, 0, 0, 1]);
+
+        let status = control
+            .clone()
+            .oneshot(
+                Request::get("/account/api/registration")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(status.status(), StatusCode::OK);
+        assert_eq!(
+            to_bytes(status.into_body(), 1024).await.unwrap(),
+            Bytes::from_static(br#"{"enabled":false}"#)
+        );
+
+        let signup_request = || {
+            Request::post("/account/api/signup")
+                .header(header::CONTENT_TYPE, "application/json")
+                .extension(ConnectInfo(SocketAddr::new(source, 49152)))
+                .body(Body::from(
+                    r#"{"email":"new@example.test","name":"New user","password":"correct-horse-battery"}"#,
+                ))
+                .unwrap()
+        };
+        let disabled = control.clone().oneshot(signup_request()).await.unwrap();
+        assert_eq!(disabled.status(), StatusCode::FORBIDDEN);
+
+        state.db.set_self_registration_enabled(1, true).unwrap();
+        let created = control.clone().oneshot(signup_request()).await.unwrap();
+        assert_eq!(created.status(), StatusCode::CREATED);
+        let candidate = state
+            .db
+            .signin_candidate("new@example.test")
+            .unwrap()
+            .unwrap();
+        assert_eq!(candidate.role, "user");
+
+        let signed_in = control
+            .clone()
+            .oneshot(
+                Request::post("/user/signin")
+                    .header(header::CONTENT_TYPE, "application/json")
+                    .header(header::ORIGIN, "app://obsidian.md")
+                    .extension(ConnectInfo(SocketAddr::new(source, 49153)))
+                    .body(Body::from(
+                        r#"{"email":"new@example.test","password":"correct-horse-battery"}"#,
+                    ))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(signed_in.status(), StatusCode::OK);
+        let body = to_bytes(signed_in.into_body(), 4096).await.unwrap();
+        let body: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        assert_eq!(body["email"], "new@example.test");
+        assert_eq!(body["name"], "New user");
+        assert_eq!(body["token"].as_str().unwrap().len(), 64);
+
+        let duplicate = control.oneshot(signup_request()).await.unwrap();
+        assert_eq!(duplicate.status(), StatusCode::CONFLICT);
     }
 
     async fn raw_http_status(address: SocketAddr, request: &str) -> StatusCode {
@@ -3592,7 +3862,8 @@ mod tests {
         let listener = TcpListener::bind(("127.0.0.1", 0)).await.unwrap();
         let address = listener.local_addr().unwrap();
         let directory = tempfile::tempdir().unwrap();
-        let (state, admin_token, _) = admin_test_state(directory.path(), address.port());
+        let (state, _, admin_session, _shutdown_tx) =
+            admin_test_state(directory.path(), address.port());
         let task = tokio::spawn(async move {
             axum::serve(
                 listener,
@@ -3624,7 +3895,7 @@ mod tests {
         let accepted = raw_http_status(
             address,
             &format!(
-                "GET /admin/api/snapshot HTTP/1.1\r\nHost: 127.0.0.1:{}\r\nAuthorization: Bearer {admin_token}\r\nConnection: close\r\n\r\n",
+                "GET /admin/api/snapshot HTTP/1.1\r\nHost: 127.0.0.1:{}\r\nCookie: blackglass_admin_session={admin_session}\r\nConnection: close\r\n\r\n",
                 address.port()
             ),
         )

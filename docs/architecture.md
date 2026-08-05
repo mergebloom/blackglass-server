@@ -4,7 +4,7 @@
 
 Provide a stable, self-hosted implementation of the Sync control and data
 planes expected by qualified Obsidian desktop clients. Client-release analysis
-and adaptation live separately in Blackglass.
+and adaptation live separately in Blackglass Bridge.
 
 ## Control plane
 
@@ -12,13 +12,15 @@ The Rust service provides durable SQLite-backed local users and the account and
 vault operations required to create, connect, migrate encryption, rename,
 delete, and share a Sync vault. Each vault has one durable owner and may have
 bounded active collaborators; every session is bound to one user. Serving never
-loads account credentials from environment variables. Registration,
-password-recovery, and business-subscription routes return explicit
-administrator-managed JSON errors instead of transport errors. Owners may
+loads account credentials from environment variables. The public `/account`
+page creates ordinary users only while an administrator has enabled
+self-registration. The upstream-client registration, password-recovery, and
+business-subscription routes retain explicit compatibility errors rather than
+guessing at unqualified proprietary flows. Owners may
 invite existing active local accounts and remove collaborators; collaborators
 may leave using their own membership ID. Passwords are verified with Argon2id.
 Successful sign-in creates a random 256-bit bearer session whose digest, user,
-expiry, and revocation state live in SQLite.
+role, expiry, and revocation state live in SQLite.
 
 ## Data plane
 

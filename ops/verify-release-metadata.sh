@@ -153,12 +153,12 @@ jq -e \
       .schemaVersion == 3 and
       .serverVersion == $version and
       .database.destinationSchema == $schema and
-      .database.supportedSourceSchemas == [4, 5] and
+      .database.supportedSourceSchemas == [4, 5, 6] and
       .rollback == {
-        "previousPublishedTag": "v0.5.0",
+        "previousPublishedTag": "v0.5.1",
         "previousPublishedSchema": 6,
-        "directRollbackTag": "v0.5.0",
-        "directRollbackSupported": true
+        "directRollbackTag": null,
+        "directRollbackSupported": false
       } and
       (.clientToolingRevision | test("^[a-f0-9]{40}$")) and
       (.qualifiedRenderers | map(.version)) == ["1.12.7", "1.13.4"] and

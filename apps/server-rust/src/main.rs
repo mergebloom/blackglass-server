@@ -1,3 +1,4 @@
+mod account;
 mod admin;
 mod auth;
 mod config;
@@ -129,6 +130,15 @@ async fn main() -> Result<()> {
             let _database_lock = server::acquire_database_lock(&database)?;
             let db = db::Db::open_offline_under_lock(&database)?;
             db.set_user_status(user_id, status)?;
+            println!("updated user: {user_id}");
+            Ok(())
+        }
+        [scope, command, database, user_id, role] if scope == "user" && command == "set-role" => {
+            let database = PathBuf::from(database);
+            let user_id = parse_user_id(user_id)?;
+            let _database_lock = server::acquire_database_lock(&database)?;
+            let db = db::Db::open_offline_under_lock(&database)?;
+            db.set_user_role(user_id, role)?;
             println!("updated user: {user_id}");
             Ok(())
         }
@@ -270,6 +280,7 @@ Usage:\n  {NAME} serve\n  {NAME} hash-password\n  {NAME} backup <database> <outp
 {NAME} user set-email <database> <user-id> <email>\n  \
 {NAME} user set-name <database> <user-id> <name>\n  \
 {NAME} user set-status <database> <user-id> <active|disabled>\n  \
+{NAME} user set-role <database> <user-id> <admin|user>\n  \
 {NAME} user revoke-sessions <database> <user-id>\n  \
 {NAME} verify <database>\n  {NAME} restore <backup> <new-database>\n  {NAME} recover-stale-backup <backup> <new-database>\n  \
 {NAME} migrate <versioned-database> <new-database>\n  \
