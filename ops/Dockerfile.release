@@ -46,6 +46,9 @@ RUN --mount=type=cache,id=blackglass-cargo-registry-$TARGETARCH,target=/usr/loca
     cargo fetch --locked --manifest-path apps/server-rust/Cargo.toml
 
 COPY apps/server-rust/src ./apps/server-rust/src
+COPY apps/server-rust/admin ./apps/server-rust/admin
+COPY apps/server-rust/account ./apps/server-rust/account
+COPY assets/blackglass-prism.png ./assets/blackglass-prism.png
 COPY ops/blackglass-server.service ./ops/blackglass-server.service
 COPY LICENSE /metadata/LICENSE
 COPY THIRD_PARTY_NOTICES.md /metadata/THIRD_PARTY_NOTICES.md

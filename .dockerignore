@@ -5,6 +5,12 @@
 !apps/server-rust/Cargo.lock
 !apps/server-rust/src/
 !apps/server-rust/src/**
+!apps/server-rust/admin/
+!apps/server-rust/admin/**
+!apps/server-rust/account/
+!apps/server-rust/account/**
+!assets/
+!assets/blackglass-prism.png
 !ops/
 !ops/release/
 !ops/release/INSTALL.md

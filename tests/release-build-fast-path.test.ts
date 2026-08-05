@@ -33,6 +33,22 @@ describe("release build fast paths", () => {
     expect(dockerfile).toContain('if test "$RUN_TESTS" = 1');
   });
 
+  test("includes every compile-time UI asset in the release build context", async () => {
+    const [dockerfile, dockerignore] = await Promise.all([
+      readFile(resolve(root, "ops/Dockerfile.release"), "utf8"),
+      readFile(resolve(root, ".dockerignore"), "utf8"),
+    ]);
+
+    for (const path of [
+      "apps/server-rust/admin",
+      "apps/server-rust/account",
+      "assets/blackglass-prism.png",
+    ]) {
+      expect(dockerfile).toContain(`COPY ${path}`);
+      expect(dockerignore).toContain(`!${path}`);
+    }
+  });
+
   test("reuses an already attested native binary unless forced", async () => {
     const script = await readFile(resolve(root, "ops/build-release.sh"), "utf8");
     expect(script).toContain('BLACKGLASS_FORCE_REBUILD:-0');
