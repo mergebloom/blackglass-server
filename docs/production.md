@@ -176,7 +176,7 @@ make a previously disclosed custom encryption password secret again.
 
 ## Read-only admin console
 
-The optional Phase 1 admin console is observation-only: it has no mutation,
+The optional Blackglass admin console is observation-only: it has no mutation,
 backup, configuration, revocation, deletion, purge, or restore controls. Enable
 it only by setting `SELFHOST_ADMIN_BIND_HOST`, `SELFHOST_ADMIN_PORT`, and
 `SELFHOST_ADMIN_TOKEN_HASH` together. The hash is exactly 64 lowercase SHA-256
@@ -185,7 +185,9 @@ plaintext token must itself be exactly 64 lowercase hexadecimal characters;
 generate it with `openssl rand -hex 32` and keep it independent from all Sync
 sessions.
 
-The admin bind is strictly loopback-only; unspecified addresses are rejected even when external Sync binding is acknowledged. Keep the listener on `127.0.0.1` (for example port `3010`). TLS remains the
+The admin bind is strictly loopback-only; unspecified addresses are rejected
+even when external Sync binding is acknowledged. Keep the listener on
+`127.0.0.1` (for example port `3010`). TLS remains the
 responsibility of a private reverse proxy. The listener rejects every HTTP
 authority except its configured loopback address (or `localhost`) and port. A
 safe remote shape is a tailnet-only hostname whose proxy route forwards

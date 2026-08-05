@@ -3444,6 +3444,20 @@ mod tests {
         assert_eq!(shell.headers()["x-content-type-options"], "nosniff");
         assert_eq!(shell.headers()["referrer-policy"], "no-referrer");
 
+        let logo = admin
+            .clone()
+            .oneshot(admin_request(
+                "/admin/logo.png",
+                "127.0.0.1:3010",
+                None,
+                IpAddr::from([127, 0, 0, 1]),
+            ))
+            .await
+            .unwrap();
+        assert_eq!(logo.status(), StatusCode::OK);
+        assert_eq!(logo.headers()[header::CONTENT_TYPE], "image/png");
+        assert_eq!(logo.headers()[header::CACHE_CONTROL], "no-store");
+
         for host in ["attacker.invalid:3010", "127.0.0.1:3011"] {
             let response = admin
                 .clone()

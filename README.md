@@ -1,4 +1,8 @@
-# Blackglass Server
+<p align="center">
+  <img src="assets/blackglass-prism.png" width="144" alt="Blackglass prism">
+</p>
+
+<h1 align="center">Blackglass Server</h1>
 
 Blackglass Server is a lean Rust/SQLite replacement for the hosted Sync service
 used by a [Blackglass Bridge](https://github.com/mergebloom/blackglass-bridge)-adapted
@@ -65,6 +69,19 @@ Export and test a verified online backup:
 The [production guide](docs/production.md) covers monitoring, account changes,
 scheduled off-host backups, real recovery, upgrades, schema migration, and
 rollback. Back up and run a restore drill before changing an image digest.
+
+## Administration
+
+The optional read-only admin console runs on its own loopback-only listener. It
+shows service health, configured limits, storage, users, vaults, live Sync
+connections, sessions, and recent activity. Its operator token remains in the
+current browser tab and is never stored by the console or written to logs. See
+the [production guide](docs/production.md#read-only-admin-console) for secure
+access and configuration.
+
+![Blackglass Server admin login](docs/images/admin-login.png)
+
+![Blackglass Server dashboard](docs/images/admin-dashboard.png)
 
 ## Standalone Linux artifacts
 

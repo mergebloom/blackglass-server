@@ -1,0 +1,64 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8">
+    <meta name="viewport" content="width=device-width,initial-scale=1">
+    <meta name="theme-color" content="#070a0e">
+    <title>Blackglass · Server admin</title>
+    <link rel="icon" href="/admin/logo.png" type="image/png">
+    <link rel="stylesheet" href="/admin/styles.css">
+    <script defer src="/admin/app.js"></script>
+  </head>
+  <body>
+    <header class="topbar">
+      <div class="brand">
+        <img src="/admin/logo.png" width="40" height="40" alt="">
+        <span><strong>Blackglass</strong><small>Server admin</small></span>
+      </div>
+      <span id="refreshed" aria-live="polite">Not connected</span>
+    </header>
+    <main>
+      <section id="login" class="auth-shell">
+        <div class="auth-card">
+          <img class="auth-mark" src="/admin/logo.png" width="104" height="104" alt="Blackglass prism">
+          <p class="eyebrow">Self-hosted operations</p>
+          <h1>Server administration</h1>
+          <p class="lede">A private, read-only view of health, storage, users, vaults, and active Sync sessions.</p>
+          <form id="login-form">
+            <label for="token">Admin token</label>
+            <input id="token" type="password" autocomplete="off" spellcheck="false" minlength="64" maxlength="64" pattern="[0-9a-f]{64}" placeholder="64-character operator token" required>
+            <button id="connect" type="submit">Open console</button>
+            <p id="login-error" role="alert"></p>
+          </form>
+          <p class="privacy-note">Your token stays in this browser tab and is never written to server logs.</p>
+        </div>
+      </section>
+      <div id="dashboard" hidden aria-busy="false">
+        <div class="status panel">
+          <div>
+            <p class="eyebrow">Operations overview</p>
+            <h1 id="dashboard-title" tabindex="-1">Server dashboard</h1>
+          </div>
+          <div class="status-meta">
+            <strong id="health" role="status" aria-live="polite">Unknown</strong>
+            <span id="version" class="chip"></span>
+          </div>
+          <div class="actions">
+            <button id="refresh">Refresh</button>
+            <button id="signout" class="secondary">Forget token</button>
+          </div>
+        </div>
+        <div class="dashboard-grid">
+          <section class="panel wide"><h2>Overview &amp; limits</h2><dl id="overview"></dl></section>
+          <section class="panel"><h2 id="user-title">Users</h2><div id="users" class="rows"></div></section>
+          <section class="panel"><h2 id="vault-title">Vaults</h2><div id="vaults" class="rows"></div></section>
+          <section class="panel wide"><h2 id="connection-title">Live connections</h2><div id="connections" class="rows"></div></section>
+          <section class="panel"><h2 id="activity-title">Recent activity</h2><div id="activity" class="rows"></div></section>
+          <section class="panel"><h2 id="session-title">Sessions</h2><div id="sessions" class="rows"></div></section>
+          <section class="panel"><h2>Storage &amp; history</h2><dl id="storage"></dl></section>
+          <section class="panel"><h2>Diagnostics</h2><dl id="diagnostics"></dl></section>
+        </div>
+      </div>
+    </main>
+  </body>
+</html>

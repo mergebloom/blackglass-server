@@ -21,7 +21,7 @@ use std::{
 };
 use uuid::Uuid;
 
-pub(crate) const CSP: &str = "default-src 'none'; script-src 'self'; style-src 'self'; connect-src 'self'; frame-ancestors 'none'; base-uri 'none'; form-action 'none'";
+pub(crate) const CSP: &str = "default-src 'none'; script-src 'self'; style-src 'self'; img-src 'self'; connect-src 'self'; frame-ancestors 'none'; base-uri 'none'; form-action 'none'";
 const MAX_DEVICE_BYTES: usize = 128;
 pub(crate) const ADMIN_TOKEN_HEX_LENGTH: usize = 64;
 pub(crate) const ADMIN_AUTH_FAILURES_PER_SOURCE: u8 = 8;
@@ -418,6 +418,7 @@ pub(crate) fn router(state: AppState) -> Router {
         .route("/admin", get(shell))
         .route("/admin/styles.css", get(styles))
         .route("/admin/app.js", get(script))
+        .route("/admin/logo.png", get(logo))
         .route("/admin/api/snapshot", get(snapshot))
         .layer(middleware::from_fn_with_state(
             state.clone(),
@@ -485,6 +486,9 @@ async fn script() -> impl IntoResponse {
         [(header::CONTENT_TYPE, "text/javascript; charset=utf-8")],
         ADMIN_JS,
     )
+}
+async fn logo() -> impl IntoResponse {
+    ([(header::CONTENT_TYPE, "image/png")], ADMIN_LOGO)
 }
 async fn snapshot(
     State(state): State<AdminRouterState>,
@@ -638,9 +642,10 @@ fn staging_facts(path: &std::path::Path) -> StagingFacts {
     }
 }
 
-pub(crate) const ADMIN_HTML: &str = r#"<!doctype html><html lang="en"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"><title>Blackglass · Server admin</title><link rel="stylesheet" href="/admin/styles.css"><script defer src="/admin/app.js"></script></head><body><header><strong>Blackglass</strong><span>Server admin</span><span id="refreshed" aria-live="polite">Not connected</span></header><main><section id="login"><h1>Read-only server view</h1><form id="login-form"><label>Admin token <input id="token" type="password" autocomplete="off" minlength="64" maxlength="64" pattern="[0-9a-f]{64}" required></label><button id="connect" type="submit">Connect</button><p id="login-error" role="alert"></p></form></section><div id="dashboard" hidden aria-busy="false"><div class="status"><h1 id="dashboard-title" tabindex="-1">Server dashboard</h1><strong id="health" role="status" aria-live="polite">Unknown</strong><span id="version"></span><button id="refresh">Refresh</button><button id="signout">Forget token</button></div><section><h2>Overview &amp; limits</h2><dl id="overview"></dl></section><section><h2 id="user-title">Users</h2><div id="users" class="rows"></div></section><section><h2 id="vault-title">Vaults</h2><div id="vaults" class="rows"></div></section><section><h2 id="connection-title">Live connections</h2><div id="connections" class="rows"></div></section><section><h2 id="activity-title">Recent activity</h2><div id="activity" class="rows"></div></section><section><h2 id="session-title">Sessions</h2><div id="sessions" class="rows"></div></section><section><h2>Storage &amp; history</h2><dl id="storage"></dl></section><section><h2>Diagnostics</h2><dl id="diagnostics"></dl></section></div></main></body></html>"#;
-pub(crate) const ADMIN_CSS: &str = r#":root{color-scheme:light;--ink:#18201d;--muted:#66706b;--line:#d8dedb;--accent:#276b57}*{box-sizing:border-box}body{margin:0;color:var(--ink);background:#f8faf9;font:15px system-ui,sans-serif;overflow-wrap:anywhere}header{display:flex;gap:1rem;align-items:baseline;padding:1rem max(1rem,calc((100% - 70rem)/2));border-bottom:1px solid var(--line)}header #refreshed{margin-left:auto;color:var(--muted)}main{max-width:70rem;margin:auto;padding:1rem;min-width:0}section{padding:1rem 0;border-bottom:1px solid var(--line)}h1,h2{font-weight:600}h2{font-size:1rem;text-transform:uppercase;letter-spacing:.06em}button,input{min-height:44px;border:1px solid var(--line);border-radius:3px;padding:.6rem;background:white;color:inherit}button{cursor:pointer}button:disabled{cursor:wait;opacity:.55}button:focus,input:focus{outline:3px solid #8ec6b4;outline-offset:2px}.status{display:flex;gap:.75rem;align-items:center}.status button:first-of-type{margin-left:auto}.rows>article{display:grid;grid-template-columns:minmax(10rem,1fr) 2fr;gap:.5rem;padding:.7rem 0;border-top:1px solid var(--line);min-width:0}.fields{display:grid;grid-template-columns:repeat(auto-fit,minmax(10rem,1fr));gap:.35rem}.field{min-width:0}.label{display:block;color:var(--muted);font-size:.8rem}.value{display:block;font-family:ui-monospace,monospace}dl{display:grid;grid-template-columns:minmax(12rem,1fr) 2fr;gap:.5rem}dt{color:var(--muted)}dd{margin:0;font-family:ui-monospace,monospace}#login-error{color:#8a2d25}@media(max-width:600px){header{flex-wrap:wrap}.status{flex-wrap:wrap}.status button{flex:1}.rows>article,dl{grid-template-columns:1fr}header #refreshed{width:100%;margin:0}}"#;
-pub(crate) const ADMIN_JS: &str = r#"'use strict';const $=id=>document.getElementById(id);let pending=null,generation=0;const token=()=>sessionStorage.getItem('blackglass-admin-token');const label=k=>k.replace(/[A-Z]/g,m=>' '+m.toLowerCase());const bytes=v=>v==null?'Unavailable':(()=>{let n=Number(v),u=['B','KiB','MiB','GiB','TiB'],i=0;while(Math.abs(n)>=1024&&i<4){n/=1024;i++}return `${n.toFixed(i?1:0)} ${u[i]}`})();const time=v=>v==null?'Unavailable':new Date(v).toLocaleString();const duration=v=>v==null?'Unavailable':v<60?`${v} s`:v<3600?`${Math.round(v/60)} min`:v<86400?`${Math.round(v/3600)} h`:`${Math.round(v/86400)} d`;const display=(k,v)=>k.match(/bytes|size/i)?bytes(v):k.match(/at$|timestamp|created|expires|revoked/i)&&typeof v==='number'?time(v):k.match(/seconds/i)?duration(v):typeof v==='boolean'?(v?'Yes':'No'):(v??'Unavailable');function dl(id,obj){const e=$(id);e.replaceChildren();for(const[k,v]of Object.entries(obj)){const dt=document.createElement('dt'),dd=document.createElement('dd');dt.textContent=label(k);dd.textContent=display(k,v);e.append(dt,dd)}}function rows(id,items,empty){const e=$(id);e.replaceChildren();if(!items.length){const p=document.createElement('p');p.textContent=empty;e.append(p);return}for(const item of items){const a=document.createElement('article'),b=document.createElement('strong'),d=document.createElement('div');d.className='fields';b.textContent=String(item.name||item.device||item.eventType||'Session');for(const[k,v]of Object.entries(item)){if(['name','device','eventType'].includes(k))continue;const f=document.createElement('span'),l=document.createElement('span'),x=document.createElement('span');f.className='field';l.className='label';x.className='value';l.textContent=label(k);x.textContent=display(k,v);f.append(l,x);d.append(f)}a.append(b,d);e.append(a)}}function busy(on){$('connect').disabled=on;$('refresh').disabled=on;$('refresh').textContent=on?'Refreshing…':'Refresh';$('dashboard').setAttribute('aria-busy',String(on));if(on)$('refreshed').textContent='Refreshing dashboard…'}function forget(message=''){generation++;if(pending)pending.controller.abort();pending=null;busy(false);sessionStorage.removeItem('blackglass-admin-token');$('dashboard').hidden=true;$('login').hidden=false;$('token').value='';$('refreshed').textContent='Not connected';$('login-error').textContent=message;$('token').focus()}async function load(manual=false){if(pending)return pending.promise;const requestGeneration=++generation,controller=new AbortController(),wasHidden=$('dashboard').hidden;const promise=(async()=>{busy(true);$('login-error').textContent='';try{const r=await fetch('/admin/api/snapshot',{headers:{Authorization:`Bearer ${token()||''}`},cache:'no-store',signal:controller.signal});if(requestGeneration!==generation)return;if(r.status===401){forget('Invalid admin token.');return}if(!r.ok)throw Error(r.status===429?'Request rate limited; retry shortly.':'Snapshot unavailable.');const x=await r.json();if(requestGeneration!==generation||!token())return;$('login').hidden=true;$('dashboard').hidden=false;$('health').textContent=x.overview.healthy?'Healthy':'Degraded';$('version').textContent=`Version ${x.overview.version}`;$('refreshed').textContent=`Refreshed ${time(x.generatedAt)}`;dl('overview',{...x.overview,perFileLimitBytes:x.limits.perFileBytes,retainedStorageLimitBytes:x.limits.retainedStorageBytes,ownerStorageLimitBytes:x.limits.retainedStorageBytesPerOwner,sessionLimit:x.limits.maxSessions,connectionLimit:x.limits.maxConnections,connectionLimitPerUser:x.limits.maxConnectionsPerUser,uploadLimit:x.limits.maxUploads,uploadLimitPerUser:x.limits.maxUploadsPerUser});$('user-title').textContent=`Users — ${x.counts.usersActive} active / ${x.counts.usersDisabled} disabled (${x.counts.usersVisible} visible)`;$('vault-title').textContent=`Vaults — ${x.counts.vaultsVisible} visible / ${x.counts.vaultsTotal} total`;$('connection-title').textContent=`Live connections — ${x.liveConnections.length} active`;$('activity-title').textContent=`Recent activity — ${x.counts.activityVisible} visible / ${x.counts.activityTotal} total`;$('session-title').textContent=`Sessions — ${x.sessions.active} active / ${x.sessions.total} total (${x.counts.sessionsVisible} visible)`;rows('users',x.users,'No users have been provisioned.');rows('vaults',x.vaults,'No vaults have been created.');rows('connections',x.liveConnections,'No active Sync connections.');rows('activity',x.recentActivity,'No revision activity recorded.');rows('sessions',x.sessions.items,'No sessions recorded.');dl('storage',x.storage);dl('diagnostics',x.diagnostics);if(wasHidden)$('dashboard-title').focus()}catch(e){if(e.name==='AbortError'||requestGeneration!==generation)return;const m=e instanceof Error?e.message:'Snapshot unavailable.';if($('dashboard').hidden)$('login-error').textContent=m;else $('refreshed').textContent=m;if(manual&&!$('dashboard').hidden)$('refresh').focus()}finally{if(requestGeneration===generation){busy(false);pending=null}}})();pending={promise,controller};return promise}$('login-form').addEventListener('submit',e=>{e.preventDefault();sessionStorage.setItem('blackglass-admin-token',$('token').value);load(true)});$('refresh').onclick=()=>load(true);$('signout').onclick=()=>forget();if(token())load();setInterval(()=>{if(token())load()},30000);"#;
+pub(crate) const ADMIN_HTML: &str = include_str!("../admin/index.html");
+pub(crate) const ADMIN_CSS: &str = include_str!("../admin/styles.css");
+pub(crate) const ADMIN_JS: &str = include_str!("../admin/app.js");
+pub(crate) const ADMIN_LOGO: &[u8] = include_bytes!("../../../assets/blackglass-prism.png");
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -772,7 +777,10 @@ mod tests {
         }
         assert!(!ADMIN_HTML.contains("token_hash"));
         assert!(ADMIN_CSS.contains("@media"));
-        assert!(ADMIN_CSS.contains("min-height:44px"));
+        assert!(ADMIN_CSS.contains("min-height: 48px"));
+        assert!(ADMIN_CSS.contains("color-scheme: dark"));
+        assert!(ADMIN_HTML.contains("/admin/logo.png"));
+        assert_eq!(&ADMIN_LOGO[..8], b"\x89PNG\r\n\x1a\n");
         for marker in [
             "sessionStorage",
             "Authorization",
@@ -790,7 +798,7 @@ mod tests {
             "pattern=\"[0-9a-f]{64}\"",
             "new AbortController()",
             "pending.controller.abort()",
-            "requestGeneration!==generation",
+            "requestGeneration !== generation",
             "Refreshing dashboard",
             "Refreshing…",
             "$('dashboard-title').focus()",
@@ -800,7 +808,8 @@ mod tests {
                 "{marker}"
             );
         }
-        assert!(CSP.contains("default-src 'none'"))
+        assert!(CSP.contains("default-src 'none'"));
+        assert!(CSP.contains("img-src 'self'"))
     }
     #[test]
     fn live_registry_is_bounded_sanitized_and_drop_safe() {
