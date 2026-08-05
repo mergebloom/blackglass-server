@@ -141,6 +141,7 @@ validation. Support claims remain tied to deterministic conformance evidence.
 
 | Guide | Purpose |
 | --- | --- |
+| [User guide](https://mergebloom.github.io/blackglass-bridge/) | Beginner setup, client adaptation, operations, and guided prompts |
 | [Production](docs/production.md) | Secure configuration, operations, backup, upgrade, rollback |
 | [Distribution](docs/distribution.md) | Linux binaries, archives, OCI image, verification |
 | [Security](docs/security.md) | Threat model and controls |
