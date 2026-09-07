@@ -828,6 +828,17 @@ impl Db {
         self.auth_context_hash(&auth::token_hash(token))
     }
 
+    pub fn auth_context_with_renewal(
+        &self,
+        token: &str,
+        ttl_secs: i64,
+    ) -> Result<(Option<AuthContext>, bool)> {
+        if token.len() != 64 || !token.bytes().all(|byte| byte.is_ascii_hexdigit()) {
+            return Ok((None, false));
+        }
+        self.auth_context_hash_with_renewal(&auth::token_hash(token), ttl_secs)
+    }
+
     pub fn auth_context_hash(&self, token_hash: &str) -> Result<Option<AuthContext>> {
         if token_hash.len() != 64 || !token_hash.bytes().all(|byte| byte.is_ascii_hexdigit()) {
             return Ok(None);
@@ -836,7 +847,7 @@ impl Db {
         self.with(|connection| {
             Ok(connection
                 .query_row(
-                    "SELECT u.id,u.email,u.name,u.role,s.token_hash,s.expires_at
+                    "SELECT u.id,u.email,u.name,u.role,s.token_hash
                        FROM sessions s JOIN users u ON u.id=s.user_id
                       WHERE s.token_hash=? AND s.expires_at>? AND s.revoked_at IS NULL
                         AND u.status='active'",
@@ -848,11 +859,85 @@ impl Db {
                             name: row.get(2)?,
                             role: row.get(3)?,
                             token_hash: row.get(4)?,
-                            expires_at: row.get(5)?,
                         })
                     },
                 )
                 .optional()?)
+        })
+    }
+
+    pub fn auth_context_hash_with_renewal(
+        &self,
+        token_hash: &str,
+        ttl_secs: i64,
+    ) -> Result<(Option<AuthContext>, bool)> {
+        if token_hash.len() != 64 || !token_hash.bytes().all(|byte| byte.is_ascii_hexdigit()) {
+            return Ok((None, false));
+        }
+        let now = now_ms();
+        let ttl_ms = ttl_secs.saturating_mul(1000);
+        let renewal_threshold = now.saturating_add(ttl_ms / 2);
+        let renewed_expiry = now.saturating_add(ttl_ms);
+        self.with(|connection| {
+            let current = connection
+                .query_row(
+                    "SELECT u.id,u.email,u.name,u.role,s.token_hash,s.expires_at
+                       FROM sessions s JOIN users u ON u.id=s.user_id
+                      WHERE s.token_hash=? AND s.expires_at>? AND s.revoked_at IS NULL
+                        AND u.status='active'",
+                    params![token_hash, now],
+                    |row| {
+                        Ok((
+                            AuthContext {
+                                user_id: row.get(0)?,
+                                email: row.get(1)?,
+                                name: row.get(2)?,
+                                role: row.get(3)?,
+                                token_hash: row.get(4)?,
+                            },
+                            row.get::<_, i64>(5)?,
+                        ))
+                    },
+                )
+                .optional()?;
+            let Some((context, expires_at)) = current else {
+                return Ok((None, false));
+            };
+            if expires_at > renewal_threshold {
+                return Ok((Some(context), false));
+            }
+            let transaction = connection.transaction()?;
+            let renewed = transaction.execute(
+                "UPDATE sessions
+                    SET expires_at=?
+                  WHERE token_hash=? AND expires_at>? AND expires_at<=?
+                    AND revoked_at IS NULL
+                    AND EXISTS(
+                        SELECT 1 FROM users u
+                         WHERE u.id=sessions.user_id AND u.status='active'
+                    )",
+                params![renewed_expiry, token_hash, now, renewal_threshold],
+            )? == 1;
+            let context = transaction
+                .query_row(
+                    "SELECT u.id,u.email,u.name,u.role,s.token_hash
+                       FROM sessions s JOIN users u ON u.id=s.user_id
+                      WHERE s.token_hash=? AND s.expires_at>? AND s.revoked_at IS NULL
+                        AND u.status='active'",
+                    params![token_hash, now],
+                    |row| {
+                        Ok(AuthContext {
+                            user_id: row.get(0)?,
+                            email: row.get(1)?,
+                            name: row.get(2)?,
+                            role: row.get(3)?,
+                            token_hash: row.get(4)?,
+                        })
+                    },
+                )
+                .optional()?;
+            transaction.commit()?;
+            Ok((context, renewed))
         })
     }
 
@@ -871,6 +956,7 @@ impl Db {
             .unwrap_or(false)
     }
 
+    #[cfg(test)]
     pub fn valid_session_for_vault(&self, hash: &str, vault: &str) -> bool {
         if hash.len() != 64 || vault.is_empty() {
             return false;
@@ -894,6 +980,72 @@ impl Db {
             )? == 1)
         })
         .unwrap_or(false)
+    }
+
+    pub fn renew_session_for_vault(
+        &self,
+        hash: &str,
+        vault: &str,
+        ttl_secs: i64,
+    ) -> Result<Option<bool>> {
+        if hash.len() != 64 || vault.is_empty() {
+            return Ok(None);
+        }
+        let now = now_ms();
+        let ttl_ms = ttl_secs.saturating_mul(1000);
+        let renewal_threshold = now.saturating_add(ttl_ms / 2);
+        let renewed_expiry = now.saturating_add(ttl_ms);
+        self.with(|connection| {
+            let authorization = "EXISTS(
+                SELECT 1 FROM users u
+                JOIN vaults v ON v.id=?
+                 WHERE u.id=sessions.user_id AND u.status='active'
+                   AND (v.owner_user_id=sessions.user_id OR EXISTS(
+                       SELECT 1 FROM memberships m
+                        WHERE m.vault_id=v.id AND m.user_id=sessions.user_id
+                          AND m.revoked_at IS NULL
+                   ))
+            )";
+            let current_expiry: Option<i64> = connection
+                .query_row(
+                    &format!(
+                        "SELECT expires_at FROM sessions
+                          WHERE token_hash=? AND expires_at>? AND revoked_at IS NULL
+                            AND {authorization}"
+                    ),
+                    params![hash, now, vault],
+                    |row| row.get(0),
+                )
+                .optional()?;
+            let Some(current_expiry) = current_expiry else {
+                return Ok(None);
+            };
+            if current_expiry > renewal_threshold {
+                return Ok(Some(false));
+            }
+            let transaction = connection.transaction()?;
+            let renewed = transaction.execute(
+                &format!(
+                    "UPDATE sessions SET expires_at=?
+                      WHERE token_hash=? AND expires_at>? AND expires_at<=?
+                        AND revoked_at IS NULL AND {authorization}"
+                ),
+                params![renewed_expiry, hash, now, renewal_threshold, vault],
+            )? == 1;
+            let expiry: Option<i64> = transaction
+                .query_row(
+                    &format!(
+                        "SELECT expires_at FROM sessions
+                          WHERE token_hash=? AND expires_at>? AND revoked_at IS NULL
+                            AND {authorization}"
+                    ),
+                    params![hash, now, vault],
+                    |row| row.get(0),
+                )
+                .optional()?;
+            transaction.commit()?;
+            Ok(expiry.map(|_| renewed))
+        })
     }
 
     #[cfg(test)]

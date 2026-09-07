@@ -87,6 +87,7 @@ pub struct Metrics {
     control: AtomicU64,
     signins: AtomicU64,
     auth_failures: AtomicU64,
+    session_renewals: AtomicU64,
     ws_connections: AtomicU64,
     uploads: AtomicU64,
     upload_bytes: AtomicU64,
@@ -663,11 +664,12 @@ async fn ready(State(s): State<AppState>) -> Response {
 async fn metrics(State(s): State<AppState>) -> Response {
     let m = &s.metrics;
     let mut body = format!(
-        "blackglass_control_requests_total {}\nblackglass_control_rejections_total {}\nblackglass_signins_total {}\nblackglass_auth_failures_total {}\nblackglass_ws_connections_total {}\nblackglass_uploads_total {}\nblackglass_upload_bytes_total {}\nblackglass_upload_timeouts_total {}\nblackglass_storage_quota_bytes {}\nblackglass_storage_quota_rejections_total {}\nblackglass_downloads_total {}\nblackglass_errors_total {}\nobsidian_sync_control_requests_total {}\nobsidian_sync_signins_total {}\nobsidian_sync_auth_failures_total {}\nobsidian_sync_ws_connections_total {}\nobsidian_sync_uploads_total {}\nobsidian_sync_upload_bytes_total {}\nobsidian_sync_downloads_total {}\nobsidian_sync_errors_total {}\n",
+        "blackglass_control_requests_total {}\nblackglass_control_rejections_total {}\nblackglass_signins_total {}\nblackglass_auth_failures_total {}\nblackglass_session_renewals_total {}\nblackglass_ws_connections_total {}\nblackglass_uploads_total {}\nblackglass_upload_bytes_total {}\nblackglass_upload_timeouts_total {}\nblackglass_storage_quota_bytes {}\nblackglass_storage_quota_rejections_total {}\nblackglass_downloads_total {}\nblackglass_errors_total {}\nobsidian_sync_control_requests_total {}\nobsidian_sync_signins_total {}\nobsidian_sync_auth_failures_total {}\nobsidian_sync_ws_connections_total {}\nobsidian_sync_uploads_total {}\nobsidian_sync_upload_bytes_total {}\nobsidian_sync_downloads_total {}\nobsidian_sync_errors_total {}\n",
         m.control.load(Ordering::Relaxed),
         m.control_rejections.load(Ordering::Relaxed),
         m.signins.load(Ordering::Relaxed),
         m.auth_failures.load(Ordering::Relaxed),
+        m.session_renewals.load(Ordering::Relaxed),
         m.ws_connections.load(Ordering::Relaxed),
         m.uploads.load(Ordering::Relaxed),
         m.upload_bytes.load(Ordering::Relaxed),
@@ -972,13 +974,24 @@ async fn authorized_control(
         .ok_or("Not logged in")?
         .to_owned();
     let validation_token = token.clone();
-    let Some(auth_context) = db_task(s, move |db| db.auth_context(&validation_token))
-        .await
-        .map_err(internal)?
-    else {
+    let session_ttl = s.config.session_ttl.as_secs() as i64;
+    let renew_session = path != "/user/signout";
+    let (auth_context, renewed) = db_task(s, move |db| {
+        if renew_session {
+            db.auth_context_with_renewal(&validation_token, session_ttl)
+        } else {
+            Ok((db.auth_context(&validation_token)?, false))
+        }
+    })
+    .await
+    .map_err(internal)?;
+    let Some(auth_context) = auth_context else {
         s.metrics.auth_failures.fetch_add(1, Ordering::Relaxed);
         return Err("Not logged in".into());
     };
+    if renewed {
+        s.metrics.session_renewals.fetch_add(1, Ordering::Relaxed);
+    }
     match path {
         "/user/signout" => {
             let invalidated_session_hash = auth_context.token_hash.clone();
@@ -1452,7 +1465,6 @@ struct Session {
     authenticated: bool,
     token_hash: Option<String>,
     user_id: Option<i64>,
-    expires_at: Option<i64>,
     vault: Option<String>,
     vault_owner_user_id: Option<i64>,
     device: String,
@@ -1637,7 +1649,6 @@ async fn socket_loop(
         authenticated: false,
         token_hash: None,
         user_id: None,
-        expires_at: None,
         vault: None,
         vault_owner_user_id: None,
         device: "Unknown device".into(),
@@ -1973,10 +1984,13 @@ async fn init(
         if valid_session || (token_has_session_shape && retired_vault) {
             if valid_session {
                 s.metrics.deny(AuthorizationOperation::DataInit);
+            } else {
+                s.metrics.auth_failures.fetch_add(1, Ordering::Relaxed);
             }
             send(tx, json!({"res":"err","msg":"Vault not found"})).await?;
             return close(tx, 1008, "Vault not found").await;
         }
+        s.metrics.auth_failures.fetch_add(1, Ordering::Relaxed);
         send(tx, json!({"res":"err","msg":"Unable to authenticate"})).await?;
         return Ok(());
     };
@@ -1994,6 +2008,22 @@ async fn init(
         send(tx, json!({"res":"err","msg":"Unable to authenticate"})).await?;
         return Ok(());
     }
+    let auth_context = auth_context.unwrap();
+    let renewal_hash = auth_context.token_hash.clone();
+    let renewal_vault = vault.id.clone();
+    let session_ttl = s.config.session_ttl.as_secs() as i64;
+    let Some(renewed) = db_task(s, move |db| {
+        db.renew_session_for_vault(&renewal_hash, &renewal_vault, session_ttl)
+    })
+    .await?
+    else {
+        s.metrics.auth_failures.fetch_add(1, Ordering::Relaxed);
+        send(tx, json!({"res":"err","msg":"Unable to authenticate"})).await?;
+        return Ok(());
+    };
+    if renewed {
+        s.metrics.session_renewals.fetch_add(1, Ordering::Relaxed);
+    }
     let version = match v.get("version") {
         None => 0,
         Some(value) => match value.as_i64() {
@@ -2004,7 +2034,6 @@ async fn init(
             }
         },
     };
-    let auth_context = auth_context.unwrap();
     let Some(user_connection_permit) = s.user_concurrency.try_acquire(
         auth_context.user_id,
         UserConcurrencyKind::Connection,
@@ -2020,7 +2049,6 @@ async fn init(
     session.authenticated = true;
     session.token_hash = Some(auth_context.token_hash.clone());
     session.user_id = Some(auth_context.user_id);
-    session.expires_at = Some(auth_context.expires_at);
     session._user_connection_permit = Some(user_connection_permit);
     session.vault = Some(vault.id.clone());
     session.vault_owner_user_id = owner_user_id;
@@ -2992,23 +3020,26 @@ pub(crate) fn observe_database_error(
 }
 
 async fn session_active(s: &AppState, session: &Session) -> bool {
-    if session
-        .expires_at
-        .is_none_or(|expires_at| expires_at <= now_ms())
-    {
-        return false;
-    }
     let Some(token_hash) = session.token_hash.clone() else {
         return false;
     };
     let Some(vault) = session.vault.clone() else {
         return false;
     };
-    db_task(s, move |db| {
-        Ok(db.valid_session_for_vault(&token_hash, &vault))
+    let session_ttl = s.config.session_ttl.as_secs() as i64;
+    match db_task(s, move |db| {
+        db.renew_session_for_vault(&token_hash, &vault, session_ttl)
     })
     .await
-    .unwrap_or(false)
+    {
+        Ok(Some(renewed)) => {
+            if renewed {
+                s.metrics.session_renewals.fetch_add(1, Ordering::Relaxed);
+            }
+            true
+        }
+        _ => false,
+    }
 }
 fn shutting_down(s: &AppState) -> bool {
     *s.shutdown.borrow()

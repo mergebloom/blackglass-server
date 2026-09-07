@@ -20,7 +20,10 @@ guessing at unqualified proprietary flows. Owners may
 invite existing active local accounts and remove collaborators; collaborators
 may leave using their own membership ID. Passwords are verified with Argon2id.
 Successful sign-in creates a random 256-bit bearer session whose digest, user,
-role, expiry, and revocation state live in SQLite.
+role, expiry, and revocation state live in SQLite. The configured session TTL is
+an inactivity window: valid active sessions renew after half the window has
+elapsed. Renewal never revives an expired or revoked session and remains
+conditional on an active account and current vault access.
 
 ## Data plane
 

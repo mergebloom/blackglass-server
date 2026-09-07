@@ -17,7 +17,6 @@ pub struct AuthContext {
     pub name: String,
     pub role: String,
     pub token_hash: String,
-    pub expires_at: i64,
 }
 
 #[derive(Clone, Debug, Serialize)]

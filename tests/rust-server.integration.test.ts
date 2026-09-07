@@ -1525,6 +1525,75 @@ describe("production Rust server", () => {
     writer.socket.close();
   }, 20_000);
 
+  test("renews active sessions without reviving expired ones and observes WebSocket failures", async () => {
+    const database = join(directory, "server.sqlite");
+    const renewalFloor = () => Date.now() + 25 * 24 * 60 * 60 * 1_000;
+
+    const controlSignin = await post("/user/signin", {
+      email: "owner@example.test",
+      password: "test-password",
+    });
+    setSessionExpiry(database, controlSignin.token, Date.now() + 1_000);
+    const metricsBeforeControl = await (await fetch(`http://127.0.0.1:${controlPort}/metrics`)).text();
+    expect(await post("/user/info", { token: controlSignin.token })).toMatchObject({
+      email: "owner@example.test",
+    });
+    const controlExpiry = sessionExpiry(database, controlSignin.token);
+    expect(controlExpiry).toBeGreaterThan(renewalFloor());
+    const metricsAfterControl = await (await fetch(`http://127.0.0.1:${controlPort}/metrics`)).text();
+    expect(metricValue(metricsAfterControl, "blackglass_session_renewals_total")).toBe(
+      metricValue(metricsBeforeControl, "blackglass_session_renewals_total") + 1,
+    );
+    expect(await post("/user/info", { token: controlSignin.token })).toMatchObject({
+      email: "owner@example.test",
+    });
+    expect(sessionExpiry(database, controlSignin.token)).toBe(controlExpiry);
+
+    const socketSignin = await post("/user/signin", {
+      email: "owner@example.test",
+      password: "test-password",
+    });
+    const socket = await Probe.connect(`ws://127.0.0.1:${dataPort}`);
+    await initializeFor(socket, socketSignin.token, vault, "Sliding session", 0, true);
+    setSessionExpiry(database, socketSignin.token, Date.now() + 7_000);
+    await Bun.sleep(6_000);
+    expect(sessionExpiry(database, socketSignin.token)).toBeGreaterThan(renewalFloor());
+    expect(socket.socket.readyState).toBe(WebSocket.OPEN);
+    socket.socket.close();
+
+    const expiredSignin = await post("/user/signin", {
+      email: "owner@example.test",
+      password: "test-password",
+    });
+    expireSession(database, expiredSignin.token);
+    expect(await post("/user/info", { token: expiredSignin.token })).toEqual({
+      error: "Not logged in",
+    });
+    expect(sessionExpiry(database, expiredSignin.token)).toBe(0);
+
+    const revokedSignin = await post("/user/signin", {
+      email: "owner@example.test",
+      password: "test-password",
+    });
+    const revokedExpiry = Date.now() + 1_000;
+    setSessionExpiry(database, revokedSignin.token, revokedExpiry);
+    expect(await post("/user/signout", { token: revokedSignin.token })).toEqual({});
+    expect(await post("/user/info", { token: revokedSignin.token })).toEqual({
+      error: "Not logged in",
+    });
+    expect(sessionExpiry(database, revokedSignin.token)).toBe(revokedExpiry);
+
+    const metricsBeforeInvalidSocket = await (await fetch(`http://127.0.0.1:${controlPort}/metrics`)).text();
+    const invalid = await Probe.connect(`ws://127.0.0.1:${dataPort}`);
+    invalid.json(initFor("0".repeat(64), vault, "Invalid session", 0, true));
+    expect(await invalid.nextJson()).toEqual({ res: "err", msg: "Unable to authenticate" });
+    const metricsAfterInvalidSocket = await (await fetch(`http://127.0.0.1:${controlPort}/metrics`)).text();
+    expect(metricValue(metricsAfterInvalidSocket, "blackglass_auth_failures_total")).toBe(
+      metricValue(metricsBeforeInvalidSocket, "blackglass_auth_failures_total") + 1,
+    );
+    invalid.socket.close();
+  }, 20_000);
+
   test("a revoked session cannot win a staged-upload commit race", async () => {
     const raceSignin = await post("/user/signin", {
       email: "owner@example.test",
@@ -2004,6 +2073,8 @@ async function openWrongOriginSlowControlRequest(port: number) {
 
 function databaseVersion(path: string, vaultId: string): number { const database = new Database(path, { readonly: true }); try { return (database.query("SELECT version FROM vaults WHERE id=?").get(vaultId) as { version: number }).version; } finally { database.close(); } }
 function expireSession(path: string, sessionToken: string) { const database = new Database(path); try { const hash = createHash("sha256").update(sessionToken).digest("hex"); expect(database.query("UPDATE sessions SET expires_at=0 WHERE token_hash=?").run(hash).changes).toBe(1); } finally { database.close(); } }
+function setSessionExpiry(path: string, sessionToken: string, expiresAt: number) { const database = new Database(path); try { const hash = createHash("sha256").update(sessionToken).digest("hex"); expect(database.query("UPDATE sessions SET expires_at=? WHERE token_hash=?").run(expiresAt, hash).changes).toBe(1); } finally { database.close(); } }
+function sessionExpiry(path: string, sessionToken: string) { const database = new Database(path, { readonly: true }); try { const hash = createHash("sha256").update(sessionToken).digest("hex"); return (database.query("SELECT expires_at FROM sessions WHERE token_hash=?").get(hash) as { expires_at: number }).expires_at; } finally { database.close(); } }
 async function promiseWithTimeout<T>(promise: Promise<T>, milliseconds: number, message: string): Promise<T> { return Promise.race([promise, new Promise<T>((_, reject) => setTimeout(() => reject(new Error(message)), milliseconds))]); }
 async function waitForClose(probe: Probe, milliseconds: number) { return promiseWithTimeout(probe.closed, milliseconds, "websocket did not close"); }
 function webSocketWithOrigin(url: string, origin: string, extraHeaders: Record<string, string> = {}) { return new WebSocket(url, { headers: { Origin: origin, ...extraHeaders } } as unknown as string[]); }

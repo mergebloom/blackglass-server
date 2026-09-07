@@ -242,6 +242,13 @@ Keep all three endpoints behind the control hostname's normal network policy.
 Alert on readiness failures, restarts, sign-in failures/rate limits, WebSocket
 errors, and backup failures. Disk-free-space monitoring is mandatory because
 SQLite and in-progress staging files share the state volume by default.
+`SELFHOST_SESSION_TTL_SECONDS` is a sliding inactivity window. A valid active
+session is renewed only after half the configured window has elapsed, limiting
+SQLite writes while preventing regularly active clients from silently expiring.
+Expired and revoked sessions are never renewed. Monitor
+`blackglass_session_renewals_total` alongside authentication failures; `/health`
+and an unauthenticated WebSocket upgrade do not prove that a client session can
+complete Sync authentication.
 Alert on `blackglass_upload_timeouts_total`; it indicates a client or network
 that stopped making progress during an upload.
 Alert on `blackglass_storage_quota_rejections_total` and record
