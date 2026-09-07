@@ -245,8 +245,17 @@ SQLite and in-progress staging files share the state volume by default.
 `SELFHOST_SESSION_TTL_SECONDS` is a sliding inactivity window. A valid active
 session is renewed only after half the configured window has elapsed, limiting
 SQLite writes while preventing regularly active clients from silently expiring.
-Expired and revoked sessions are never renewed. Monitor
-`blackglass_session_renewals_total` alongside authentication failures; `/health`
+Expired and revoked sessions are never renewed. Periodic authorization checks alone do not renew a
+session. Authenticated peers that stop sending traffic are disconnected after
+`SELFHOST_WS_IDLE_TIMEOUT_SECONDS` (default 90, range 5–3600); native Sync sends
+heartbeats. Reconnecting clients resume from their last revision. Successful
+download progress also renews an active session. Pending uploads use their
+separate `SELFHOST_UPLOAD_IDLE_TIMEOUT_SECONDS` progress deadline so a slow data
+frame is not mistaken for a missing application heartbeat. Each vault has its
+own bounded change queue, so unrelated vault traffic cannot force a resynchronization.
+Monitor `blackglass_ws_active_connections`, `blackglass_ws_idle_timeouts_total`,
+and `blackglass_ws_capacity_rejections_total` for stuck peers or undersized limits.
+Monitor `blackglass_session_renewals_total` alongside authentication failures; `/health`
 and an unauthenticated WebSocket upgrade do not prove that a client session can
 complete Sync authentication.
 Alert on `blackglass_upload_timeouts_total`; it indicates a client or network
@@ -254,6 +263,12 @@ that stopped making progress during an upload.
 Alert on `blackglass_storage_quota_rejections_total` and record
 `blackglass_storage_quota_bytes` alongside host disk capacity. A quota
 rejection is an expected bounded client error, not a server fault.
+The native `size` response advertises the effective owner ceiling after global
+free space and pending upload reservations, without identifying other owners.
+It is a point-in-time capacity estimate, not a reservation or filesystem-free
+space measurement. Scrape `blackglass_storage_used_bytes` and
+`blackglass_storage_reserved_bytes` alongside the quota gauge; the used gauge
+is omitted when the database cannot be sampled promptly.
 Alert on unexpected increases in `blackglass_authorization_denials_total`;
 its fixed `operation` and `reason` labels identify the denied protocol surface
 without tenant, vault, session, or payload data. Alert on any sustained increase

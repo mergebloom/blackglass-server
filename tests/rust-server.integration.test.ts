@@ -886,6 +886,8 @@ describe("production Rust server", () => {
       );
       fullPending.json(push("quota-full-pending", "quota-full-pending", storageQuota, 1));
       expect(await fullPending.nextJson()).toEqual({ res: "next" });
+      probe.json({ op: "size" });
+      expect(await probe.nextJson()).toEqual({ res: "ok", size: 0, limit: 0, vault_size: 0 });
       probe.json(push("quota-concurrent", "quota-concurrent", 1, 1));
       expect(await probe.nextJson()).toEqual({ err: "Storage limit reached" });
       probe.json({ op: "restore", uid: emptySource.uid });
@@ -959,6 +961,74 @@ describe("production Rust server", () => {
       await child.exited;
     }
   }, 20_000);
+
+  test("isolates a backpressured attachment download from another owner's write burst and reports global headroom", async () => {
+    const serviceDirectory = await mkdtemp(join(tmpdir(), "blackglass-vault-events-"));
+    const [cp, dp, proxyPort] = await Promise.all([freePort(), freePort(), freePort()]);
+    const database = join(serviceDirectory, "server.sqlite");
+    for (const email of ["owner@example.test", "other@example.test"]) {
+      const created = Bun.spawnSync([binary, "user", "create", database, email, "Regression user"],
+        { stdin: Buffer.from("test-password\n"), stdout: "pipe", stderr: "pipe" });
+      expect(created.exitCode, created.stderr.toString()).toBe(0);
+    }
+    const size = 32 * 1024 * 1024;
+    const child = spawnRustServer(serviceDirectory, cp, dp, {
+      SELFHOST_PER_FILE_MAX: String(size), SELFHOST_STORAGE_QUOTA_BYTES: String(size + 1024),
+    });
+    let upstream: ReturnType<typeof createConnection> | undefined;
+    const transports: Array<ReturnType<typeof createConnection>> = [];
+    const proxy = createServer(downstream => {
+      upstream = createConnection({ host: "127.0.0.1", port: dp });
+      transports.push(downstream, upstream);
+      downstream.on("error", () => upstream?.destroy());
+      upstream.on("error", () => downstream.destroy());
+      downstream.pipe(upstream); upstream.pipe(downstream);
+    });
+    try {
+      await waitForHealthAt(cp, child);
+      await new Promise<void>((resolveListen, reject) => {
+        proxy.once("error", reject); proxy.listen(proxyPort, "127.0.0.1", resolveListen);
+      });
+      const owner = await postAt(cp, "/user/signin", {email:"owner@example.test",password:"test-password"});
+      const other = await postAt(cp, "/user/signin", {email:"other@example.test",password:"test-password"});
+      const makeVault = (token: string) => postAt(cp, "/vault/create", {token,name:"Isolated vault",keyhash:"opaque",salt:"opaque",region:"selfhost",encryption_version:3});
+      const first = await makeVault(owner.token), second = await makeVault(other.token);
+      const writer = await Probe.connect(`ws://127.0.0.1:${dp}`);
+      await initializeFor(writer, owner.token, first, "Attachment writer", 0, true);
+      const notice = await uploadOpaqueCiphertext(writer, "attachment.pdf", "synthetic-ciphertext", size);
+      writer.socket.close(); await waitForClose(writer, 2_000);
+      const reader = await Probe.connect(`ws://127.0.0.1:${proxyPort}`);
+      await initializeFor(reader, owner.token, first, "Slow reader", 0, true);
+      const noisy = await Probe.connect(`ws://127.0.0.1:${dp}`);
+      noisy.json(initFor(other.token, second, "Other owner", 0, true));
+      expect(await noisy.nextJson()).toMatchObject({res:"ok",userId:2});
+      expect(await noisy.nextJson()).toMatchObject({op:"ready"});
+      noisy.json({op:"size"});
+      expect(await noisy.nextJson()).toEqual({res:"ok",size:0,limit:1024,vault_size:0});
+      upstream!.pause(); reader.json({op:"pull",uid:notice.uid});
+      await Bun.sleep(250);
+      for (let index = 0; index < 40; index++) await metadata(noisy, `other-${index}`, `hash-${index}`);
+      upstream!.resume();
+      expect(await reader.nextJson()).toMatchObject({res:"ok",size,pieces:16});
+      let received = 0;
+      for (let piece = 0; piece < 16; piece++) {
+        const bytes = new Uint8Array(await reader.nextBinary());
+        expect(bytes.every(value => value === 0)).toBe(true);
+        received += bytes.byteLength;
+      }
+      expect(received).toBe(size);
+      reader.json({op:"ping"}); expect(await reader.nextJson()).toEqual({op:"pong"});
+      expect(reader.socket.readyState).toBe(WebSocket.OPEN);
+      const metrics = await (await fetch(`http://127.0.0.1:${cp}/metrics`)).text();
+      expect(metricValue(metrics, "blackglass_storage_used_bytes")).toBe(size);
+      expect(metricValue(metrics, "blackglass_storage_reserved_bytes")).toBe(0);
+      reader.socket.close(); noisy.socket.close();
+    } finally {
+      for (const transport of transports) transport.destroy();
+      if (proxy.listening) await new Promise<void>(resolveClose => proxy.close(() => resolveClose()));
+      child.kill("SIGTERM"); await child.exited;
+    }
+  }, 35_000);
 
   test("broadcasts revisions and preserves snapshot/resume semantics", async () => {
     const writer = await Probe.connect(`ws://127.0.0.1:${dataPort}`);
@@ -1525,6 +1595,57 @@ describe("production Rust server", () => {
     writer.socket.close();
   }, 20_000);
 
+  test("reclaims silent authenticated slots without timer renewal while active peers stay connected", async () => {
+    const serviceDirectory = await mkdtemp(join(tmpdir(), "blackglass-peer-idle-"));
+    const [cp, dp] = await Promise.all([freePort(), freePort()]);
+    const child = spawnRustServer(serviceDirectory, cp, dp, { SELFHOST_WS_IDLE_TIMEOUT_SECONDS: "5" });
+    try {
+      await waitForHealthAt(cp, child);
+      const signin = await postAt(cp, "/user/signin", { email: "owner@example.test", password: "test-password" });
+      const remote = await postAt(cp, "/vault/create", { token: signin.token, name: "Idle regression", keyhash: "opaque", salt: "opaque", region: "selfhost", encryption_version: 3 });
+      const idle: Probe[] = [];
+      for (let index = 0; index < 4; index++) {
+        const peer = await Probe.connect(`ws://127.0.0.1:${dp}`);
+        await initializeFor(peer, signin.token, remote, `Frozen ${index}`, 0, true); idle.push(peer);
+      }
+      const denied = await Probe.connect(`ws://127.0.0.1:${dp}`);
+      denied.json(initFor(signin.token, remote, "Capacity probe", 0, true));
+      expect((await waitForClose(denied, 2_000)).code).toBe(1013);
+      const database = join(serviceDirectory, "server.sqlite");
+      const expiry = Date.now() + 30_000;
+      setSessionExpiry(database, signin.token, expiry);
+      expect((await fetch(`http://127.0.0.1:${cp}/ready`)).status).toBe(200);
+      const closures = await Promise.all(idle.map(peer => waitForClose(peer, 8_000)));
+      for (const event of closures) {
+        // Bun 1.3 maps the peer's Going Away (1001) to Normal (1000).
+        expect([1000, 1001]).toContain(event.code);
+        expect(event.reason).toBe("Peer idle timeout; reconnect to resume");
+      }
+      expect(sessionExpiry(database, signin.token)).toBe(expiry);
+      const metrics = await (await fetch(`http://127.0.0.1:${cp}/metrics`)).text();
+      expect(metricValue(metrics, "blackglass_ws_idle_timeouts_total")).toBe(4);
+      expect(metricValue(metrics, "blackglass_ws_capacity_rejections_total")).toBe(1);
+      expect(metricValue(metrics, "blackglass_ws_active_connections")).toBe(0);
+      const active = await Probe.connect(`ws://127.0.0.1:${dp}`);
+      await initializeFor(active, signin.token, remote, "Recovered client", 0, true);
+      setSessionExpiry(database, signin.token, Date.now() + 7_000);
+      for (let index = 0; index < 6; index++) {
+        await Bun.sleep(1_000); active.json({ op: "ping" });
+        expect(await active.nextJson()).toEqual({ op: "pong" });
+      }
+      expect(sessionExpiry(database, signin.token)).toBeGreaterThan(Date.now() + 24 * 60 * 60 * 1_000);
+      expect(active.socket.readyState).toBe(WebSocket.OPEN);
+      active.json(push("slow-frame", "slow-frame", 1, 1));
+      expect(await active.nextJson()).toEqual({ res: "next" });
+      await Bun.sleep(6_000);
+      expect(active.socket.readyState).toBe(WebSocket.OPEN);
+      active.socket.send(new Uint8Array(1));
+      expect(await active.nextJson()).toMatchObject({ op: "push", path: "slow-frame" });
+      expect(await active.nextJson()).toEqual({ res: "ok" });
+      active.socket.close();
+    } finally { child.kill("SIGTERM"); await child.exited; }
+  }, 30_000);
+
   test("renews active sessions without reviving expired ones and observes WebSocket failures", async () => {
     const database = join(directory, "server.sqlite");
     const renewalFloor = () => Date.now() + 25 * 24 * 60 * 60 * 1_000;
@@ -1556,6 +1677,8 @@ describe("production Rust server", () => {
     const socket = await Probe.connect(`ws://127.0.0.1:${dataPort}`);
     await initializeFor(socket, socketSignin.token, vault, "Sliding session", 0, true);
     setSessionExpiry(database, socketSignin.token, Date.now() + 7_000);
+    socket.json({ op: "ping" });
+    expect(await socket.nextJson()).toEqual({ op: "pong" });
     await Bun.sleep(6_000);
     expect(sessionExpiry(database, socketSignin.token)).toBeGreaterThan(renewalFloor());
     expect(socket.socket.readyState).toBe(WebSocket.OPEN);

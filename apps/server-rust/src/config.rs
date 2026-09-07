@@ -37,6 +37,7 @@ pub struct Config {
     pub storage_quota_bytes: i64,
     pub storage_quota_bytes_per_owner: i64,
     pub session_ttl: Duration,
+    pub websocket_idle_timeout: Duration,
     pub upload_idle_timeout: Duration,
     pub allowed_origins: Vec<String>,
     pub max_concurrent_uploads: usize,
@@ -99,6 +100,8 @@ impl Config {
         if !(300..=365 * 24 * 60 * 60).contains(&session_ttl_seconds) {
             bail!("SELFHOST_SESSION_TTL_SECONDS must be between 300 seconds and 365 days");
         }
+        let websocket_idle_seconds = number("SELFHOST_WS_IDLE_TIMEOUT_SECONDS", 90u64)?;
+        validate_websocket_idle_timeout(websocket_idle_seconds)?;
         let upload_idle_timeout_seconds = number(
             "SELFHOST_UPLOAD_IDLE_TIMEOUT_SECONDS",
             DEFAULT_UPLOAD_IDLE_TIMEOUT_SECONDS,
@@ -197,6 +200,7 @@ impl Config {
             storage_quota_bytes,
             storage_quota_bytes_per_owner,
             session_ttl: Duration::from_secs(session_ttl_seconds),
+            websocket_idle_timeout: Duration::from_secs(websocket_idle_seconds),
             upload_idle_timeout: Duration::from_secs(upload_idle_timeout_seconds),
             allowed_origins,
             max_concurrent_uploads,
@@ -228,6 +232,7 @@ impl Config {
             storage_quota_bytes: DEFAULT_STORAGE_QUOTA_BYTES,
             storage_quota_bytes_per_owner: DEFAULT_STORAGE_QUOTA_BYTES,
             session_ttl: Duration::from_secs(3600),
+            websocket_idle_timeout: Duration::from_secs(90),
             upload_idle_timeout: Duration::from_secs(DEFAULT_UPLOAD_IDLE_TIMEOUT_SECONDS),
             allowed_origins: vec!["app://obsidian.md".into()],
             max_concurrent_uploads: 2,
@@ -319,6 +324,13 @@ fn validate_concurrent_uploads(value: usize) -> Result<()> {
         bail!(
             "SELFHOST_MAX_CONCURRENT_UPLOADS must be between 1 and {MAX_CONCURRENT_UPLOADS_LIMIT}"
         )
+    }
+    Ok(())
+}
+
+fn validate_websocket_idle_timeout(value: u64) -> Result<()> {
+    if !(5..=3600).contains(&value) {
+        bail!("SELFHOST_WS_IDLE_TIMEOUT_SECONDS must be between 5 and 3600 seconds");
     }
     Ok(())
 }
@@ -595,6 +607,16 @@ mod tests {
                 validate_concurrent_uploads(value).is_err(),
                 "passed: {value}"
             );
+        }
+    }
+
+    #[test]
+    fn websocket_idle_timeout_has_safe_operational_bounds() {
+        for value in [5, 90, 3600] {
+            validate_websocket_idle_timeout(value).unwrap();
+        }
+        for value in [0, 4, 3601, u64::MAX] {
+            assert!(validate_websocket_idle_timeout(value).is_err());
         }
     }
 

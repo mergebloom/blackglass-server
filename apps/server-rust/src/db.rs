@@ -956,10 +956,9 @@ impl Db {
             .unwrap_or(false)
     }
 
-    #[cfg(test)]
-    pub fn valid_session_for_vault(&self, hash: &str, vault: &str) -> bool {
+    pub fn valid_session_for_vault(&self, hash: &str, vault: &str) -> Result<bool> {
         if hash.len() != 64 || vault.is_empty() {
-            return false;
+            return Ok(false);
         }
         let now = now_ms();
         self.with(|c| {
@@ -979,7 +978,6 @@ impl Db {
                 |row| row.get::<_, i64>(0),
             )? == 1)
         })
-        .unwrap_or(false)
     }
 
     pub fn renew_session_for_vault(
@@ -4801,7 +4799,11 @@ mod tests {
                 .unwrap(),
             Some(2)
         );
-        assert!(!database.valid_session_for_vault(&member_hash, "shared-vault"));
+        assert!(
+            !database
+                .valid_session_for_vault(&member_hash, "shared-vault")
+                .unwrap()
+        );
         let replacement = database
             .invite_collaborator_for_session(
                 1,
@@ -4856,7 +4858,11 @@ mod tests {
             )
             .unwrap();
         assert!(share.uid > 0);
-        assert!(database.valid_session_for_vault(&member_hash, "old-shared-vault"));
+        assert!(
+            database
+                .valid_session_for_vault(&member_hash, "old-shared-vault")
+                .unwrap()
+        );
         database.checkpoint().unwrap();
         drop(database);
 
@@ -4883,7 +4889,11 @@ mod tests {
 
         recover_stale_backup(&source, &recovered).unwrap();
         let recovered = Db::open_existing(&recovered).unwrap();
-        assert!(!recovered.valid_session_for_vault(&member_hash, "old-shared-vault"));
+        assert!(
+            !recovered
+                .valid_session_for_vault(&member_hash, "old-shared-vault")
+                .unwrap()
+        );
         assert!(
             recovered
                 .find_authorized_vault(2, "old-shared-vault")

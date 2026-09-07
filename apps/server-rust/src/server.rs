@@ -89,6 +89,8 @@ pub struct Metrics {
     auth_failures: AtomicU64,
     session_renewals: AtomicU64,
     ws_connections: AtomicU64,
+    ws_idle_timeouts: AtomicU64,
+    ws_capacity_rejections: AtomicU64,
     uploads: AtomicU64,
     upload_bytes: AtomicU64,
     upload_timeouts: AtomicU64,
@@ -192,13 +194,35 @@ struct Event {
     vault: String,
     text: String,
     invalidated: bool,
-    invalidated_session_hash: Option<String>,
+}
+
+/// Pruning bounds topics by active subscribers, not historical vault IDs.
+#[derive(Default)]
+struct VaultEvents(StdMutex<HashMap<String, broadcast::Sender<Event>>>);
+
+impl VaultEvents {
+    fn subscribe(&self, vault: &str) -> broadcast::Receiver<Event> {
+        let mut topics = self.0.lock().expect("vault event registry poisoned");
+        topics.retain(|_, sender| sender.receiver_count() > 0);
+        topics
+            .entry(vault.to_owned())
+            .or_insert_with(|| broadcast::channel(EVENT_CAPACITY).0)
+            .subscribe()
+    }
+
+    fn send(&self, event: Event) {
+        let mut topics = self.0.lock().expect("vault event registry poisoned");
+        topics.retain(|_, sender| sender.receiver_count() > 0);
+        if let Some(sender) = topics.get(&event.vault) {
+            let _ = sender.send(event);
+        }
+    }
 }
 #[derive(Clone)]
 pub struct AppState {
     pub config: Arc<Config>,
     pub db: Db,
-    events: broadcast::Sender<Event>,
+    events: Arc<VaultEvents>,
     commit_order: Arc<AsyncMutex<()>>,
     storage_reservations: Arc<StorageReservations>,
     user_concurrency: Arc<UserConcurrency>,
@@ -422,14 +446,13 @@ pub async fn run(config: Config) -> Result<()> {
             config.database_path.display()
         )
     }
-    let (events, _) = broadcast::channel(EVENT_CAPACITY);
     let max_uploads = config.max_concurrent_uploads;
     let max_connections = config.max_ws_connections;
     let (shutdown_tx, shutdown) = watch::channel(false);
     let state = AppState {
         config: Arc::new(config),
         db,
-        events,
+        events: Arc::new(VaultEvents::default()),
         commit_order: Arc::new(AsyncMutex::new(())),
         storage_reservations: Arc::new(StorageReservations::default()),
         user_concurrency: Arc::new(UserConcurrency::default()),
@@ -692,6 +715,16 @@ async fn metrics(State(s): State<AppState>) -> Response {
             "blackglass_authorization_denials_total{{operation=\"{label}\",reason=\"not_authorized\"}} {}\n",
             m.authorization_denials[operation as usize].load(Ordering::Relaxed)
         ));
+    }
+    body.push_str(&format!(
+        "blackglass_ws_active_connections {}\nblackglass_ws_idle_timeouts_total {}\nblackglass_ws_capacity_rejections_total {}\nblackglass_storage_reserved_bytes {}\n",
+        s.config.max_ws_connections.saturating_sub(s.connections.available_permits()),
+        m.ws_idle_timeouts.load(Ordering::Relaxed),
+        m.ws_capacity_rejections.load(Ordering::Relaxed),
+        s.storage_reservations.reserved(),
+    ));
+    if let Ok(used) = try_db_task(&s, |db| db.stored_ciphertext_size()).await {
+        body.push_str(&format!("blackglass_storage_used_bytes {used}\n"));
     }
     for (operation, label) in DatabaseOperation::ALL {
         body.push_str(&format!(
@@ -999,13 +1032,6 @@ async fn authorized_control(
                 .await
                 .map_err(internal)?;
             s.live_connections.cancel_session(&invalidated_session_hash);
-            let _ = s.events.send(Event {
-                uid: 0,
-                vault: String::new(),
-                text: String::new(),
-                invalidated: false,
-                invalidated_session_hash: Some(invalidated_session_hash),
-            });
             Ok(json!({}))
         }
         "/user/info" => {
@@ -1419,12 +1445,11 @@ fn vault_credentials(
 
 fn invalidate_vault(s: &AppState, vault: String) {
     s.live_connections.cancel_vault(&vault);
-    let _ = s.events.send(Event {
+    s.events.send(Event {
         uid: 0,
         vault,
         text: String::new(),
         invalidated: true,
-        invalidated_session_hash: None,
     });
 }
 
@@ -1453,7 +1478,12 @@ async fn upgrade(
     };
     let permit = match s.connections.clone().try_acquire_owned() {
         Ok(permit) => permit,
-        Err(_) => return StatusCode::SERVICE_UNAVAILABLE.into_response(),
+        Err(_) => {
+            s.metrics
+                .ws_capacity_rejections
+                .fetch_add(1, Ordering::Relaxed);
+            return StatusCode::SERVICE_UNAVAILABLE.into_response();
+        }
     };
     ws.max_frame_size(PIECE_SIZE as usize)
         .max_message_size(PIECE_SIZE as usize)
@@ -1643,7 +1673,9 @@ async fn socket_loop(
 ) {
     s.metrics.ws_connections.fetch_add(1, Ordering::Relaxed);
     let (mut tx, mut rx) = socket.split();
-    let mut events = s.events.subscribe();
+    // Replaced under the commit-order lock after authentication. Never poll
+    // this closed placeholder before the socket has authenticated.
+    let mut events = broadcast::channel(EVENT_CAPACITY).1;
     let mut shutdown = s.shutdown.clone();
     let mut session = Session {
         authenticated: false,
@@ -1662,6 +1694,7 @@ async fn socket_loop(
     tokio::pin!(authentication_deadline);
     let mut session_revalidation = interval(SESSION_REVALIDATE_INTERVAL);
     session_revalidation.set_missed_tick_behavior(MissedTickBehavior::Skip);
+    let mut peer_deadline = TokioInstant::now() + s.config.websocket_idle_timeout;
     loop {
         let cancellation = session.cancellation.clone();
         let pending_upload_deadline = session
@@ -1708,6 +1741,16 @@ async fn socket_loop(
                 }))).await;
                 break
             },
+            // A pending upload has its own bounded progress deadline. A slow
+            // data frame may prevent application heartbeats from interleaving.
+            _ = sleep_until(peer_deadline), if session.authenticated && session.pending.is_none() => {
+                s.metrics.ws_idle_timeouts.fetch_add(1, Ordering::Relaxed);
+                let _ = socket_send(&mut tx, Message::Close(Some(CloseFrame {
+                    code: 1001,
+                    reason: "Peer idle timeout; reconnect to resume".into(),
+                }))).await;
+                break
+            },
             _ = session_revalidation.tick(), if session.authenticated => {
                 if !session_active(&s, &session).await {
                     let _ = socket_send(&mut tx, Message::Close(Some(CloseFrame {
@@ -1720,6 +1763,10 @@ async fn socket_loop(
             incoming = rx.next() => match incoming {
                 Some(Ok(Message::Close(_))) => break,
                 Some(Ok(msg)) => {
+                    if session.authenticated && !renew_active_session(&s, &session).await {
+                        let _ = close(&mut tx, 1008, "Session expired or revoked").await;
+                        break;
+                    }
                     let result = handle_message(
                         &s,
                         &mut session,
@@ -1727,6 +1774,9 @@ async fn socket_loop(
                         &mut tx,
                         msg,
                     ).await;
+                    // Per-frame write deadlines bound a blocked reader during
+                    // streaming. Idle time begins after the operation finishes.
+                    peer_deadline = TokioInstant::now() + s.config.websocket_idle_timeout;
                     if session.authenticated {
                         drop(source_permit.take());
                     }
@@ -1738,14 +1788,7 @@ async fn socket_loop(
                 },
                 _ => break,
             },
-            event = events.recv() => match event {
-                Ok(event) if event.invalidated_session_hash.as_deref() == session.token_hash.as_deref() => {
-                    let _ = socket_send(&mut tx, Message::Close(Some(CloseFrame {
-                        code: 1008,
-                        reason: "Session revoked".into(),
-                    }))).await;
-                    break
-                },
+            event = events.recv(), if session.authenticated => match event {
                 Ok(event) if session.vault.as_deref() == Some(&event.vault) && event.invalidated => {
                     let _ = socket_send(&mut tx, Message::Close(Some(CloseFrame {
                         code: 1008,
@@ -1849,18 +1892,34 @@ async fn handle_message(
                 "ping" => send(tx, json!({"op":"pong"})).await?,
                 "size" => {
                     let vault = session.vault.clone().unwrap();
-                    let (size, vault_size) = db_task(s, move |db| {
+                    let _commit = s.commit_order.lock().await;
+                    let owner = session.vault_owner_user_id.context("vault has no owner")?;
+                    let (size, vault_size, global_size) = db_task(s, move |db| {
                         Ok((
                             db.stored_ciphertext_size_for_vault_owner(&vault)?
                                 .context("authorized vault has no owner")?,
                             db.vault_size(&vault)?,
+                            db.stored_ciphertext_size()?,
                         ))
                     })
                     .await?;
+                    let limit = effective_storage_limit(
+                        size,
+                        global_size,
+                        s.storage_reservations.reserved_for_owner(owner),
+                        s.storage_reservations.reserved(),
+                        s.config.storage_quota_bytes_per_owner,
+                        s.config.storage_quota_bytes,
+                    );
+                    drop(_commit);
                     if !session_active(s, session).await {
                         return close(tx, 1008, "Authorization revoked").await;
                     }
-                    send(tx,json!({"res":"ok","size":size,"limit":s.config.storage_quota_bytes_per_owner,"vault_size":vault_size})).await?
+                    send(
+                        tx,
+                        json!({"res":"ok","size":size,"limit":limit,"vault_size":vault_size}),
+                    )
+                    .await?
                 }
                 "usernames" => {
                     let vault = session.vault.clone().unwrap();
@@ -2039,6 +2098,9 @@ async fn init(
         UserConcurrencyKind::Connection,
         s.config.max_ws_connections_per_user,
     ) else {
+        s.metrics
+            .ws_capacity_rejections
+            .fetch_add(1, Ordering::Relaxed);
         send(
             tx,
             json!({"res":"err","msg":"Account connection capacity reached; retry shortly"}),
@@ -2076,7 +2138,7 @@ async fn init(
         let _commit = s.commit_order.lock().await;
         let vault_id = vault.id.clone();
         let ready_version = db_task(s, move |db| db.current_version(&vault_id)).await?;
-        *events = s.events.subscribe();
+        *events = s.events.subscribe(&vault.id);
         ready_version
     };
     if !initial && version > ready_version {
@@ -2476,6 +2538,9 @@ async fn pull(
             return close(tx, 1008, "Authorization revoked").await;
         }
         socket_send(tx, Message::Binary(chunk.into())).await?;
+        if !renew_active_session(s, session).await {
+            return close(tx, 1008, "Authorization revoked").await;
+        }
         offset += len
     }
     s.metrics.downloads.fetch_add(1, Ordering::Relaxed);
@@ -2726,9 +2791,8 @@ fn publish_committed(s: &AppState, r: Revision) -> Result<Event> {
         vault,
         text,
         invalidated: false,
-        invalidated_session_hash: None,
     };
-    let _ = s.events.send(event.clone());
+    s.events.send(event.clone());
     Ok(event)
 }
 
@@ -2763,7 +2827,28 @@ fn record_storage_quota_rejection(s: &AppState) {
     );
 }
 
+// Retain the native size/limit response while reporting only headroom that
+// this owner can use. Admission rechecks when competing writes commit.
+fn effective_storage_limit(
+    owner_used: i64,
+    global_used: i64,
+    owner_reserved: i64,
+    global_reserved: i64,
+    owner_limit: i64,
+    global_limit: i64,
+) -> i64 {
+    let global_free = global_limit
+        .saturating_sub(global_used)
+        .saturating_sub(global_reserved)
+        .max(0);
+    owner_limit
+        .saturating_sub(owner_reserved)
+        .max(0)
+        .min(owner_used.saturating_add(global_free))
+}
+
 fn serialized_notice_size(revision: &NewRevision) -> Result<usize> {
+    // Metadata remains bounded before it can enter a vault's event queue.
     Ok(serde_json::to_vec(&json!({
         "op": "push",
         "path": revision.path,
@@ -3020,6 +3105,18 @@ pub(crate) fn observe_database_error(
 }
 
 async fn session_active(s: &AppState, session: &Session) -> bool {
+    let Some(token_hash) = session.token_hash.clone() else {
+        return false;
+    };
+    let Some(vault) = session.vault.clone() else {
+        return false;
+    };
+    db_task(s, move |db| db.valid_session_for_vault(&token_hash, &vault))
+        .await
+        .unwrap_or(false)
+}
+
+async fn renew_active_session(s: &AppState, session: &Session) -> bool {
     let Some(token_hash) = session.token_hash.clone() else {
         return false;
     };
@@ -3360,6 +3457,50 @@ mod tests {
     use tower::ServiceExt;
 
     #[test]
+    fn vault_event_queues_isolate_other_vaults_and_still_detect_own_lag() {
+        let topics = VaultEvents::default();
+        let mut quiet = topics.subscribe("quiet");
+        let mut busy = topics.subscribe("busy");
+        for uid in 1..=100 {
+            topics.send(Event {
+                uid,
+                vault: "busy".into(),
+                text: "{}".into(),
+                invalidated: false,
+            });
+        }
+        assert!(matches!(
+            quiet.try_recv(),
+            Err(broadcast::error::TryRecvError::Empty)
+        ));
+        assert!(matches!(
+            busy.try_recv(),
+            Err(broadcast::error::TryRecvError::Lagged(_))
+        ));
+        topics.send(Event {
+            uid: 101,
+            vault: "quiet".into(),
+            text: "{}".into(),
+            invalidated: false,
+        });
+        assert_eq!(quiet.try_recv().unwrap().uid, 101);
+        drop(busy);
+        for index in 0..1000 {
+            drop(topics.subscribe(&format!("transient-{index}")));
+        }
+        assert!(topics.0.lock().unwrap().len() <= 2);
+    }
+
+    #[test]
+    fn advertised_storage_accounts_for_both_quotas_and_pending_reservations() {
+        assert_eq!(effective_storage_limit(20, 80, 0, 0, 100, 100), 40);
+        assert_eq!(effective_storage_limit(20, 80, 5, 15, 100, 100), 25);
+        assert_eq!(effective_storage_limit(20, 20, 5, 5, 30, 100), 25);
+        assert_eq!(effective_storage_limit(0, 100, 0, 0, 100, 100), 0);
+        assert_eq!(effective_storage_limit(20, 120, 0, 0, 100, 100), 20);
+    }
+
+    #[test]
     fn share_invite_limits_are_bounded_keyed_and_uniform() {
         let directory = tempfile::tempdir().unwrap();
         let mut config = Config::test(directory.path(), 3000, 3003).unwrap();
@@ -3414,7 +3555,7 @@ mod tests {
             AppState {
                 config: Arc::new(config),
                 db,
-                events: broadcast::channel(EVENT_CAPACITY).0,
+                events: Arc::new(VaultEvents::default()),
                 commit_order: Arc::new(AsyncMutex::new(())),
                 storage_reservations: Arc::new(StorageReservations::default()),
                 user_concurrency: Arc::new(UserConcurrency::default()),

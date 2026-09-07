@@ -24,8 +24,8 @@ const MAX_CONTROL_BODY_MEMORY_KIB: usize = (crate::server::MAX_CONTROL_BODY_READ
     + crate::server::MAX_CONTROL_REQUESTS)
     * crate::server::MAX_CONTROL_BODY_BYTES
     / 1024;
-const MAX_EVENT_BUFFER_MEMORY_KIB: usize = (crate::server::EVENT_CAPACITY
-    + crate::config::MAX_WS_CONNECTIONS_LIMIT)
+const MAX_EVENT_BUFFER_MEMORY_KIB: usize = (crate::server::EVENT_CAPACITY + 1)
+    * crate::config::MAX_WS_CONNECTIONS_LIMIT
     * crate::server::MAX_EVENT_BYTES
     / 1024;
 const MAX_LARGE_RESPONSE_WORKING_MEMORY_KIB: usize = 24 * 1024;
@@ -264,7 +264,7 @@ mod tests {
         assert_eq!(MAX_PASSWORD_CHECK_MEMORY_KIB, 64 * 1024);
         assert_eq!(MAX_WS_FRAME_MEMORY_KIB, 32 * 1024);
         assert_eq!(MAX_CONTROL_BODY_MEMORY_KIB, 3 * 1024);
-        assert_eq!(MAX_EVENT_BUFFER_MEMORY_KIB, 1536);
+        assert_eq!(MAX_EVENT_BUFFER_MEMORY_KIB, 16896);
         assert_eq!(MAX_LARGE_RESPONSE_WORKING_MEMORY_KIB, 24 * 1024);
         assert!(
             MAX_PASSWORD_CHECK_MEMORY_KIB
