@@ -20,11 +20,11 @@ RUN set -eu; \
     case "$SOURCE_REVISION" in *[!0-9a-f]*) exit 1 ;; esac
 
 # Pin the complete package closure added on top of the digest-pinned builder.
-# Alpine security updates therefore fail this build closed until these versions
-# and the builder digest are deliberately advanced together.
+# Alpine package replacements fail this build closed until the exact pins
+# are deliberately updated and requalified against the pinned builder.
 RUN apk add --no-cache \
       acl-libs=2.3.2-r1 \
-      gzip=1.14-r1 \
+      gzip=1.14-r2 \
       less=679-r0 \
       libncursesw=6.5_p20250503-r0 \
       musl=1.2.5-r12 \
