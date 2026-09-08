@@ -627,8 +627,10 @@ impl Db {
         let deadline = std::time::Instant::now() + std::time::Duration::from_millis(250);
         c.progress_handler(1_000, Some(move || std::time::Instant::now() >= deadline));
         let result = (|| {
+            // Join the grouped vault/path keys as well as uid so SQLite can index
+            // the materialized heads instead of scanning them for every revision.
             let mut vault_query = c.prepare(
-                "WITH latest_path AS (SELECT vault_id,path,MAX(uid) uid FROM revisions GROUP BY vault_id,path), per_vault AS (SELECT r.vault_id,SUM(r.size) retained_bytes,SUM(CASE WHEN lp.uid=r.uid AND r.deleted=0 AND r.folder=0 THEN 1 ELSE 0 END) file_count,SUM(CASE WHEN lp.uid=r.uid AND r.deleted=1 THEN 1 ELSE 0 END) deleted_count FROM revisions r LEFT JOIN latest_path lp ON lp.uid=r.uid GROUP BY r.vault_id), latest_revision AS (SELECT r.vault_id,r.ts,r.device FROM revisions r JOIN (SELECT vault_id,MAX(uid) uid FROM revisions GROUP BY vault_id) x ON x.uid=r.uid) SELECT v.id,v.name,v.created,CASE WHEN v.password IS NULL THEN 'custom-password' ELSE 'managed' END,v.encryption_version,v.version,v.size,COALESCE(p.retained_bytes,0),COALESCE(p.file_count,0),COALESCE(p.deleted_count,0),l.ts,l.device,v.owner_user_id,(SELECT COUNT(*) FROM memberships m WHERE m.vault_id=v.id AND m.revoked_at IS NULL) FROM vaults v LEFT JOIN per_vault p ON p.vault_id=v.id LEFT JOIN latest_revision l ON l.vault_id=v.id ORDER BY v.created ASC LIMIT 100"
+                "WITH latest_path AS (SELECT vault_id,path,MAX(uid) uid FROM revisions GROUP BY vault_id,path), per_vault AS (SELECT r.vault_id,SUM(r.size) retained_bytes,SUM(CASE WHEN lp.uid=r.uid AND r.deleted=0 AND r.folder=0 THEN 1 ELSE 0 END) file_count,SUM(CASE WHEN lp.uid=r.uid AND r.deleted=1 THEN 1 ELSE 0 END) deleted_count FROM revisions r LEFT JOIN latest_path lp ON lp.vault_id=r.vault_id AND lp.path=r.path AND lp.uid=r.uid GROUP BY r.vault_id), latest_revision AS (SELECT r.vault_id,r.ts,r.device FROM revisions r JOIN (SELECT vault_id,MAX(uid) uid FROM revisions GROUP BY vault_id) x ON x.uid=r.uid) SELECT v.id,v.name,v.created,CASE WHEN v.password IS NULL THEN 'custom-password' ELSE 'managed' END,v.encryption_version,v.version,v.size,COALESCE(p.retained_bytes,0),COALESCE(p.file_count,0),COALESCE(p.deleted_count,0),l.ts,l.device,v.owner_user_id,(SELECT COUNT(*) FROM memberships m WHERE m.vault_id=v.id AND m.revoked_at IS NULL) FROM vaults v LEFT JOIN per_vault p ON p.vault_id=v.id LEFT JOIN latest_revision l ON l.vault_id=v.id ORDER BY v.created ASC LIMIT 100"
             )?;
             let vaults = vault_query
                 .query_map([], |r| {
@@ -4555,6 +4557,52 @@ fn secure_file(path: &Path) -> Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn admin_snapshot_scales_with_distinct_paths_and_preserves_latest_state() {
+        let directory = tempfile::tempdir().unwrap();
+        let database = Db::open(&directory.path().join("admin-scale.sqlite")).unwrap();
+        for vault in ["first", "second", "empty"] {
+            create_test_vault(&database, vault);
+        }
+        const PATHS: i64 = 3_000;
+        database.with(|connection| {
+            let transaction = connection.transaction()?;
+            {
+                let mut insert = transaction.prepare(
+                    "INSERT INTO revisions(vault_id,path,extension,hash,ctime,mtime,folder,deleted,size,pieces,content,device,user_id,ts) VALUES(?,?,'md','fixture',0,0,?,?,?,0,NULL,'fixture',1,0)"
+                )?;
+                // Reuse path names across vaults to check tenant-local latest state.
+                for vault in ["first", "second"] {
+                    for path in 0..PATHS {
+                        insert.execute(params![vault, format!("path-{path}"), 0, 0, 10])?;
+                    }
+                }
+                insert.execute(params!["first", "path-0", 0, 1, 0])?;
+                insert.execute(params!["first", "path-1", 1, 0, 0])?;
+                insert.execute(params!["first", "path-2", 0, 1, 0])?;
+                insert.execute(params!["first", "path-2", 0, 0, 7])?;
+            }
+            transaction.commit()?;
+            Ok(())
+        }).unwrap();
+
+        // Exercise the real 250 ms snapshot deadline, not a relaxed test query.
+        // The old uid-only join scans all distinct paths for every revision.
+        let snapshot = database.admin_snapshot("localhost:3003").unwrap();
+        assert_eq!(snapshot.activity_count, PATHS * 2 + 4);
+        assert_eq!(snapshot.retained_bytes, PATHS * 2 * 10 + 7);
+        for (id, files, deleted, retained) in [
+            ("first", PATHS - 2, 1, PATHS * 10 + 7),
+            ("second", PATHS, 0, PATHS * 10),
+            ("empty", 0, 0, 0),
+        ] {
+            let vault = snapshot.vaults.iter().find(|vault| vault.id == id).unwrap();
+            assert_eq!(vault.file_count, files, "{id}: live files");
+            assert_eq!(vault.deleted_count, deleted, "{id}: tombstones");
+            assert_eq!(vault.retained_bytes, retained, "{id}: retained history");
+        }
+    }
 
     #[test]
     fn admin_snapshot_uses_a_literal_query_only_connection_outside_writer_mutex() {
