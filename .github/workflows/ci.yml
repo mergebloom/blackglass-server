@@ -13,6 +13,16 @@ jobs:
     timeout-minutes: 25
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          # Scan all real source/history, not GitHub's generated merge metadata.
+          ref: ${{ github.event.pull_request.head.sha || github.sha }}
+          fetch-depth: 0
+      - name: Prepare exact CI integration source
+        env:
+          CI_EVENT_NAME: ${{ github.event_name }}
+          CI_HEAD_SHA: ${{ github.event.pull_request.head.sha || github.sha }}
+          CI_BASE_SHA: ${{ github.event.pull_request.base.sha }}
+        run: ./ops/prepare-ci-source.sh
       - uses: oven-sh/setup-bun@0c5077e51419868618aeaa5fe8019c62421857d6 # v2.2.0
         with:
           bun-version: 1.3.8
@@ -27,7 +37,8 @@ jobs:
           --manifest-path apps/server-rust/Cargo.toml
           check advisories licenses sources
       - run: bun run check
-      - run: BLACKGLASS_TESTED_SOURCE_REVISION="$GITHUB_SHA" ./ops/build-release.sh
+      # This local integration artifact is test-only; release.yml publishes releases.
+      - run: BLACKGLASS_TESTED_SOURCE_REVISION="$(git rev-parse --verify HEAD)" ./ops/build-release.sh
       - run: bun run server:measure
       - run: shellcheck ops/*.sh
       - name: Verify systemd hardening unit

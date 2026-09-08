@@ -73,6 +73,16 @@ describe("release metadata consistency", () => {
     });
   }
 
+  test("patch release records the schema-7 predecessor without approving a regression rollback", async () => {
+    const contract = JSON.parse(await readFile(join(root, "ops/release/release-contract.json"), "utf8"));
+    expect(contract.rollback).toEqual({
+      previousPublishedTag: "v0.6.1",
+      previousPublishedSchema: 7,
+      directRollbackTag: null,
+      directRollbackSupported: false,
+    });
+  });
+
   test("rejects disagreement inside package-lock.json", async () => {
     const fixture = await copyMetadataFixture();
     try {

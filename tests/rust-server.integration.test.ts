@@ -1715,7 +1715,10 @@ describe("production Rust server", () => {
       metricValue(metricsBeforeInvalidSocket, "blackglass_auth_failures_total") + 1,
     );
     invalid.socket.close();
-  }, 20_000);
+    // Four serial Argon2 sign-ins plus a six-second renewal observation exceed
+    // 20 seconds on debug CI builds. Keep protocol deadlines unchanged and bound
+    // only the complete test's setup/observation budget separately.
+  }, 60_000);
 
   test("a revoked session cannot win a staged-upload commit race", async () => {
     const raceSignin = await post("/user/signin", {
