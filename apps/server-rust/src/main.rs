@@ -4,6 +4,7 @@ mod auth;
 mod config;
 mod db;
 mod model;
+mod publish;
 mod server;
 
 use anyhow::{Context, Result, bail};
@@ -237,6 +238,35 @@ async fn main() -> Result<()> {
             println!("revoked sessions: {}", db::revoke_all_sessions(&path)?);
             Ok(())
         }
+        [command, runtime, expected_sha256, expected_source_sha256]
+            if command == "verify-publish-runtime" =>
+        {
+            let verified = publish::VerifiedPublishRuntime::load(
+                &PathBuf::from(runtime),
+                expected_sha256,
+                expected_source_sha256,
+            )?;
+            println!("{}", verified.report());
+            Ok(())
+        }
+        [
+            command,
+            runtime,
+            expected_sha256,
+            expected_source_sha256,
+            port,
+        ] if command == "serve-publish-replay" => {
+            let port = port
+                .parse::<u16>()
+                .context("Publish replay port must be from 0 to 65535")?;
+            publish::serve_replay(
+                &PathBuf::from(runtime),
+                expected_sha256,
+                expected_source_sha256,
+                port,
+            )
+            .await
+        }
         _ => bail!("invalid arguments; run `{NAME} --help` for usage"),
     }
 }
@@ -287,7 +317,10 @@ Usage:\n  {NAME} serve\n  {NAME} hash-password\n  {NAME} backup <database> <outp
 {NAME} migrate-legacy <legacy-database> <new-database>\n  \
 {NAME} rebind-data-host <database> <new-host> <backup>\n  \
 {NAME} purge-deleted <database> <vault-id> <backup>\n  \
-{NAME} revoke-all-sessions <database>\n  {NAME} healthcheck\n  {NAME} build-info\n  {NAME} --version\n  {NAME} --help"
+{NAME} revoke-all-sessions <database>\n  \
+{NAME} verify-publish-runtime <runtime-directory> <expected-sha256> <expected-source-sha256>\n  \
+{NAME} serve-publish-replay <runtime-directory> <expected-sha256> <expected-source-sha256> <port>\n  \
+{NAME} healthcheck\n  {NAME} build-info\n  {NAME} --version\n  {NAME} --help"
     );
 }
 
