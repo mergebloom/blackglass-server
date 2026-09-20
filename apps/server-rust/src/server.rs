@@ -1890,6 +1890,7 @@ async fn handle_message(
             }
             match op {
                 "ping" => send(tx, json!({"op":"pong"})).await?,
+                "capabilities" => send(tx, json!({"res":"ok","conditional_push_v1":true})).await?,
                 "size" => {
                     let vault = session.vault.clone().unwrap();
                     let _commit = s.commit_order.lock().await;
@@ -2243,6 +2244,11 @@ async fn begin_push(
         && size >= 0
         && size <= max_ciphertext_size(&s.config)
         && pieces >= 0
+        && match v.get("expected_version") {
+            None => true,
+            Some(Value::Number(value)) => value.as_i64().is_some_and(js_safe_nonnegative),
+            _ => false,
+        }
         && pieces == (size + PIECE_SIZE - 1) / PIECE_SIZE;
     if !valid {
         send(tx, json!({"err":"Invalid push metadata"})).await?;
@@ -2267,12 +2273,14 @@ async fn begin_push(
         user_id: session
             .user_id
             .context("authenticated session has no user ID")?,
+        expected_version: v.get("expected_version").and_then(Value::as_i64),
     };
     if serialized_notice_size(&revision)? > MAX_EVENT_BYTES {
         send(tx, json!({"err":"Push metadata is too large"})).await?;
         return Ok(());
     }
     if revision.folder || revision.deleted || pieces == 0 {
+        let conditional = revision.expected_version.is_some();
         let notice = {
             let _commit = s.commit_order.lock().await;
             let storage_quota_bytes = s.config.storage_quota_bytes;
@@ -2297,11 +2305,16 @@ async fn begin_push(
                     reject_storage_quota(s, tx).await?;
                     return Ok(());
                 }
+                Err(error) if crate::db::is_conditional_write_conflict(&error) => {
+                    drop(_commit);
+                    send(tx, json!({"res":"err","code":"conditional_write_conflict","msg":"Conditional write conflict; catch up before retrying"})).await?;
+                    return Ok(());
+                }
                 Err(error) => return Err(error),
             };
             publish_committed(s, stored)?
         };
-        acknowledge_commit(s, session, events, tx, notice).await?;
+        acknowledge_commit(s, session, events, tx, notice, conditional).await?;
         return Ok(());
     }
     let permit = match s.uploads.clone().try_acquire_owned() {
@@ -2418,6 +2431,7 @@ async fn upload_chunk(
     let pending = session.pending.take().unwrap();
     drop(pending.file);
     let revision = pending.revision.clone();
+    let conditional = revision.expected_version.is_some();
     let path = pending.path.clone();
     let storage_reservation = pending._storage_reservation;
     let storage_quota_bytes = s.config.storage_quota_bytes;
@@ -2455,13 +2469,17 @@ async fn upload_chunk(
             close_storage_quota(s, tx).await?;
             return Ok(());
         }
+        Err(error) if crate::db::is_conditional_write_conflict(&error) => {
+            send(tx, json!({"res":"err","code":"conditional_write_conflict","msg":"Conditional write conflict; catch up before retrying"})).await?;
+            return Ok(());
+        }
         Err(error) => return Err(error),
     };
     s.metrics.uploads.fetch_add(1, Ordering::Relaxed);
     s.metrics
         .upload_bytes
         .fetch_add(stored_size as u64, Ordering::Relaxed);
-    acknowledge_commit(s, session, events, tx, notice).await
+    acknowledge_commit(s, session, events, tx, notice, conditional).await
 }
 
 async fn write_staged_piece<W>(file: &mut W, bytes: &[u8]) -> std::io::Result<()>
@@ -2773,7 +2791,7 @@ async fn restore(
         }
     };
     match notice {
-        Some(notice) => acknowledge_commit(s, session, events, tx, notice).await?,
+        Some(notice) => acknowledge_commit(s, session, events, tx, notice, false).await?,
         None => send(tx, json!({"err":"Revision not found"})).await?,
     }
     Ok(())
@@ -2873,6 +2891,7 @@ async fn acknowledge_commit(
     events: &mut broadcast::Receiver<Event>,
     tx: &mut SplitSink<WebSocket, Message>,
     committed: Event,
+    conditional: bool,
 ) -> Result<()> {
     if shutting_down(s) {
         return Ok(());
@@ -2912,7 +2931,11 @@ async fn acknowledge_commit(
     if !session_active(s, session).await {
         return close(tx, 1008, "Session expired or revoked").await;
     }
-    send(tx, json!({"res":"ok"})).await?;
+    if conditional {
+        send(tx, json!({"res":"ok","uid":committed.uid})).await?;
+    } else {
+        send(tx, json!({"res":"ok"})).await?;
+    }
     Ok(())
 }
 fn notice_item(r: Revision) -> Value {

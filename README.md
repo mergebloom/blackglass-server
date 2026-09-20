@@ -126,6 +126,11 @@ The Bridge repository owns official-client inspection, local adaptation, macOS
 packaging, client artifacts, E2E orchestration, and the exact compatibility
 matrix. Server protocol evidence is linked into those client release claims;
 client implementation details are not duplicated here.
+The [Headless repository](https://github.com/mergebloom/blackglass-headless)
+owns the independent Rust CLI/local MCP client and its Linux client artifacts.
+Its native conditional-push extension is documented in
+[architecture](docs/architecture.md); native release qualification remains
+separate from desktop compatibility claims.
 
 The public repository contains no Obsidian application, ASAR, extracted source,
 proprietary assets, credentials, private domains, vault data, or private

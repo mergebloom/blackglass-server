@@ -113,6 +113,42 @@ describe("production Rust server", () => {
     expect(unavailable.exitCode).not.toBe(0);
   });
 
+  test("negotiates conditional push and rejects a stale second writer without changing legacy acknowledgements", async () => {
+    const first = await Probe.connect(`ws://127.0.0.1:${dataPort}`);
+    const second = await Probe.connect(`ws://127.0.0.1:${dataPort}`);
+    const firstReady = await currentReady(first, "conditional-first");
+    const secondReady = await currentReady(second, "conditional-second");
+    expect(secondReady.version).toBe(firstReady.version);
+    first.json({ op: "capabilities" });
+    expect(await first.nextJson()).toEqual({ res: "ok", conditional_push_v1: true });
+    second.json({ op: "capabilities" });
+    expect(await second.nextJson()).toEqual({ res: "ok", conditional_push_v1: true });
+
+    const path = `conditional-${randomBytes(8).toString("hex")}`;
+    first.json(push(path, "first", 0, 0, { expected_version: firstReady.version }));
+    expect(await first.nextJson()).toMatchObject({ op: "push", path });
+    const committed = await first.nextJson();
+    expect(committed.res).toBe("ok");
+    expect(typeof committed.uid).toBe("number");
+    const committedUid = committed.uid;
+
+    second.json(push(path, "stale", 0, 0, { expected_version: secondReady.version }));
+    expect(await second.nextJson()).toMatchObject({ op: "push", path, uid: committedUid });
+    expect(await second.nextJson()).toMatchObject({
+      res: "err", code: "conditional_write_conflict",
+    });
+
+    second.json(push(path, "fresh", 0, 0, { expected_version: committedUid }));
+    expect(await second.nextJson()).toMatchObject({ op: "push", path });
+    expect(await second.nextJson()).toMatchObject({ res: "ok", uid: expect.any(Number) });
+
+    first.json(push(`${path}-legacy`, "legacy", 0, 0));
+    // The second writer's notice can arrive before this legacy commit.
+    let message = await first.nextJson();
+    while (message.op === "push") message = await first.nextJson();
+    expect(message).toEqual({ res: "ok" });
+  });
+
   test("streams an online verified backup without retaining a staging copy", async () => {
     const streamed = Bun.spawnSync([binary, "backup-stdout", join(directory, "server.sqlite")], {
       stdout: "pipe",

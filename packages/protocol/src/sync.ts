@@ -33,6 +33,8 @@ export interface PushMessage {
   deleted: boolean;
   size?: number;
   pieces?: number;
+  /** Blackglass conditional-push capability only; legacy clients omit it. */
+  expected_version?: number;
 }
 
 export interface PullMessage {

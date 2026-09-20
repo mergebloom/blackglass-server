@@ -49,6 +49,14 @@ revalidates the exact session, active user, and owner-or-collaborator access
 inside the same immediate SQLite transaction that commits the change, making
 transaction order authoritative for revoke-versus-write races.
 
+An authenticated native client may probe `capabilities` and use the optional
+`conditional_push_v1` extension. It supplies the last observed vault version
+with a push; the commit transaction rejects a stale version and returns a
+typed conflict, while a successful conditional acknowledgement includes the
+committed revision UID. Legacy pushes and their exact acknowledgements are
+unchanged. This bounds native-versus-native write races; it does not make
+legacy desktop writes conditional or deduplicate an upload after a lost reply.
+
 ## Persistence
 
 SQLite is the supported database for the single-node, multi-account deployment.

@@ -86,6 +86,9 @@ pub struct NewRevision {
     pub pieces: i64,
     pub device: String,
     pub user_id: i64,
+    /// Optional native-client vault-wide compare-and-swap boundary. Legacy
+    /// desktop pushes omit it and retain their existing wire behavior.
+    pub expected_version: Option<i64>,
 }
 
 #[derive(Debug, Deserialize)]

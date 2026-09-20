@@ -165,6 +165,21 @@ pub(crate) fn is_storage_quota_exceeded(error: &anyhow::Error) -> bool {
     error.downcast_ref::<StorageQuotaExceeded>().is_some()
 }
 
+#[derive(Debug)]
+struct ConditionalWriteConflict;
+
+impl fmt::Display for ConditionalWriteConflict {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter.write_str("conditional write conflict; catch up before retrying")
+    }
+}
+
+impl StdError for ConditionalWriteConflict {}
+
+pub(crate) fn is_conditional_write_conflict(error: &anyhow::Error) -> bool {
+    error.downcast_ref::<ConditionalWriteConflict>().is_some()
+}
+
 #[derive(Clone)]
 pub struct Db {
     connection: Arc<Mutex<Connection>>,
@@ -1661,6 +1676,7 @@ impl Db {
         self.with(|c| {
             let tx=c.transaction_with_behavior(TransactionBehavior::Immediate)?; let ts=now_ms();
             authorize_mutation(&tx, token_hash, revision.user_id, &revision.vault_id)?;
+            check_expected_version(&tx, revision)?;
             enforce_storage_quotas(
                 &tx,
                 &revision.vault_id,
@@ -2176,6 +2192,7 @@ fn add_revision(
 ) -> Result<Revision> {
     let tx = c.transaction_with_behavior(TransactionBehavior::Immediate)?;
     authorize_mutation(&tx, token_hash, r.user_id, &r.vault_id)?;
+    check_expected_version(&tx, r)?;
     enforce_storage_quotas(
         &tx,
         &r.vault_id,
@@ -2197,6 +2214,24 @@ fn add_revision(
         [uid],
         revision_row,
     )?)
+}
+
+fn check_expected_version(c: &Connection, revision: &NewRevision) -> Result<()> {
+    let Some(expected) = revision.expected_version else {
+        return Ok(());
+    };
+    if !(0..=MAX_JS_SAFE_INTEGER).contains(&expected) {
+        bail!("invalid conditional write boundary");
+    }
+    let actual: i64 = c.query_row(
+        "SELECT version FROM vaults WHERE id = ?1",
+        [&revision.vault_id],
+        |row| row.get(0),
+    )?;
+    if actual != expected {
+        return Err(ConditionalWriteConflict.into());
+    }
+    Ok(())
 }
 fn now_ms() -> i64 {
     SystemTime::now()
@@ -4667,6 +4702,29 @@ mod tests {
     }
 
     #[test]
+    fn conditional_push_compares_vault_version_inside_commit_transaction() {
+        let dir = tempfile::tempdir().unwrap();
+        let database = Db::open(&dir.path().join("conditional.sqlite")).unwrap();
+        create_test_vault(&database, "vault");
+        let mut revision = test_file_revision("vault", "opaque", 0);
+        revision.pieces = 0;
+        revision.expected_version = Some(0);
+        let first = database
+            .add_empty_revision(&revision, MAX_JS_SAFE_INTEGER, MAX_JS_SAFE_INTEGER)
+            .unwrap();
+        let stale = database
+            .add_empty_revision(&revision, MAX_JS_SAFE_INTEGER, MAX_JS_SAFE_INTEGER)
+            .unwrap_err();
+        assert!(is_conditional_write_conflict(&stale));
+        assert_eq!(database.current_version("vault").unwrap(), first.uid);
+        revision.expected_version = Some(first.uid);
+        let second = database
+            .add_empty_revision(&revision, MAX_JS_SAFE_INTEGER, MAX_JS_SAFE_INTEGER)
+            .unwrap();
+        assert!(second.uid > first.uid);
+    }
+
+    #[test]
     fn registration_is_default_off_atomic_and_never_grants_admin() {
         let dir = tempfile::tempdir().unwrap();
         let database = Db::open(&dir.path().join("registration.sqlite")).unwrap();
@@ -4977,6 +5035,7 @@ mod tests {
             pieces: (size + REVISION_PIECE_SIZE - 1) / REVISION_PIECE_SIZE,
             device: "test".into(),
             user_id: 1,
+            expected_version: None,
         }
     }
 
@@ -5688,6 +5747,7 @@ mod tests {
                     pieces: 0,
                     device: "test".into(),
                     user_id: 1,
+                    expected_version: None,
                 },
                 MAX_JS_SAFE_INTEGER,
                 MAX_JS_SAFE_INTEGER,
@@ -5913,6 +5973,7 @@ mod tests {
             pieces: 0,
             device: "test".into(),
             user_id: 1,
+            expected_version: None,
         };
         database
             .add_empty_revision(
@@ -6005,6 +6066,7 @@ mod tests {
                             pieces: 0,
                             device: "test".into(),
                             user_id: 1,
+                            expected_version: None,
                         },
                         MAX_JS_SAFE_INTEGER,
                         MAX_JS_SAFE_INTEGER,
@@ -6067,6 +6129,7 @@ mod tests {
                     pieces: 0,
                     device: "test".into(),
                     user_id: 1,
+                    expected_version: None,
                 },
                 MAX_JS_SAFE_INTEGER,
                 MAX_JS_SAFE_INTEGER,
@@ -6131,6 +6194,7 @@ mod tests {
             pieces: 0,
             device: "test".into(),
             user_id: 1,
+            expected_version: None,
         };
         let stored = db
             .add_empty_revision(&rev, MAX_JS_SAFE_INTEGER, MAX_JS_SAFE_INTEGER)
