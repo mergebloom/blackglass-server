@@ -149,6 +149,41 @@ describe("production Rust server", () => {
     expect(message).toEqual({ res: "ok" });
   });
 
+  test("rejects a staged conditional upload that lost a commit race and cleans its bytes", async () => {
+    const winner = await Probe.connect(`ws://127.0.0.1:${dataPort}`);
+    const loser = await Probe.connect(`ws://127.0.0.1:${dataPort}`);
+    const winnerReady = await currentReady(winner, "conditional-staged-winner");
+    const loserReady = await currentReady(loser, "conditional-staged-loser");
+    expect(loserReady.version).toBe(winnerReady.version);
+    const path = `conditional-staged-${randomBytes(8).toString("hex")}`;
+    const staleBytes = new Uint8Array([1, 2, 3, 4]);
+    loser.json(push(path, "stale", staleBytes.length, 1, { expected_version: loserReady.version }));
+    expect(await loser.nextJson()).toEqual({ res: "next" });
+    expect(await stagedParts(join(directory, "uploads"))).toHaveLength(1);
+
+    winner.json(push(`${path}-winner`, "winner", 0, 0, { expected_version: winnerReady.version }));
+    const winningNotice = await winner.nextJson();
+    expect(winningNotice).toMatchObject({ op: "push", path: `${path}-winner` });
+    expect(await winner.nextJson()).toMatchObject({ res: "ok", uid: winningNotice.uid });
+
+    loser.socket.send(staleBytes);
+    expect(await loser.nextJson()).toMatchObject({ op: "push", uid: winningNotice.uid });
+    expect(await loser.nextJson()).toMatchObject({ res: "err", code: "conditional_write_conflict" });
+    expect(await stagedParts(join(directory, "uploads"))).toEqual([]);
+
+    loser.json(push(path, "fresh", staleBytes.length, 1, { expected_version: winningNotice.uid }));
+    expect(await loser.nextJson()).toEqual({ res: "next" });
+    loser.socket.send(staleBytes);
+    const retryNotice = await loser.nextJson();
+    expect(retryNotice).toMatchObject({ op: "push", path });
+    expect(await loser.nextJson()).toMatchObject({ res: "ok", uid: retryNotice.uid });
+    const reader = await Probe.connect(`ws://127.0.0.1:${dataPort}`);
+    await initialize(reader, "conditional-staged-reader", retryNotice.uid, false);
+    reader.json({ op: "pull", uid: retryNotice.uid });
+    expect(await reader.nextJson()).toMatchObject({ res: "ok", size: staleBytes.length });
+    expect(new Uint8Array(await reader.nextBinary())).toEqual(staleBytes);
+  });
+
   test("streams an online verified backup without retaining a staging copy", async () => {
     const streamed = Bun.spawnSync([binary, "backup-stdout", join(directory, "server.sqlite")], {
       stdout: "pipe",
