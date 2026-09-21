@@ -279,13 +279,13 @@ storage contention, an undersized host, or an unexpectedly expensive query.
 Alert on `blackglass_share_invites_total{outcome="rate_limited"}`. The fixed
 outcome labels contain no email address, user ID, vault ID, or target digest.
 
-The `v0.6.3` archive includes `release-contract.json`. Release automation
-checks that it binds server 0.6.3 to schema 7 and schema-4/schema-5/schema-6
-migration input, the exact v0.6.1 predecessor, the exact client tooling
+The `v0.7.0` archive includes `release-contract.json`. Release automation
+checks that it binds server 0.7.0 to schema 7 and schema-4/schema-5/schema-6
+migration input, the exact v0.6.3 predecessor, the exact client tooling
 revision, both reviewed renderer baselines, and the required primary/recovery
-monitoring selectors. Upgrading from v0.6.1 needs no schema migration or session
-reset. The release does not approve direct rollback to v0.6.1: that tag lacks
-the active-session renewal, peer-liveness, and admin snapshot fixes. Retain a
+monitoring selectors. Upgrading from v0.6.3 needs no schema migration or session
+reset. The release does not approve direct rollback to v0.6.3 because native
+conditional-push capability negotiation would be lost. Retain a
 separately qualified same-schema executable for operational rollback; never
 restore an older database merely to roll back an executable.
 

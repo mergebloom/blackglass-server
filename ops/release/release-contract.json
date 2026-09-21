@@ -1,12 +1,12 @@
 {
   "schemaVersion": 3,
-  "serverVersion": "0.6.3",
+  "serverVersion": "0.7.0",
   "database": {
     "supportedSourceSchemas": [4, 5, 6],
     "destinationSchema": 7
   },
   "rollback": {
-    "previousPublishedTag": "v0.6.1",
+    "previousPublishedTag": "v0.6.3",
     "previousPublishedSchema": 7,
     "directRollbackTag": null,
     "directRollbackSupported": false

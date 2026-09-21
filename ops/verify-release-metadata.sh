@@ -155,7 +155,7 @@ jq -e \
       .database.destinationSchema == $schema and
       .database.supportedSourceSchemas == [4, 5, 6] and
       .rollback == {
-        "previousPublishedTag": "v0.6.1",
+        "previousPublishedTag": "v0.6.3",
         "previousPublishedSchema": 7,
         "directRollbackTag": null,
         "directRollbackSupported": false
